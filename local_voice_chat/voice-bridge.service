@@ -1,0 +1,17 @@
+[Unit]
+Description=Voice Bridge (KWS->ASR->OpenClaw->TTS)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/NAS-Demo/local_voice_chat
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/pi/NAS-Demo/local_voice_chat/voice_bridge.py --wake-duration 4 --kws-root /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h --asr-root /home/pi/voice/asr_cpu_1.19 --tts-root /home/pi/voice/tts_cpu_2.1 --wake-keyword-bin /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_xiaoyuantongxue.bin
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

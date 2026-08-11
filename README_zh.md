@@ -244,9 +244,9 @@ sudo docker logs --tail 200 openclaw
 
 实现文件（最小改动，均在现有语音目录下）：
 
-- `/home/pi/voice/local_voice_chat/voice_bridge.py`
-- `/home/pi/voice/local_voice_chat/voice-bridge.service`
-- `/home/pi/voice/local_voice_chat/install_voice_bridge_service.sh`
+- `/home/pi/NAS-Demo/local_voice_chat/voice_bridge.py`
+- `/home/pi/NAS-Demo/local_voice_chat/voice-bridge.service`
+- `/home/pi/NAS-Demo/local_voice_chat/install_voice_bridge_service.sh`
 
 说明：OpenClaw gateway 在容器内是 `18789`，宿主映射到 `24190`。语音桥接不直接调用 HTTP `127.0.0.1:18789`，而是调用官方 CLI：
 
@@ -259,7 +259,7 @@ docker exec openclaw node dist/index.js agent --session-key agent:main:voice-bri
 ### 6.1 前台验证
 
 ```bash
-cd /home/pi/voice/local_voice_chat
+cd /home/pi/NAS-Demo/local_voice_chat
 python3 -m pip install --user sherpa-onnx numpy
 python3 voice_bridge.py
 ```
@@ -285,7 +285,7 @@ python3 voice_bridge.py --openclaw-dry-run
 ### 6.2 开机自启（systemd）
 
 ```bash
-cd /home/pi/voice/local_voice_chat
+cd /home/pi/NAS-Demo/local_voice_chat
 chmod +x install_voice_bridge_service.sh
 ./install_voice_bridge_service.sh
 ```

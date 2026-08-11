@@ -1,0 +1,159 @@
+# Local Voice Chat (KWS -> ASR -> TTS)
+
+This directory adds a minimal local voice chain on Linux arm64 without changing your existing SDK code.
+
+## What it does
+
+1. Record a short wakeup clip from microphone
+2. Run KWS (`ivw_demo`) to detect wake word
+3. If wakeup is detected, record user speech clip
+4. Run ASR (SenseVoice via `sherpa-onnx`)
+5. Synthesize reply with MatchaTTS (existing model in `tts_cpu_2.1/model`)
+6. Play reply audio
+
+By default, you only need to wake once. Then continuous dialog is active.
+
+Speech capture is now dynamic:
+- It listens for at least a minimum duration
+- It keeps extending while you are still speaking
+- It ends turn when trailing audio is silent, or when max duration is reached
+
+## Files
+
+- `local_voice_chat.py`: main script
+- `run_local_voice_chat.sh`: launcher (auto-installs Python deps)
+- `voice_bridge.py`: bridge to OpenClaw (`docker exec openclaw ... agent --json`)
+- `voice-bridge.service`: systemd unit template
+- `install_voice_bridge_service.sh`: helper to install/enable service
+
+## Requirements
+
+- Linux arm64 (Debian is OK)
+- `ffmpeg`, `ffplay`, `curl`
+- Microphone input available via PulseAudio or ALSA
+
+## Quick start
+
+```bash
+cd /home/pi/NAS-Demo/local_voice_chat
+chmod +x run_local_voice_chat.sh
+./run_local_voice_chat.sh
+```
+
+## OpenClaw bridge mode
+
+```bash
+cd /home/pi/NAS-Demo/local_voice_chat
+python3 voice_bridge.py
+```
+
+Default wake word in bridge mode is 小远同学 (`keyword_xiaoyuantongxue.bin`).
+
+Install as systemd service:
+
+```bash
+chmod +x /home/pi/NAS-Demo/local_voice_chat/install_voice_bridge_service.sh
+/home/pi/NAS-Demo/local_voice_chat/install_voice_bridge_service.sh
+```
+
+If OpenClaw call fails with docker permission/sudo password error:
+
+```bash
+sudo usermod -aG docker pi
+# newgrp may fail with "setgid failed" in current session; use passwordless sudoers instead (works immediately):
+echo 'pi ALL=(ALL) NOPASSWD: /usr/bin/docker' | sudo tee /etc/sudoers.d/pi-docker
+sudo chmod 440 /etc/sudoers.d/pi-docker
+sudo -n docker ps
+
+sudo systemctl restart voice-bridge
+```
+
+`voice_bridge.py` tries `docker exec` first, then falls back to `sudo -n docker exec`.
+The sudoers rule above makes that fallback work without re-login.
+
+Recommended for first real-mic run:
+
+```bash
+./run_local_voice_chat.sh --wake-any-keyword --wake-duration 4
+```
+
+This will try all built-in wake words and print mic level each turn.
+After one successful wakeup, later turns do not need wake words.
+
+## Offline file test (no microphone)
+
+Use existing sample files to verify the full chain once:
+
+```bash
+./run_local_voice_chat.sh \
+	--once \
+	--no-play \
+	--wake-audio-file /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/audio/xiaochuang.wav \
+	--speech-audio-file /home/pi/voice/asr_cpu_1.19/test/resources/audios/1.wav
+```
+
+## First run note
+
+If `/home/pi/voice/asr_cpu_1.19/model/model.int8.onnx` (or `model.onnx`) is missing,
+this script will auto-download SenseVoice int8 model from sherpa-onnx release.
+
+If you want to disable auto-download:
+
+```bash
+./run_local_voice_chat.sh --no-auto-download-asr
+```
+
+## Useful options
+
+```bash
+# One round only
+./run_local_voice_chat.sh --once
+
+# One round only, file-mode (no microphone)
+./run_local_voice_chat.sh --once --wake-audio-file /path/to/wake.wav --speech-audio-file /path/to/speech.wav
+
+# Switch wake word model
+./run_local_voice_chat.sh --wake-keyword-bin /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_yunlingyunling.bin
+
+# Try any built-in wake word model
+./run_local_voice_chat.sh --wake-any-keyword
+
+# Legacy behavior: require wake word before every turn
+./run_local_voice_chat.sh --wake-any-keyword --require-wake-each-turn
+
+# Adjust recording durations
+./run_local_voice_chat.sh --wake-duration 2.5 --speech-duration 7
+
+# If pulse is unstable, force ALSA backend
+./run_local_voice_chat.sh --record-backend alsa
+
+# Run without speaker playback
+./run_local_voice_chat.sh --no-play
+
+# Session sleeps after 5 consecutive empty ASR rounds
+./run_local_voice_chat.sh --session-idle-rounds 5
+
+# Tune dynamic speech end
+./run_local_voice_chat.sh --speech-min-duration 3 --speech-duration 18 --speech-silence-threshold-dbfs -45
+```
+
+## If wakeup keeps failing
+
+- Watch this line after each recording: `[MIC] wake clip level: -xx.x dBFS`
+- If below `-45 dBFS`, mic volume is too low; move closer or raise input gain
+- Try `--wake-any-keyword` first, then say one of:
+	- 小创小创
+	- 小燕小燕
+	- 云铃云铃
+	- 小远同学
+- Increase wake recording window:
+
+```bash
+./run_local_voice_chat.sh --wake-any-keyword --wake-duration 5
+```
+
+- If PulseAudio source is wrong, switch backend:
+
+```bash
+./run_local_voice_chat.sh --wake-any-keyword --record-backend alsa
+```
