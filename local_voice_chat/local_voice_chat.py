@@ -481,7 +481,7 @@ def parse_args():
 
 	parser.add_argument("--wake-duration", type=float, default=3.0)
 	parser.add_argument("--speech-duration", type=float, default=12.0, help="Max speech capture duration in seconds")
-	parser.add_argument("--speech-min-duration", type=float, default=2.5, help="Minimum speech capture duration before silence can end turn")
+	parser.add_argument("--speech-min-duration", type=float, default=1.5, help="Minimum speech capture duration before silence can end turn")
 	parser.add_argument("--speech-tail-window", type=float, default=0.8, help="Tail window size in seconds for silence detection")
 	parser.add_argument("--speech-silence-threshold-dbfs", type=float, default=-42.0, help="Tail dBFS below this is treated as silence")
 	parser.add_argument("--record-backend", choices=["auto", "pulse", "alsa"], default="auto")

@@ -83,6 +83,31 @@ services:
 
 然后重建容器。
 
+### 0.1.2 Immich 智能相册集成（人脸/场景识别 + 自然语言搜索）
+
+目标：通过语音（或文本）对 Immich 照片库做语义搜索，例如「找出所有有海的照片」。
+
+已实现并验证（2026-08-11）：
+
+1. OpenClaw 已注册 `immich` MCP 工具（`immich-mcp`），支持自然语言搜索、人脸/场景相关接口。
+2. 修复了两个关键配置坑：
+   - `immich-mcp` 要求环境变量 **`IMMICH_BASE_URL`**（格式 `http://<host>:<port>/api`），不是 `IMMICH_URL`。
+   - OpenClaw 容器（bridge 网络）默认**无法访问** CasaOS 安装的 Immich（独立网络）。已通过把 openclaw 加入 Immich 网络解决，并用容器名 `http://immich-server:2283/api` 访问（已在 `docker-compose.yml` 固化）。
+3. 验证命令（自然语言搜索）：
+
+```bash
+sudo -n docker exec openclaw node dist/index.js agent --session-key agent:main:immich-test --message "用 immich 工具搜索照片库，找出所有包含'海'的照片，返回数量" --json
+```
+
+4. 若需要重新配置 Immich MCP：
+
+```bash
+cd /home/pi/NAS-Demo
+./oc.sh tools-immich-setup   # 注意：需要先 docker network connect big-bear-immich_big_bear_immich_network openclaw
+```
+
+注意：Immich 的智能搜索依赖 CLIP 向量索引（Smart Search）。未完成索引的照片（新导入、未后台任务处理）不会被语义搜索命中，需在 Immich 管理界面确认后台任务完成。
+
 ## 0.2 CasaOS 跳转层（点击图标直接打开 OpenClaw）
 
 OpenClaw 网关只支持 HTTPS，且禁止被 iframe 内嵌（`X-Frame-Options: DENY`），

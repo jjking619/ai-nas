@@ -7,16 +7,13 @@ services:
     container_name: openclaw
     restart: unless-stopped
     init: true
-    networks:
-      - default
-      - immich-net
     environment:
       HOME: /home/node
       OPENCLAW_HOME: /home/node
       TERM: xterm-256color
       OPENCLAW_GATEWAY_TOKEN: casaos
       TZ: Asia/Shanghai
-      IMMICH_URL: http://immich-server:2283
+      IMMICH_URL: http://10.55.84.133:2283
       IMMICH_API_KEY: HmPpUh8KFg6ZP6JTZ3s3jxGutth7q4VzjSAyosW6w
     command:
       - /bin/bash
@@ -30,8 +27,3 @@ services:
     volumes:
       - /DATA/AppData/openclaw:/home/node/.openclaw
       - /home/pi/nas_share:/nas_share
-
-networks:
-  immich-net:
-    external: true
-    name: big-bear-immich_big_bear_immich_network

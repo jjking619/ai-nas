@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument("--mic-input", default="default")
 
     parser.add_argument("--speech-duration", type=float, default=15.0)
-    parser.add_argument("--speech-min-duration", type=float, default=3.0)
+    parser.add_argument("--speech-min-duration", type=float, default=1.5)
     parser.add_argument("--speech-tail-window", type=float, default=0.8)
     parser.add_argument("--speech-silence-threshold-dbfs", type=float, default=-45.0)
 
@@ -228,9 +228,12 @@ def ask_openclaw(args, user_text):
         return f"[dry-run] 你说的是：{user_text}"
 
     bridge_prompt = (
-        "你是树莓派上的语音助手，负责执行用户口头指令。"
+        "你是quectel pi上的语音助手，负责执行用户口头指令。"
         "可调用你已有工具（如文件/NAS/相册等）来完成任务。"
         "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过120字。\n"
+        "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
+        "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
+        "  备份、家庭相册、工作文档、手机相册、旅行\n"
         f"用户指令：{user_text}"
     )
 
