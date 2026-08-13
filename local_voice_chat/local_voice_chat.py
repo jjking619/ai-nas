@@ -299,10 +299,10 @@ def ensure_sensevoice_model(asr_model_dir: Path, force_download: bool) -> Path:
 	int8_model = asr_model_dir / "model.int8.onnx"
 	fp_model = asr_model_dir / "model.onnx"
 
-	if int8_model.exists():
-		return int8_model
 	if fp_model.exists():
 		return fp_model
+	if int8_model.exists():
+		return int8_model
 
 	if not force_download:
 		raise RuntimeError(

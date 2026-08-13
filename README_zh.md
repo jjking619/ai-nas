@@ -108,6 +108,29 @@ cd /home/pi/NAS-Demo
 
 注意：Immich 的智能搜索依赖 CLIP 向量索引（Smart Search）。未完成索引的照片（新导入、未后台任务处理）不会被语义搜索命中，需在 Immich 管理界面确认后台任务完成。
 
+### 0.1.3 语音照片分类卡死（最小修复）
+
+现象：语音下达“按内容分类照片”后长时间无回复，OpenClaw 日志可能出现：
+
+```text
+Exec failed: fetch http://172.18.x.x:3003/predict
+```
+
+原因：分类脚本依赖 `immich-machine-learning:3003/predict`，当 ML 容器退出或不可达时，agent 会等待很久，表现为“卡死”。
+
+最小修复（已验证）：
+
+```bash
+sudo -n docker start immich-machine-learning
+mkdir -p /home/pi/nas_share/tools
+cp /home/pi/NAS-Demo/local_voice_chat/nas_classify.py /home/pi/nas_share/tools/nas_classify.py
+sudo -n docker exec openclaw sh -lc 'getent hosts immich-machine-learning && curl -s -o /dev/null -w "%{http_code}\n" --max-time 5 http://immich-machine-learning:3003'
+```
+
+补充：
+- `local_voice_chat/nas_classify.py` 已加入 3 秒连通性检查，不可达时会快速报错并提示 `docker start immich-machine-learning`。
+- `voice_bridge.py` 的分类命令已改为 `timeout 30 python3 /nas_share/tools/nas_classify.py ...`，避免长时间阻塞。
+
 ## 0.2 CasaOS 跳转层（点击图标直接打开 OpenClaw）
 
 OpenClaw 网关只支持 HTTPS，且禁止被 iframe 内嵌（`X-Frame-Options: DENY`），
@@ -123,6 +146,22 @@ OpenClaw 网关只支持 HTTPS，且禁止被 iframe 内嵌（`X-Frame-Options: 
 ```javascript
 window.top.location.href = 'https://<host>:24190/#token=casaos';
 ```
+
+> ⚠️ 若跳转页服务返回 **404（File not found）**，通常是 systemd 服务指向的目录
+> 不存在。本仓库实际路径是 `/home/pi/NAS-Demo/redirect`，而服务文件指向的是
+> 旧路径 `/home/pi/openclaw-casaos/redirect`。最小修复（无需改 systemd）：
+>
+> ```bash
+> mkdir -p /home/pi/openclaw-casaos
+> ln -sfn /home/pi/NAS-Demo/redirect /home/pi/openclaw-casaos/redirect
+> curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:24192/   # 应为 200
+> ```
+>
+> 另外，OpenClaw 镜像自带健康检查用 `http://127.0.0.1:18789/healthz` 探测，
+> 但网关是 HTTPS-only，会导致容器状态显示 `unhealthy`（不影响功能，网关
+> HTTPS 探活正常返回 200）。如需修复健康检查，需在创建容器时覆盖 healthcheck
+> 为 HTTPS 探测（`docker update` 不支持改 healthcheck，重建容器会中断服务并
+> 需要重新连接 immich 网络，风险较高，一般无需处理）。
 
 ### 跳转服务（systemd）
 

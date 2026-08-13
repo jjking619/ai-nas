@@ -175,6 +175,30 @@ def ensure_openclaw_exec_access(container_name: str) -> None:
         )
 
 
+def sync_nas_classify_script() -> Path:
+    """同步 NAS-Demo 下的唯一源文件到容器内运行位置。
+
+    /home/pi/NAS-Demo/local_voice_chat/nas_classify.py 是唯一维护源；
+    容器通过 /nas_share 挂载访问 /nas_share/tools/nas_classify.py（运行必需），
+    每次启动时若内容有差异自动覆盖，避免两份漂移。
+    """
+    src = Path(__file__).resolve().parent / "nas_classify.py"
+    dst = Path("/home/pi/nas_share/tools/nas_classify.py")
+
+    if not src.exists():
+        raise RuntimeError(f"nas_classify.py 源文件不存在: {src}")
+
+    try:
+        if not dst.exists() or src.read_bytes() != dst.read_bytes():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+            print(f"[SYNC] nas_classify.py 已同步: {src} -> {dst}")
+        return dst
+    except OSError as e:
+        print(f"[WARN] nas_classify.py 同步失败（不影响语音主流程）: {e}")
+        return dst
+
+
 def _json_from_mixed_output(raw):
     raw = raw.strip()
     if not raw:
@@ -223,6 +247,27 @@ def _extract_text_from_agent_json(obj):
     return ""
 
 
+def normalize_asr_text(text: str) -> str:
+    """Fix common SenseVoice mis-recognitions of known NAS folder names.
+
+    SenseVoice is a generic CTC model and cannot be biased with hotwords,
+    so we normalize frequent errors at the application layer.
+    """
+    replacements = {
+        "家庭册": "家庭相册",
+        "家庭像册": "家庭相册",
+        "家庭象册": "家庭相册",
+        "手机册": "手机相册",
+        "手机像册": "手机相册",
+        "工作文档": "工作文档",
+        "备份": "备份",
+        "旅行": "旅行",
+    }
+    for wrong, right in replacements.items():
+        text = text.replace(wrong, right)
+    return text
+
+
 def ask_openclaw(args, user_text):
     if args.openclaw_dry_run:
         return f"[dry-run] 你说的是：{user_text}"
@@ -230,10 +275,16 @@ def ask_openclaw(args, user_text):
     bridge_prompt = (
         "你是quectel pi上的语音助手，负责执行用户口头指令。"
         "可调用你已有工具（如文件/NAS/相册等）来完成任务。"
-        "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过120字。\n"
+        "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过50字。"
+        "严禁使用markdown格式（如**加粗**、-列表、#标题），只输出纯文字。\n"
         "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
         "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
         "  备份、家庭相册、工作文档、手机相册、旅行\n"
+        "照片分类规则：当用户要求对照片按内容分类时，禁止仅凭文件名猜测。"
+        "必须先用 exec 工具运行AI图像分类脚本获取每张图的类别建议，再按建议移动：\n"
+        "  timeout 30 python3 /nas_share/tools/nas_classify.py <图片1> <图片2> ...\n"
+        "脚本会输出每张图建议的类别（人物/动物/美食/风景/植物/建筑/交通工具/日常用品）。"
+        "然后使用 nas_files 的 create_directory 和 move_file 把图片移到对应类别子目录。\n"
         f"用户指令：{user_text}"
     )
 
@@ -285,6 +336,7 @@ def main():
     check_cmd_exists("docker")
 
     ensure_openclaw_exec_access(args.openclaw_container)
+    sync_nas_classify_script()
 
     kws_root = Path(args.kws_root)
     asr_root = Path(args.asr_root)
@@ -404,6 +456,10 @@ def main():
         print(f"[MIC] speech clip level: {level:.1f} dBFS")
 
         text = asr_transcribe(recognizer, user_wav)
+        normalized = normalize_asr_text(text)
+        if normalized != text:
+            print(f"[ASR] normalized: {normalized}")
+            text = normalized
         print(f"[ASR] text: {text}")
 
         if not text:
@@ -433,9 +489,16 @@ def main():
             break
 
         reply = ask_openclaw(args, text)
+        # Strip markdown symbols that TTS cannot pronounce
+        import re
+        reply = re.sub(r"\*+", "", reply)
+        reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
+        reply = re.sub(r"[_`]", "", reply)
+        reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；""''（）…—\s]", "", reply)
+        reply = re.sub(r"\s+", " ", reply).strip()
         # Guard TTS from very long outputs
-        if len(reply) > 300:
-            reply = reply[:300] + "。"
+        if len(reply) > 80:
+            reply = reply[:80] + "。"
 
         print(f"[OpenClaw] reply: {reply}")
         tts_speak(tts, reply, reply_wav, play=not args.no_play)
