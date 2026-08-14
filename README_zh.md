@@ -129,7 +129,68 @@ sudo -n docker exec openclaw sh -lc 'getent hosts immich-machine-learning && cur
 
 补充：
 - `local_voice_chat/nas_classify.py` 已加入 3 秒连通性检查，不可达时会快速报错并提示 `docker start immich-machine-learning`。
-- `voice_bridge.py` 的分类命令已改为 `timeout 30 python3 /nas_share/tools/nas_classify.py ...`，避免长时间阻塞。
+- `voice_bridge.py` 的分类命令已改为 `timeout 120 python3 /nas_share/tools/nas_classify.py ...`，并支持脚本内自动归档，避免长时间阻塞与多步误操作。
+
+### 0.1.4 识别后自动重命名并按规则归档（最小改动）
+
+目标：把“识别内容 -> 重命名 -> 归档”收敛为一次脚本调用，减少 agent 多工具链路的漂移。
+
+为什么这是当前最优策略（在现有架构下）：
+
+1. 最小改动：不新增服务，不改 Compose，不改容器挂载；仅扩展现有 `nas_classify.py` 与 `voice_bridge.py` 提示词。
+2. 风险最低：默认行为保持不变（只分类）；只有显式加 `--archive` 才执行移动。
+3. 归档稳定：优先保留原一级相册根（`家庭相册/手机相册/旅行/备份`），在根下按类别落盘，避免跨库混放。
+4. 命名可追溯：统一重命名为 `YYYYMMDD_HHMMSS_类别_原文件名.ext`；同名冲突自动加 `_2/_3...`。
+5. 低置信兜底：分数低于阈值时归入 `待确认`，防止误分硬落盘。
+6. 重复归档幂等：文件名若已带归档前缀（`YYYYMMDD_HHMMSS_类别_`）会被自动剥离后重拼，避免前缀无限叠加（如反复归档把 `test_1.jpg` 变成多层 `..._风景_..._风景_test_1.jpg`）。
+
+脚本新增参数（向后兼容）：
+
+- `--archive`：执行自动重命名+归档
+- `--dry-run`：只打印计划，不执行移动
+- `--min-score`：低置信阈值（默认 `0.20`）
+- `--unknown-dir`：低置信目录名（默认 `待确认`）
+
+推荐工作流（先预览再执行）：
+
+```bash
+# 1) 先看计划（不改文件）
+timeout 120 python3 /nas_share/tools/nas_classify.py --dir /nas_share/家庭相册 --recursive --archive --dry-run
+
+# 2) 确认后执行
+timeout 120 python3 /nas_share/tools/nas_classify.py --dir /nas_share/家庭相册 --recursive --archive
+```
+
+输出示例：
+
+```text
+/nas_share/家庭相册/IMG_1001.jpg  建议: 风景 (score=0.284)  风景=0.284 植物=0.201 建筑=0.173  MOVED: /nas_share/家庭相册/风景/20260814_101530_风景_IMG_1001.jpg
+```
+
+语音自动化行为（已接入）：
+
+- 当你说“按内容归档/整理照片”时，`voice_bridge.py` 会优先引导 OpenClaw 调用脚本的 `--archive` 模式。
+- 未明确“立即执行”时，优先 `--dry-run` 预览；失败时才回退到 `nas_files` 逐个移动。
+
+### 0.1.5 语音照片分类超时（OpenClaw agent timeout after 180s）根因与修复
+
+现象：语音说“帮我手机相册下的照片分类”后约 3 分钟报 `OpenClaw agent timeout after 180s`。
+
+根因（2026-08-14 实测日志）：**不是分类脚本慢，而是 agent 多轮 LLM 推理 + 远端模型 API 延迟叠加超时**。
+
+- 分类脚本本身仅需约 2 秒（5 张图 1.96s）。
+- OpenClaw agent 为“规划→执行脚本→汇报结果”跑了约 6 轮模型调用，其中单次模型请求最长 112 秒（走 `qlitellm.phicotek.com` 转发，`elapsedMs=112581`）。
+- `voice_bridge.py` 的 `--openclaw-timeout` 原默认 180 秒，agent 实际耗时约 215 秒，被硬超时掐断。
+
+最小修复（已验证）：
+1. `voice_bridge.py` 新增“快速照片分类捷径”`try_classify_locally()`：当指令明确含“分类/归档/整理 + 照片/图片/相册 + 指定相册目录（手机相册/家庭相册/旅行/备份）”时，直接在容器内跑 `nas_classify.py` 并本地汇总结果，**完全不经 OpenClaw agent**。
+2. 主循环改为“先试本地捷径，未命中才调 agent”，避免无关指令被误拦截。
+3. `--openclaw-timeout` 默认值从 180 提到 300 秒，作为 agent 兜底。
+
+验证：
+- 原超时指令“帮我手机相册下的照片分类”现在秒级返回：`手机相册分类完成：风景3张，美食1张，植物1张。`
+- “预览”类指令走 `--dry-run`，不实际移动文件。
+- “今天天气怎么样”“把照片移到家庭相册”等不命中关键词，仍交给 agent，不受影响。
 
 ## 0.2 CasaOS 跳转层（点击图标直接打开 OpenClaw）
 

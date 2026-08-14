@@ -10,8 +10,11 @@
   python3 /nas_share/tools/nas_classify.py /nas_share/家庭相册/*.jpg
 """
 import argparse
+from datetime import datetime
 import json
+import re
 import socket
+import shutil
 import sys
 import urllib.error
 import urllib.parse
@@ -23,6 +26,38 @@ MODEL = "ViT-B-32__openai"
 CONNECT_TIMEOUT = 3
 PREDICT_TIMEOUT = 120
 _ML_READY_CHECKED = False
+
+ARCHIVE_ROOT_HINTS = ("家庭相册", "手机相册", "旅行", "备份")
+
+# 交通工具类在“旅行街景/路景”里易与风景、美食重叠，做一个保守回退：
+# 仅当交通工具置信度不高且与候选类分差很小时，才把首类切到候选类。
+_VEHICLE_AMBIGUOUS_MAX = 0.26
+_VEHICLE_AMBIGUOUS_MARGIN = 0.015
+_VEHICLE_FALLBACK_CATS = ("风景", "美食")
+
+# 发给 ML 前的本地校验：小于此值视为损坏/假图片，直接跳过，避免拖垮 ML 服务
+_MIN_IMAGE_BYTES = 1024
+# 各格式文件头魔数（只检头几字节，纯标准库）
+_MAGIC = {
+    ".jpg": b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+    ".png": b"\x89PNG",
+    ".webp": b"RIFF",
+}
+
+
+def _is_valid_image(path: Path) -> bool:
+    """快速校验：大小 + 文件头魔数。纯标准库，可在容器内直接运行。"""
+    try:
+        if path.stat().st_size < _MIN_IMAGE_BYTES:
+            return False
+        magic = _MAGIC.get(path.suffix.lower())
+        if magic is None:
+            return True  # 未知扩展名，不强制校验
+        with path.open("rb") as fh:
+            return fh.read(len(magic)) == magic
+    except OSError:
+        return False
 
 # 类别 -> 英文描述（CLIP 对英文描述的分类效果远好于中文短词）
 CATEGORIES = {
@@ -131,10 +166,95 @@ def _cosine(a, b):
     return sum(x * y for x, y in zip(a, b)) / (na * nb)
 
 
-def classify(img_bytes: bytes, cat_vecs: dict):
+def _apply_ambiguous_vehicle_fallback(ranked):
+    if not ranked:
+        return ranked
+    top_cat, top_score = ranked[0]
+    if top_cat != "交通工具" or top_score >= _VEHICLE_AMBIGUOUS_MAX:
+        return ranked
+
+    candidates = [(cat, score) for cat, score in ranked if cat in _VEHICLE_FALLBACK_CATS]
+    if not candidates:
+        return ranked
+    alt_cat, alt_score = max(candidates, key=lambda x: x[1])
+    if (top_score - alt_score) > _VEHICLE_AMBIGUOUS_MARGIN:
+        return ranked
+
+    reordered = [(alt_cat, alt_score), (top_cat, top_score)]
+    reordered.extend((cat, score) for cat, score in ranked if cat not in {alt_cat, top_cat})
+    return reordered
+
+
+def classify(img_bytes: bytes, cat_vecs: dict, min_score: float = 0.20):
     img_vec = _encode_image(img_bytes)
     scores = {cat: _cosine(img_vec, v) for cat, v in cat_vecs.items()}
-    return sorted(scores.items(), key=lambda x: -x[1])
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    ranked = _apply_ambiguous_vehicle_fallback(ranked)
+    if ranked[0][1] < min_score:
+        ranked = [("不确定", ranked[0][1])] + ranked
+    return ranked
+
+
+def _safe_stem(stem: str) -> str:
+    name = stem.strip().replace(" ", "_")
+    name = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("._ ")
+    return name or "IMG"
+
+
+def _strip_archive_prefix(stem: str) -> str:
+    """去掉文件名里已有的归档前缀（YYYYMMDD_HHMMSS_类别_），可重复剥离。
+
+    防止重复归档时前缀不断叠加（test_1 → ..._风景_test_1 → ..._风景_..._风景_test_1）。
+    只在前缀确实存在时才剥离，普通原名（如 IMG_1001）不受影响。
+    """
+    ts_re = re.compile(r"^\d{8}_\d{6}_")
+    while True:
+        m = ts_re.match(stem)
+        if not m:
+            break
+        stem = stem[m.end():]
+        if "_" in stem:
+            first, rest = stem.split("_", 1)
+            if first in CATEGORIES or first == "待确认":
+                stem = rest
+    return stem
+
+
+def _detect_archive_root(path: Path) -> Path:
+    parts = path.parts
+    for i, p in enumerate(parts):
+        if p in ARCHIVE_ROOT_HINTS:
+            return Path(*parts[: i + 1])
+    return path.parent
+
+
+def _build_target_path(src: Path, category: str, unknown_dir: str) -> Path:
+    root = _detect_archive_root(src)
+    cat_dir = unknown_dir if category == "不确定" else category
+    ts = datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+    stem = _safe_stem(_strip_archive_prefix(src.stem))
+    suffix = src.suffix.lower()
+
+    target_dir = root / cat_dir
+    target = target_dir / f"{ts}_{cat_dir}_{stem}{suffix}"
+    if target == src:
+        return target
+
+    idx = 2
+    while target.exists() and target != src:
+        target = target_dir / f"{ts}_{cat_dir}_{stem}_{idx}{suffix}"
+        idx += 1
+    return target
+
+
+def _move_file(src: Path, dst: Path, dry_run: bool) -> None:
+    if src == dst:
+        return
+    if dry_run:
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
 
 
 def main():
@@ -142,6 +262,10 @@ def main():
     ap.add_argument("paths", nargs="*", help="图片路径")
     ap.add_argument("--dir", help="目录，遍历其中图片")
     ap.add_argument("--recursive", action="store_true", help="递归子目录")
+    ap.add_argument("--archive", action="store_true", help="按规则自动重命名并归档")
+    ap.add_argument("--dry-run", action="store_true", help="仅输出归档计划，不执行移动")
+    ap.add_argument("--min-score", type=float, default=0.20, help="最低置信阈值")
+    ap.add_argument("--unknown-dir", default="待确认", help="低置信度归档目录名")
     args = ap.parse_args()
 
     files = [Path(p) for p in args.paths]
@@ -162,12 +286,27 @@ def main():
         sys.exit(2)
 
     for f in files:
+        if not _is_valid_image(f):
+            print(f"{f}\tSKIP: 文件过小或格式异常（<{_MIN_IMAGE_BYTES}B 或魔数不符），跳过以避免 ML 崩溃",
+                  file=sys.stderr)
+            continue
         try:
             img = f.read_bytes()
-            top = classify(img, cat_vecs)
+            top = classify(img, cat_vecs, min_score=args.min_score)
             best, score = top[0]
             top3 = " ".join(f"{k}={v:.3f}" for k, v in top[:3])
-            print(f"{f}\t建议: {best} (score={score:.3f})\t{top3}")
+            if args.archive:
+                dst = _build_target_path(f, best, args.unknown_dir)
+                try:
+                    _move_file(f, dst, args.dry_run)
+                    action = "PLAN" if args.dry_run else "MOVED"
+                    if f == dst:
+                        action = "SKIP"
+                    print(f"{f}\t建议: {best} (score={score:.3f})\t{top3}\t{action}: {dst}")
+                except OSError as e:
+                    print(f"{f}\tERROR: move failed: {e}", file=sys.stderr)
+            else:
+                print(f"{f}\t建议: {best} (score={score:.3f})\t{top3}")
         except Exception as e:  # noqa: BLE001
             print(f"{f}\tERROR: {e}", file=sys.stderr)
 

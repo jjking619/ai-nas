@@ -12,6 +12,33 @@ from pathlib import Path
 import numpy as np
 import sherpa_onnx
 
+# ---- Hotword-capable transducer models (sherpa-onnx) ----
+# SenseVoice / 离线Paraformer 不支持热词；transducer 系列（在线/离线）支持热词纠偏。
+CONFORMER_MODEL_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-conformer-zh-stateless2-2023-05-23.tar.bz2"
+)
+
+DEFAULT_HOTWORDS = [
+    "家庭相册", "手机相册", "工作文档", "备份", "旅行",
+    "图片", "照片", "文件夹", "文件", "视频",
+    "分类", "移动到", "新建", "删除", "重命名",
+    "打开", "复制", "所有", "全部", "播放",
+]
+
+
+def default_hotwords_path() -> Path:
+    return Path(__file__).resolve().parent / "hotwords.txt"
+
+
+def ensure_hotwords_file(path: Path = None) -> Path:
+    """热词表不存在时自动创建（每行一个词，cjkchar 建模可直接写中文）。"""
+    path = path or default_hotwords_path()
+    if not path.exists():
+        path.write_text("\n".join(DEFAULT_HOTWORDS) + "\n", encoding="utf-8")
+        print(f"[ASR] hotwords file created: {path}")
+    return path
+
 
 def _resolve_sdk_root(folder_name: str) -> Path:
 	env_base = os.getenv("VOICE_SDK_BASE")
@@ -295,63 +322,145 @@ def detect_wakeup(
 	return hit, keyword, output
 
 
+def _download_model_archive(url: str, dest_dir: Path, archive_name: str) -> Path:
+	"""下载并解压 tar.bz2 模型包，返回解压目录。"""
+	dest_dir.mkdir(parents=True, exist_ok=True)
+	archive = dest_dir / archive_name
+	print(f"[ASR] downloading {archive_name} ...")
+	p = run_cmd(["curl", "-L", "-o", str(archive), url])
+	if p.returncode != 0:
+		raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"Failed to download {url}")
+
+	extract_dir = dest_dir / "_extract"
+	if extract_dir.exists():
+		shutil.rmtree(extract_dir)
+	extract_dir.mkdir(parents=True, exist_ok=True)
+	with tarfile.open(archive, "r:bz2") as tf:
+		tf.extractall(extract_dir)
+	archive.unlink(missing_ok=True)
+	return extract_dir
+
+
+def _model_dir_with_files(eng_dir: Path):
+	"""在引擎目录（或其直接子目录）中查找含完整模型文件的目录。
+
+	兼容两种布局：
+	  - 扁平：model_conformer/encoder-*.onnx ...
+	  - 嵌套：model_conformer/sherpa-onnx-conformer-zh-.../encoder-*.onnx ...
+	返回第一个匹配的目录；找不到返回 None。
+	"""
+	if not eng_dir.exists():
+		return None
+	candidates = [eng_dir]
+	candidates += sorted(d for d in eng_dir.iterdir() if d.is_dir())
+	for base in candidates:
+		if (
+			list(base.glob("*encoder*.onnx"))
+			and list(base.glob("*decoder*.onnx"))
+			and list(base.glob("*joiner*.onnx"))
+			and (base / "tokens.txt").exists()
+		):
+			return base
+	return None
+
+
+def ensure_transducer_model(asr_root: Path, engine: str, force_download: bool = True) -> dict:
+	"""获取支持热词的 transducer 模型，返回 {engine, encoder, decoder, joiner, tokens, root}。
+
+	优先复用已存在的模型目录（SDK 自带或历史解压），仅在完全缺失时才下载。
+	"""
+	if engine == "conformer":
+		url = CONFORMER_MODEL_URL
+		rel_dir = "sherpa-onnx-conformer-zh-stateless2-2023-05-23"
+		eng_dir = asr_root / "model_conformer"
+	else:
+		raise ValueError(f"unsupported transducer engine: {engine}")
+
+	base = _model_dir_with_files(eng_dir)
+	if base is None and force_download:
+		# 仅当目录里确实没有完整模型时才下载解压
+		extract_dir = _download_model_archive(url, asr_root, rel_dir + ".tar.bz2")
+		src = _model_dir_with_files(extract_dir)
+		if src is None:
+			shutil.rmtree(extract_dir, ignore_errors=True)
+			raise RuntimeError(f"模型包解压后未找到模型文件: {extract_dir}")
+		eng_dir.mkdir(parents=True, exist_ok=True)
+		# 把解压出的文件并入 eng_dir，绝不 rmtree 已有目录
+		for item in src.iterdir():
+			dst = eng_dir / item.name
+			if dst.exists():
+				if dst.is_dir():
+					shutil.rmtree(dst)
+				else:
+					dst.unlink()
+			shutil.move(str(item), str(dst))
+		shutil.rmtree(extract_dir, ignore_errors=True)
+		print(f"[ASR] {engine} model ready: {eng_dir}")
+		base = eng_dir
+
+	if base is None:
+		raise RuntimeError(
+			f"{engine} 模型未找到: {eng_dir}。"
+			"请放入 encoder/decoder/joiner onnx 与 tokens.txt，或开启自动下载。"
+		)
+
+	def _pick(part: str) -> str:
+		cands = sorted(base.glob(f"*{part}*.onnx"))
+		if not cands:
+			raise RuntimeError(f"missing {part} onnx under {base}")
+		int8 = [c for c in cands if "int8" in c.name]
+		return str((int8 or cands)[0])
+
+	return {
+		"engine": engine,
+		"encoder": _pick("encoder"),
+		"decoder": _pick("decoder"),
+		"joiner": _pick("joiner"),
+		"tokens": str(base / "tokens.txt"),
+		"root": str(base),
+	}
+
+
 def ensure_sensevoice_model(asr_model_dir: Path, force_download: bool) -> Path:
 	int8_model = asr_model_dir / "model.int8.onnx"
 	fp_model = asr_model_dir / "model.onnx"
 
-	if fp_model.exists():
-		return fp_model
+	# CPU 上优先 int8（4~5 倍速度，精度损失很小）；fp32 仅在无 int8 时使用
 	if int8_model.exists():
 		return int8_model
-
-	if not force_download:
-		raise RuntimeError(
-			"ASR model not found. Put model.int8.onnx or model.onnx into "
-			f"{asr_model_dir}"
-		)
-
-	asr_model_dir.mkdir(parents=True, exist_ok=True)
-	archive = asr_model_dir / "sensevoice-int8.tar.bz2"
-	url = (
-		"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
-		"sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
-	)
-
-	print("[ASR] model missing, downloading SenseVoice int8 model...")
-	p = run_cmd(["curl", "-L", "-o", str(archive), url])
-	if p.returncode != 0:
-		raise RuntimeError(p.stderr.strip() or p.stdout.strip() or "Failed to download ASR model")
-
-	extract_dir = asr_model_dir / "_sensevoice_extract"
-	if extract_dir.exists():
-		shutil.rmtree(extract_dir)
-	extract_dir.mkdir(parents=True, exist_ok=True)
-
-	with tarfile.open(archive, "r:bz2") as tf:
-		tf.extractall(extract_dir)
-
-	extracted_model = None
-	extracted_tokens = None
-	for pth in extract_dir.rglob("*"):
-		if pth.name == "model.int8.onnx":
-			extracted_model = pth
-		elif pth.name == "tokens.txt":
-			extracted_tokens = pth
-
-	if extracted_model is None:
-		raise RuntimeError("Downloaded archive does not contain model.int8.onnx")
-
-	shutil.copy2(extracted_model, int8_model)
-	token_path = asr_model_dir / "tokens.txt"
-	if (not token_path.exists()) and extracted_tokens is not None:
-		shutil.copy2(extracted_tokens, token_path)
-
-	shutil.rmtree(extract_dir, ignore_errors=True)
-	archive.unlink(missing_ok=True)
-	return int8_model
+	if fp_model.exists():
+		return fp_model
 
 
-def build_asr_recognizer(asr_root: Path, model_path: Path, language: str):
+def build_asr_recognizer(
+	asr_root: Path,
+	model_path: Path,
+	language: str,
+	engine: str = "sensevoice",
+	hotwords_file: str = "",
+	hotwords_score: float = 2.5,
+):
+	threads = max(1, (os.cpu_count() or 2) // 2)
+
+	# 热词路径：conformer（离线 transducer）支持热词
+	if engine == "conformer":
+		files = ensure_transducer_model(asr_root, engine)
+		hw = ensure_hotwords_file(Path(hotwords_file) if hotwords_file else None)
+		common = {
+			"tokens": files["tokens"],
+			"encoder": files["encoder"],
+			"decoder": files["decoder"],
+			"joiner": files["joiner"],
+			"num_threads": threads,
+			"decoding_method": "modified_beam_search",
+			"hotwords_file": str(hw),
+			"hotwords_score": hotwords_score,
+			"modeling_unit": "cjkchar",
+			"provider": "cpu",
+		}
+		return sherpa_onnx.OfflineRecognizer.from_transducer(**common)
+
+	# 默认 SenseVoice（离线，不支持热词）
 	tokens = asr_root / "model" / "tokens.txt"
 	if not tokens.exists():
 		raise RuntimeError(f"Missing ASR tokens file: {tokens}")
@@ -366,7 +475,7 @@ def build_asr_recognizer(asr_root: Path, model_path: Path, language: str):
 		"tokens": str(tokens),
 		"use_itn": True,
 		"language": language,
-		"num_threads": max(1, (os.cpu_count() or 2) // 2),
+		"num_threads": threads,
 		"provider": "cpu",
 		"debug": False,
 	}
@@ -382,8 +491,9 @@ def build_asr_recognizer(asr_root: Path, model_path: Path, language: str):
 	return sherpa_onnx.OfflineRecognizer.from_sense_voice(**kwargs)
 
 
-def asr_transcribe(recognizer, wav_path: Path) -> str:
+def asr_transcribe(recognizer, wav_path: Path, engine: str = "sensevoice") -> str:
 	sample_rate, samples = load_wav_mono_16k_float(wav_path)
+
 	stream = recognizer.create_stream()
 	stream.accept_waveform(sample_rate, samples)
 	recognizer.decode_stream(stream)
@@ -503,6 +613,14 @@ def parse_args():
 	parser.add_argument("--asr-language", default="zh")
 	parser.add_argument("--asr-model", default="")
 	parser.add_argument("--no-auto-download-asr", action="store_true")
+	parser.add_argument(
+		"--asr-engine",
+		choices=["sensevoice", "conformer"],
+		default="sensevoice",
+		help="sensevoice=不支持热词(默认)；conformer=离线大模型+热词",
+	)
+	parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
+	parser.add_argument("--hotwords-score", type=float, default=2.5, help="热词增益分数")
 
 	parser.add_argument("--once", action="store_true", help="Run one dialog turn and exit")
 	parser.add_argument("--no-play", action="store_true", help="Do not play TTS audio")
@@ -540,13 +658,23 @@ def main():
 	if args.speech_duration < args.speech_min_duration:
 		args.speech_duration = args.speech_min_duration
 
-	asr_model_path = Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
-		asr_root / "model",
-		force_download=not args.no_auto_download_asr,
-	)
+	if args.asr_engine == "sensevoice":
+		asr_model_path = Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
+			asr_root / "model",
+			force_download=not args.no_auto_download_asr,
+		)
+	else:  # conformer
+		asr_model_path = Path(args.asr_model) if args.asr_model else None
 
 	print("[INIT] building ASR recognizer...")
-	recognizer = build_asr_recognizer(asr_root, asr_model_path, args.asr_language)
+	recognizer = build_asr_recognizer(
+		asr_root,
+		asr_model_path,
+		args.asr_language,
+		engine=args.asr_engine,
+		hotwords_file=args.hotwords_file,
+		hotwords_score=args.hotwords_score,
+	)
 	print("[INIT] building TTS engine...")
 	tts = build_tts(tts_root)
 	if args.wake_any_keyword:
@@ -657,7 +785,7 @@ def main():
 			level = wav_level_dbfs(user_wav)
 			print(f"[MIC] speech clip level: {level:.1f} dBFS")
 
-		text = asr_transcribe(recognizer, user_wav)
+		text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
 		print(f"[ASR] text: {text}")
 		if not text:
 			idle_rounds += 1

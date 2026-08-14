@@ -82,12 +82,20 @@ def parse_args():
     parser.add_argument("--asr-language", default="zh")
     parser.add_argument("--asr-model", default="")
     parser.add_argument("--no-auto-download-asr", action="store_true")
+    parser.add_argument(
+        "--asr-engine",
+        choices=["sensevoice", "conformer"],
+        default="conformer",
+        help="sensevoice=不支持热词；conformer=离线大模型+热词",
+    )
+    parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
+    parser.add_argument("--hotwords-score", type=float, default=2.5, help="热词增益分数")
 
     parser.add_argument("--session-idle-rounds", type=int, default=3)
 
     parser.add_argument("--openclaw-container", default="openclaw")
     parser.add_argument("--openclaw-session-key", default="agent:main:voice-bridge")
-    parser.add_argument("--openclaw-timeout", type=int, default=180)
+    parser.add_argument("--openclaw-timeout", type=int, default=300)
     parser.add_argument("--openclaw-dry-run", action="store_true")
 
     parser.add_argument("--no-play", action="store_true")
@@ -259,18 +267,79 @@ def normalize_asr_text(text: str) -> str:
         "家庭象册": "家庭相册",
         "手机册": "手机相册",
         "手机像册": "手机相册",
-        "工作文档": "工作文档",
-        "备份": "备份",
-        "旅行": "旅行",
+        "手机象册": "手机相册",
     }
     for wrong, right in replacements.items():
         text = text.replace(wrong, right)
+
+    # 上下文补全：仅当句子属于 NAS 操作语境时，才做"缺字补全"，降低误伤
+    is_nas_cmd = any(k in text for k in ("分类", "照片", "相册", "图片", "移动", "整理", "备份"))
+    if is_nas_cmd:
+        for base, full in (("家庭", "家庭相册"), ("手机", "手机相册")):
+            if base in text and full not in text:
+                for d in ("下面", "里面", "里的", "中的", "内", "下", "里"):
+                    pat = f"{base}{d}"
+                    if pat in text:
+                        text = text.replace(pat, f"{full}{d}")
+                        break
+        text = text.replace("所有图", "所有图片")
+        text = text.replace("全部图", "全部图片")
     return text
+
+
+def _fast_local_classify_reply(args, user_text):
+    """命中明确分类指令时，直跑脚本，避免 agent 多轮推理超时。
+
+    返回 None 表示不命中，交给 agent 正常处理。
+    """
+    want = any(k in user_text for k in ("分类", "归档", "整理", "重命名", "清理"))
+    is_photo = any(k in user_text for k in ("照片", "图片", "相册"))
+    if not (want and is_photo):
+        return None
+
+    roots = ("手机相册", "家庭相册", "旅行", "备份")
+    target = next((r for r in roots if r in user_text), None)
+    if target is None:
+        return None
+
+    dry = any(k in user_text for k in ("预览", "看看", "先别动", "计划"))
+    cmd = [
+        "docker",
+        "exec",
+        args.openclaw_container,
+        "python3",
+        "/nas_share/tools/nas_classify.py",
+        "--dir",
+        f"/nas_share/{target}",
+        "--recursive",
+        "--dry-run" if dry else "--archive",
+    ]
+    ok, output = _run_agent_cmd(cmd, timeout_sec=120)
+    if not ok:
+        return f"分类脚本执行失败：{output[:120]}"
+
+    counts = {}
+    for line in output.splitlines():
+        if "\t建议:" not in line:
+            continue
+        cat = line.split("\t建议:", 1)[1].split("(", 1)[0].strip()
+        counts[cat] = counts.get(cat, 0) + 1
+    if not counts:
+        return f"{target}分类脚本已执行。"
+
+    summary = "，".join(f"{k}{v}张" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
+    if dry:
+        return f"预览结果：{target} {summary}，未做任何改动。"
+    return f"{target}分类完成：{summary}。"
 
 
 def ask_openclaw(args, user_text):
     if args.openclaw_dry_run:
         return f"[dry-run] 你说的是：{user_text}"
+
+    fast_reply = _fast_local_classify_reply(args, user_text)
+    if fast_reply is not None:
+        return fast_reply
 
     bridge_prompt = (
         "你是quectel pi上的语音助手，负责执行用户口头指令。"
@@ -280,11 +349,13 @@ def ask_openclaw(args, user_text):
         "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
         "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
         "  备份、家庭相册、工作文档、手机相册、旅行\n"
-        "照片分类规则：当用户要求对照片按内容分类时，禁止仅凭文件名猜测。"
-        "必须先用 exec 工具运行AI图像分类脚本获取每张图的类别建议，再按建议移动：\n"
-        "  timeout 30 python3 /nas_share/tools/nas_classify.py <图片1> <图片2> ...\n"
-        "脚本会输出每张图建议的类别（人物/动物/美食/风景/植物/建筑/交通工具/日常用品）。"
-        "然后使用 nas_files 的 create_directory 和 move_file 把图片移到对应类别子目录。\n"
+        "照片分类归档规则：当用户要求按内容分类/归档/整理时，禁止仅凭文件名猜测。"
+        "优先用 exec 工具一次性执行脚本自动归档（识别+重命名+移动）：\n"
+        "  timeout 120 python3 /nas_share/tools/nas_classify.py --dir <目录> --recursive --archive\n"
+        "默认直接执行归档；只有用户明确说“预览/先别动”才允许 dry-run。\n"
+        "发现重复前缀文件名时，直接自动清理并重命名，不要询问用户确认。\n"
+        "脚本归档规则：按内容分类到类别目录，并重命名为 YYYYMMDD_HHMMSS_类别_原文件名.ext；"
+        "低置信度会归入“待确认”。只有脚本模式失败时，才回退 nas_files 手动逐个移动。\n"
         f"用户指令：{user_text}"
     )
 
@@ -361,13 +432,23 @@ def main():
     if args.speech_duration < args.speech_min_duration:
         args.speech_duration = args.speech_min_duration
 
-    asr_model_path = Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
-        asr_root / "model",
-        force_download=not args.no_auto_download_asr,
-    )
+    if args.asr_engine == "sensevoice":
+        asr_model_path = Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
+            asr_root / "model",
+            force_download=not args.no_auto_download_asr,
+        )
+    else:
+        asr_model_path = Path(args.asr_model) if args.asr_model else None
 
-    print("[INIT] building ASR recognizer...")
-    recognizer = build_asr_recognizer(asr_root, asr_model_path, args.asr_language)
+    print(f"[INIT] building ASR recognizer (engine={args.asr_engine})...")
+    recognizer = build_asr_recognizer(
+        asr_root,
+        asr_model_path,
+        args.asr_language,
+        engine=args.asr_engine,
+        hotwords_file=args.hotwords_file,
+        hotwords_score=args.hotwords_score,
+    )
     print("[INIT] building TTS engine...")
     tts = build_tts(tts_root)
 
@@ -455,7 +536,7 @@ def main():
         level = wav_level_dbfs(user_wav)
         print(f"[MIC] speech clip level: {level:.1f} dBFS")
 
-        text = asr_transcribe(recognizer, user_wav)
+        text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
         normalized = normalize_asr_text(text)
         if normalized != text:
             print(f"[ASR] normalized: {normalized}")
