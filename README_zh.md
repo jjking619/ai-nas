@@ -127,6 +127,10 @@ cp /home/pi/NAS-Demo/local_voice_chat/nas_classify.py /home/pi/nas_share/tools/n
 sudo -n docker exec openclaw sh -lc 'getent hosts immich-machine-learning && curl -s -o /dev/null -w "%{http_code}\n" --max-time 5 http://immich-machine-learning:3003'
 ```
 
+> **维护约定：`nas_classify.py` 的唯一源码是 `local_voice_chat/nas_classify.py`**（仓库根目录的同名文件已废弃删除）。
+> 修改只改这一份并提交 git；`voice_bridge.py` 启动时会自动同步到 `/nas_share/tools/nas_classify.py`，
+> 若未重启服务可手动执行上面的 `cp` 命令同步。
+
 补充：
 - `local_voice_chat/nas_classify.py` 已加入 3 秒连通性检查，不可达时会快速报错并提示 `docker start immich-machine-learning`。
 - `voice_bridge.py` 的分类命令已改为 `timeout 120 python3 /nas_share/tools/nas_classify.py ...`，并支持脚本内自动归档，避免长时间阻塞与多步误操作。

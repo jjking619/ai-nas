@@ -1,0 +1,7 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地运行副本（唯一源码在 local_voice_chat/nas_classify.py，由 voice_bridge 启动时自动同步）
+# /nas_share 挂载目录是运行时数据，不进 git
+nas_share/
