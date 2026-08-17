@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -71,6 +72,18 @@ def parse_args():
     parser.add_argument("--wake-mlp", default=str(kws_root / "res_shuffnet_v2" / "mlp.bin"))
 
     parser.add_argument("--wake-duration", type=float, default=4.0)
+    parser.add_argument(
+        "--wake-low-level-dbfs",
+        type=float,
+        default=-43.0,
+        help="Wake录音低于该电平且首次未命中时，触发一次增益重试",
+    )
+    parser.add_argument(
+        "--wake-boost-db",
+        type=float,
+        default=6.0,
+        help="低电平重试时的增益(dB)，设为0可关闭",
+    )
     parser.add_argument("--record-backend", choices=["auto", "pulse", "alsa"], default="auto")
     parser.add_argument("--mic-input", default="default")
 
@@ -97,6 +110,25 @@ def parse_args():
     parser.add_argument("--openclaw-session-key", default="agent:main:voice-bridge")
     parser.add_argument("--openclaw-timeout", type=int, default=300)
     parser.add_argument("--openclaw-dry-run", action="store_true")
+
+    parser.add_argument(
+        "--tts-max-chars",
+        type=int,
+        default=80,
+        help="TTS常规最大播报字数",
+    )
+    parser.add_argument(
+        "--tts-brief-max-chars",
+        type=int,
+        default=36,
+        help="短指令场景下的TTS压缩播报上限",
+    )
+    parser.add_argument(
+        "--tts-brief-user-len",
+        type=int,
+        default=12,
+        help="用户输入长度小于等于该值时，启用短回复优先",
+    )
 
     parser.add_argument("--no-play", action="store_true")
     parser.add_argument("--work-dir", default="/tmp/voice_bridge")
@@ -344,7 +376,7 @@ def ask_openclaw(args, user_text):
     bridge_prompt = (
         "你是quectel pi上的语音助手，负责执行用户口头指令。"
         "可调用你已有工具（如文件/NAS/相册等）来完成任务。"
-        "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过50字。"
+        "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过20字。"
         "严禁使用markdown格式（如**加粗**、-列表、#标题），只输出纯文字。\n"
         "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
         "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
@@ -396,6 +428,77 @@ def ask_openclaw(args, user_text):
     if text:
         return text
     return "OpenClaw返回为空"
+
+
+_IMPORTANT_REPLY_HINTS = (
+    "失败",
+    "错误",
+    "警告",
+    "风险",
+    "确认",
+    "不可",
+    "无法",
+    "删除",
+    "覆盖",
+)
+
+_SHORT_CMD_HINTS = (
+    "打开",
+    "关闭",
+    "开始",
+    "停止",
+    "退出",
+    "查询",
+    "看",
+    "播放",
+    "暂停",
+    "分类",
+    "整理",
+    "移动",
+    "重命名",
+)
+
+
+def _sanitize_reply_for_tts(reply: str) -> str:
+    reply = re.sub(r"\*+", "", reply)
+    reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
+    reply = re.sub(r"[_`]", "", reply)
+    reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；""''（）…—\s]", "", reply)
+    reply = re.sub(r"\s+", " ", reply).strip()
+    return reply
+
+
+def _first_sentence(text: str) -> str:
+    m = re.search(r"[。！？!?；;]", text)
+    if not m:
+        return text
+    return text[: m.end()].strip()
+
+
+def _adaptive_tts_reply(user_text: str, reply: str, max_chars: int, brief_max_chars: int, brief_user_len: int):
+    """根据用户话轮长度动态压缩播报内容，并保留可恢复详情。"""
+    if not reply:
+        return "", ""
+
+    max_chars = max(16, max_chars)
+    brief_max_chars = max(12, brief_max_chars)
+    brief_user_len = max(1, brief_user_len)
+
+    important = any(k in reply for k in _IMPORTANT_REPLY_HINTS)
+    short_cmd = (len(user_text.strip()) <= brief_user_len) or any(k in user_text for k in _SHORT_CMD_HINTS)
+
+    if short_cmd and (not important):
+        first = _first_sentence(reply)
+        spoken = first if len(first) <= brief_max_chars else (first[:brief_max_chars].rstrip("，、；:： ") + "。")
+        if spoken != reply:
+            return spoken, reply
+        return spoken, ""
+
+    if len(reply) > max_chars:
+        spoken = reply[:max_chars].rstrip("，、；:： ") + "。"
+        return spoken, reply
+
+    return reply, ""
 
 
 def main():
@@ -466,6 +569,7 @@ def main():
 
     session_awake = False
     idle_rounds = 0
+    pending_reply_detail = ""
 
     while True:
         wake_wav = work_dir / "wake.wav"
@@ -506,6 +610,58 @@ def main():
                     wake_mlp,
                 )
                 matched_bin = wake_keyword_bin
+
+            # 低音量下首次未命中：做一次增益重试，降低漏唤醒
+            if (not hit) and (level < args.wake_low_level_dbfs) and (args.wake_boost_db > 0):
+                boosted_wav = work_dir / "wake_boost.wav"
+                print(
+                    f"[KWS] low-level clip ({level:.1f} dBFS), retry with +{args.wake_boost_db:.1f} dB"
+                )
+                p = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(wake_wav),
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-af",
+                        f"volume={args.wake_boost_db}dB",
+                        str(boosted_wav),
+                        "-loglevel",
+                        "error",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if p.returncode == 0 and boosted_wav.exists():
+                    boosted_level = wav_level_dbfs(boosted_wav)
+                    print(f"[MIC] boosted wake clip level: {boosted_level:.1f} dBFS")
+                    if args.wake_any_keyword:
+                        hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
+                            kws_root,
+                            boosted_wav,
+                            wake_keyword_bins,
+                            wake_filler,
+                            wake_mlp,
+                        )
+                    else:
+                        hit, hit_keyword, _raw = detect_wakeup(
+                            kws_root,
+                            boosted_wav,
+                            wake_keyword_bin,
+                            wake_filler,
+                            wake_mlp,
+                        )
+                        matched_bin = wake_keyword_bin
+                else:
+                    err = (p.stderr or p.stdout or "ffmpeg boost failed").strip()
+                    print(f"[KWS] boost retry skipped: {err}")
+
+                boosted_wav.unlink(missing_ok=True)
 
             if not hit:
                 print("[KWS] no wake word detected.")
@@ -554,6 +710,24 @@ def main():
 
         idle_rounds = 0
 
+        if pending_reply_detail and any(k in text for k in ("继续", "详细", "详情", "补充", "说完")):
+            detail = pending_reply_detail
+            pending_reply_detail = ""
+            reply = f"补充说明：{detail}"
+            reply = _sanitize_reply_for_tts(reply)
+            spoken, tail = _adaptive_tts_reply(
+                text,
+                reply,
+                max_chars=args.tts_max_chars,
+                brief_max_chars=args.tts_brief_max_chars,
+                brief_user_len=args.tts_brief_user_len,
+            )
+            if tail:
+                pending_reply_detail = tail
+            print(f"[OpenClaw] reply: {spoken}")
+            tts_speak(tts, spoken, reply_wav, play=not args.no_play)
+            continue
+
         # Local control keywords for bridge process
         if any(k in text for k in ("休眠", "停止监听", "待机")):
             session_awake = False
@@ -569,20 +743,25 @@ def main():
             print("[EXIT] done")
             break
 
-        reply = ask_openclaw(args, text)
-        # Strip markdown symbols that TTS cannot pronounce
-        import re
-        reply = re.sub(r"\*+", "", reply)
-        reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
-        reply = re.sub(r"[_`]", "", reply)
-        reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；""''（）…—\s]", "", reply)
-        reply = re.sub(r"\s+", " ", reply).strip()
-        # Guard TTS from very long outputs
-        if len(reply) > 80:
-            reply = reply[:80] + "。"
+        processing_hint = "正在处理，请稍等。"
+        print(f"[OpenClaw] processing: {processing_hint}")
+        tts_speak(tts, processing_hint, reply_wav, play=not args.no_play)
 
-        print(f"[OpenClaw] reply: {reply}")
-        tts_speak(tts, reply, reply_wav, play=not args.no_play)
+        reply = ask_openclaw(args, text)
+        reply = _sanitize_reply_for_tts(reply)
+        spoken_reply, tail = _adaptive_tts_reply(
+            text,
+            reply,
+            max_chars=args.tts_max_chars,
+            brief_max_chars=args.tts_brief_max_chars,
+            brief_user_len=args.tts_brief_user_len,
+        )
+        pending_reply_detail = tail
+        if tail:
+            print("[TTS] long reply shortened; say '继续' to hear more")
+
+        print(f"[OpenClaw] reply: {spoken_reply}")
+        tts_speak(tts, spoken_reply, reply_wav, play=not args.no_play)
 
 
 if __name__ == "__main__":
