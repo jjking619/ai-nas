@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/home/pi/openclaw-casaos"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
+APP_DIR="$SCRIPT_DIR"
+if [[ ! -f "$APP_DIR/openclaw.bootstrap.json" && -f "/home/pi/NAS-Demo/openclaw.bootstrap.json" ]]; then
+  APP_DIR="/home/pi/NAS-Demo"
+fi
 BOOTSTRAP_CONFIG="$APP_DIR/openclaw.bootstrap.json"
 DATA_DIR="/DATA/AppData/openclaw"
 TARGET_CONFIG="$DATA_DIR/openclaw.json"

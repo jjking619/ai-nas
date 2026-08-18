@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/home/pi/openclaw-casaos"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
+APP_DIR="$SCRIPT_DIR"
+if [[ ! -f "$APP_DIR/deploy.sh" && -f "/home/pi/NAS-Demo/deploy.sh" ]]; then
+  APP_DIR="/home/pi/NAS-Demo"
+fi
 
 docker_cmd() {
   if [[ "${EUID}" -eq 0 ]]; then
@@ -23,6 +27,8 @@ Usage:
   ./oc.sh model
   ./oc.sh tools-nas-setup
   ./oc.sh tools-nas-show
+  ./oc.sh tools-media-setup
+  ./oc.sh tools-media-show
   ./oc.sh tools-immich-setup
   ./oc.sh tools-immich-show
   ./oc.sh pair-list
@@ -30,6 +36,8 @@ Usage:
   ./oc.sh immich-apply       Apply immich-compose.yml to CasaOS
   ./oc.sh immich-show        Show current CasaOS Immich config
   ./oc.sh immich-sync-jobs   Trigger Immich ML jobs (faceDetection + smartSearch)
+  ./oc.sh jellyfin-deploy    Start Jellyfin (jellyfin-compose.yml)
+  ./oc.sh jellyfin-show      Show Jellyfin container status
 EOF
 }
 
@@ -70,6 +78,38 @@ case "${1:-}" in
     ;;
   tools-nas-show)
     docker_cmd exec openclaw node dist/index.js mcp show nas_files --json
+    ;;
+  tools-media-setup)
+    mkdir -p /home/pi/nas_share/downloads/家庭影院
+    mkdir -p /home/pi/nas_share/tools
+    cp "$APP_DIR/local_voice_chat/download_media_mcp.js" /home/pi/nas_share/tools/download_media_mcp.js
+
+    if ! docker_cmd ps --format '{{.Names}}' | grep -qx media_downloader; then
+      if docker_cmd ps -a --format '{{.Names}}' | grep -qx media_downloader; then
+        docker_cmd start media_downloader >/dev/null
+      else
+        docker_cmd build -t nas-media-downloader:local "$APP_DIR/media_downloader"
+        docker_cmd run -d \
+          --name media_downloader \
+          --restart unless-stopped \
+          -e DOWNLOAD_ROOT=/downloads \
+          -e PORT=8081 \
+          -e YTDLP_TIMEOUT_SEC=1800 \
+          -e DOWNLOAD_TTS_TEXT="下载已完成" \
+          -v /home/pi/nas_share/downloads:/downloads \
+          -p 28081:8081 \
+          nas-media-downloader:local >/dev/null
+      fi
+    fi
+
+    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://host.docker.internal:28081/download","DOWNLOAD_ROOT_LABEL":"/home/pi/nas_share/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成"}}'
+    docker_cmd exec openclaw node dist/index.js mcp reload
+    docker_cmd restart openclaw
+    echo "Media download tool configured."
+    echo "Download root: /home/pi/nas_share/downloads"
+    ;;
+  tools-media-show)
+    docker_cmd exec openclaw node dist/index.js mcp show download_media --json
     ;;
   tools-immich-setup)
     # Read env vars from running container (set in docker-compose.yml)
@@ -134,6 +174,20 @@ case "${1:-}" in
       -H "x-api-key: ${KEY}" -H "Content-Type: application/json" \
       -d '{"command":"start","force":false}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('smartSearch active:',d.get('queueStatus',{}).get('isActive'))"
     echo "Jobs triggered. New photos will be indexed shortly."
+    ;;
+  jellyfin-deploy)
+    JELLYFIN_COMPOSE="${APP_DIR}/jellyfin-compose.yml"
+    if [[ ! -f "${JELLYFIN_COMPOSE}" ]]; then
+      echo "ERROR: ${JELLYFIN_COMPOSE} not found"
+      exit 1
+    fi
+    casaos-cli app-management install -f "${JELLYFIN_COMPOSE}"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "Jellyfin installed to CasaOS (asynchronous). Open http://${ip:-<your-host-ip>}:8096"
+    echo "First run: 建库时选 /media 下的子目录，建议关闭 Admin > Playback > Transcoding"
+    ;;
+  jellyfin-show)
+    docker_cmd ps -a --filter name=jellyfin --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     ;;
   ""|-h|--help|help)
     usage

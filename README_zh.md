@@ -10,17 +10,21 @@
 新增了一个轻量脚本 [oc.sh](oc.sh)，只封装常用命令，不改现有部署逻辑。
 
 ```bash
-chmod +x /home/pi/openclaw-casaos/oc.sh
-/home/pi/openclaw-casaos/oc.sh deploy
-/home/pi/openclaw-casaos/oc.sh status
-/home/pi/openclaw-casaos/oc.sh logs
-/home/pi/openclaw-casaos/oc.sh health
-/home/pi/openclaw-casaos/oc.sh url
-/home/pi/openclaw-casaos/oc.sh model
-/home/pi/openclaw-casaos/oc.sh tools-nas-setup
-/home/pi/openclaw-casaos/oc.sh tools-nas-show
-/home/pi/openclaw-casaos/oc.sh pair-list
-/home/pi/openclaw-casaos/oc.sh pair-approve <request_id>
+chmod +x /home/pi/NAS-Demo/oc.sh
+/home/pi/NAS-Demo/oc.sh deploy
+/home/pi/NAS-Demo/oc.sh status
+/home/pi/NAS-Demo/oc.sh logs
+/home/pi/NAS-Demo/oc.sh health
+/home/pi/NAS-Demo/oc.sh url
+/home/pi/NAS-Demo/oc.sh model
+/home/pi/NAS-Demo/oc.sh tools-nas-setup
+/home/pi/NAS-Demo/oc.sh tools-nas-show
+/home/pi/NAS-Demo/oc.sh tools-media-setup
+/home/pi/NAS-Demo/oc.sh tools-media-show
+/home/pi/NAS-Demo/oc.sh pair-list
+/home/pi/NAS-Demo/oc.sh pair-approve <request_id>
+/home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）
+/home/pi/NAS-Demo/oc.sh jellyfin-show     # 查看 Jellyfin 容器状态
 ```
 
 `pair-approve` 会自动去掉你从页面复制时常见的末尾中文句号 `。`。
@@ -33,8 +37,8 @@ chmod +x /home/pi/openclaw-casaos/oc.sh
 执行以下命令即可启用文件管理工具并重启容器：
 
 ```bash
-/home/pi/openclaw-casaos/oc.sh deploy
-/home/pi/openclaw-casaos/oc.sh tools-nas-setup
+/home/pi/NAS-Demo/oc.sh deploy
+/home/pi/NAS-Demo/oc.sh tools-nas-setup
 ```
 
 启用后可在 OpenClaw 里用自然语言触发，例如：
@@ -47,6 +51,66 @@ chmod +x /home/pi/openclaw-casaos/oc.sh
 - `move_file` 已按原名暴露
 - `list_files` 对应 `list_directory`
 - `create_folder` 对应 `create_directory`
+
+### 0.1.0 媒体下载工具（download_media）
+
+目标：最小改动接入 yt-dlp 下载能力，默认落盘到 `/home/pi/nas_share/downloads`。
+
+启用步骤：
+
+```bash
+cd /home/pi/NAS-Demo
+./oc.sh deploy
+./oc.sh tools-media-setup
+./oc.sh tools-media-show
+```
+
+说明：`tools-media-setup` 会自动同步 MCP 脚本到 `/home/pi/nas_share/tools/`，并在需要时自动构建/启动 `media_downloader` 容器（即使系统缺少 docker compose 插件）。
+
+能力说明：
+- 工具名：`download_media`
+- 下载根目录固定：`/home/pi/nas_share/downloads`
+- 自然语言目标目录会映射到该根目录子目录（如“家庭影院文件夹” -> `家庭影院`）
+- 默认完成通知文案：`下载已完成`（可在调用参数中关闭或自定义）
+
+示例指令：
+
+```text
+下载《流浪地球3》预告片，放到家庭影院文件夹
+```
+
+#### 0.1.0.1 下载服务“连不上”的根因与修复（2026-08-18 实测）
+
+现象：OpenClaw 回复“下载服务连不上，无法下载”，但 `curl http://localhost:28081/healthz` 正常。
+
+根因：**MCP 脚本 `download_media_mcp.js` 与 openclaw 内置 MCP SDK 的 stdio 传输协议不匹配**。
+
+- openclaw 容器内的 `@modelcontextprotocol/sdk` 版本为 **1.29.0**，
+  其 stdio 传输格式是**换行分隔 JSON**（发送 `JSON.stringify(message) + '\n'`，读取按 `\n` 分割）。
+- 而 `download_media_mcp.js` 旧实现是 **Content-Length 帧协议**（LSP 风格，`\r\n\r\n` 分隔）。
+- 结果：openclaw 发来的消息脚本永远解析不到，30 秒后报
+  `[bundle-mcp] failed to start server "download_media" ... MCP server connection timed out after 30000ms`，
+  agent 因此看不到 `download_media` 工具，只能退回 curl 直接下载（还能下载，但绕过了媒体目录映射）。
+
+修复（已写入 `local_voice_chat/download_media_mcp.js`，需重新同步到 `/nas_share/tools/` 并重启 openclaw）：
+
+1. `send()` 输出改为换行分隔 JSON（`JSON.stringify(msg) + '\n'`）。
+2. stdin 解析**同时兼容**两种协议：优先按 `\n` 切行解析 JSON；若没有换行则回退到 Content-Length 帧（兼容旧客户端）。
+3. 顺手修复同类目录映射 bug：`shortMap` 中 `电影/剧集/电视剧` 必须排在 `家庭影院` 前面，
+   否则 `家庭影院/电影` 会被 `家庭影院` 分支先命中而被扁平化成 `家庭影院`（与 `api_server.py` 的 `_safe_subdir` 同款问题）。
+
+同步与验证：
+
+```bash
+cp /home/pi/NAS-Demo/local_voice_chat/download_media_mcp.js /home/pi/nas_share/tools/download_media_mcp.js
+sudo docker restart openclaw
+# 验证 MCP 脚本能响应换行分隔 JSON：
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n' \
+  | sudo docker exec -i openclaw sh -c 'timeout 10 node /nas_share/tools/download_media_mcp.js'
+```
+
+验证通过的结果：agent 用 `download_media` 工具下载测试视频，正确落盘到
+`/home/pi/nas_share/downloads/家庭影院/电影/`，Jellyfin 电影库实时扫描可见。
 
 ### 0.1.1 NAS 挂载成功但语音无法移动文件的原因
 
@@ -298,6 +362,52 @@ CasaOS 图标点击
   → JS 导航整个 tab 到 https://10.55.84.133:24190/#token=casaos
   → OpenClaw 界面
 ```
+
+## 0.3 Jellyfin 家庭影院（播放下载的视频）
+
+目标：用 Jellyfin 播放 `media_downloader` 下载到 `/home/pi/nas_share/downloads` 的视频，
+提供海报墙、多端播放、断点续播，并集成进 CasaOS。
+
+实现文件（最小改动）：
+
+- [jellyfin-compose.yml](jellyfin-compose.yml) — 官方 `jellyfin/jellyfin:latest`（arm64 可用）
+- `oc.sh` 新增 `jellyfin-deploy` / `jellyfin-show` 两条命令
+
+部署方式（本机**没有** `docker compose` 插件，走 CasaOS CLI，与 Immich 相同套路）：
+
+```bash
+cd /home/pi/NAS-Demo
+./oc.sh jellyfin-deploy
+# 输出 "compose app is being installed asynchronously" 后容器异步创建
+./oc.sh jellyfin-show
+```
+
+路径映射：
+
+| 宿主机 | 容器内 | 说明 |
+|---|---|---|
+| `/DATA/AppData/jellyfin/config` | `/config` | Jellyfin 配置 |
+| `/DATA/AppData/jellyfin/cache` | `/cache` | 缓存 |
+| `/home/pi/nas_share/downloads` | `/media` | 只读挂载，媒体库根目录 |
+
+首次访问：
+
+- 地址：`http://<你的CasaOS主机IP>:8096`
+- 首次启动有约 10~20 秒数据库初始化，期间网页打不开属正常，稍等刷新即可
+- 若宿主机有防火墙，需放行端口：`sudo iptables -A INPUT -p tcp --dport 8096 -j ACCEPT`
+
+首次向导完成后必做：
+
+1. 建媒体库：类型选「电影」→ 路径 `/media/家庭影院/电影`；再建类型「电视节目」→ `/media/家庭影院/剧集`
+2. 关闭转码：管理后台 → 控制台 → 播放 → 转码 → 取消勾选「允许转码」（树莓派 CPU 弱，必须关）
+
+常见坑（已踩过并修复）：
+
+1. `./oc.sh: line 187: docker-compose: command not found`
+   → 本机没有旧版 `docker-compose`，也不要尝试 `docker compose`（没有该插件）。
+   部署统一走 `casaos-cli app-management install -f`。
+2. `Error: 404 Not Found - compose app 'jellyfin' not found`
+   → 首次部署要用 `install` 而不是 `apply`（`apply` 只对已安装的 app 生效）。
 
 ## 1. 在 CasaOS 中导入 Compose
 

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/home/pi/openclaw-casaos"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
+APP_DIR="$SCRIPT_DIR"
+if [[ ! -f "$APP_DIR/docker-compose.yml" && -f "/home/pi/NAS-Demo/docker-compose.yml" ]]; then
+  APP_DIR="/home/pi/NAS-Demo"
+fi
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 BOOTSTRAP_CONFIG="$APP_DIR/openclaw.bootstrap.json"
 DATA_DIR="/DATA/AppData/openclaw"

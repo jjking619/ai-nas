@@ -1,0 +1,305 @@
+#!/usr/bin/env node
+
+const DEFAULT_API_URL = process.env.DOWNLOAD_API_URL || "http://media_downloader:8081/download";
+const DOWNLOAD_ROOT_LABEL = process.env.DOWNLOAD_ROOT_LABEL || "/home/pi/nas_share/downloads";
+const DEFAULT_NOTIFY_TEXT = process.env.DOWNLOAD_NOTIFY_TEXT || "下载已完成";
+const REQUEST_TIMEOUT_MS = Number(process.env.DOWNLOAD_API_TIMEOUT_MS || 15 * 60 * 1000);
+
+const TOOL = {
+  name: "download_media",
+  description:
+    "下载媒体到NAS目录。仅允许写入 /home/pi/nas_share/downloads 及其子目录。支持 URL 或关键词搜索。",
+  inputSchema: {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+        description: "媒体链接（可选，与query二选一）",
+      },
+      query: {
+        type: "string",
+        description: "搜索关键词（可选，例如：流浪地球3 预告片）",
+      },
+      target_folder: {
+        type: "string",
+        description: "目标文件夹描述，例如：家庭影院文件夹、电影",
+      },
+      notify_tts: {
+        type: "boolean",
+        description: "下载完成后是否触发TTS通知，默认 true",
+      },
+      tts_message: {
+        type: "string",
+        description: "自定义TTS通知文案，默认 下载已完成",
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
+const shortMap = [
+  ["电影", "家庭影院/电影"],
+  ["剧集", "家庭影院/剧集"],
+  ["电视剧", "家庭影院/剧集"],
+  ["音乐", "音乐"],
+  ["短视频", "视频"],
+  ["视频", "视频"],
+  ["家庭影院", "家庭影院"],
+];
+
+function mapTargetFolder(raw) {
+  const v = String(raw || "").trim();
+  if (!v) return "家庭影院";
+
+  const compact = v.replace(/\s+/g, "");
+  for (const [k, val] of shortMap) {
+    if (compact.includes(k)) return val;
+  }
+
+  const safe = v
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((part) =>
+      part
+        .replace(/\.\./g, "")
+        .replace(/[^\w\u4e00-\u9fff\-()（）\[\]【】 .]/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^[._ ]+|[._ ]+$/g, "")
+        .slice(0, 80)
+    )
+    .filter(Boolean)
+    .join("/");
+
+  return safe || "家庭影院";
+}
+
+function send(msg) {
+  const json = JSON.stringify(msg);
+  // MCP SDK stdio 协议：换行分隔 JSON（`JSON.stringify(message) + '\n'`）
+  process.stdout.write(`${json}\n`);
+}
+
+function ok(id, result) {
+  send({ jsonrpc: "2.0", id, result });
+}
+
+function fail(id, code, message) {
+  send({ jsonrpc: "2.0", id, error: { code, message } });
+}
+
+async function callDownloadApi(args) {
+  const url = String(args.url || "").trim();
+  const query = String(args.query || "").trim();
+
+  if (!url && !query) {
+    return {
+      ok: false,
+      error: "url 或 query 至少提供一个",
+      status: 400,
+    };
+  }
+
+  const payload = {
+    url,
+    query,
+    target_subdir: mapTargetFolder(args.target_folder),
+    notify_tts: args.notify_tts !== false,
+    tts_message: String(args.tts_message || DEFAULT_NOTIFY_TEXT).trim() || DEFAULT_NOTIFY_TEXT,
+  };
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const resp = await fetch(DEFAULT_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctl.signal,
+    });
+    const data = await resp.json().catch(() => ({}));
+    return {
+      ok: resp.ok && !!data.ok,
+      status: resp.status,
+      data,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 500,
+      error: err && err.name === "AbortError" ? "下载请求超时" : String(err),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function renderSuccess(data) {
+  const safeSubdir = data.safe_subdir || "家庭影院";
+  const files = Array.isArray(data.files) ? data.files : [];
+  const first = files.length > 0 ? files[0] : "(文件名未返回)";
+  const ttsText = data.notify_tts ? `；通知：${data.tts_text || DEFAULT_NOTIFY_TEXT}` : "";
+  const summary = `下载已完成，目录：${safeSubdir}，文件数：${files.length}${ttsText}`;
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: `${summary}\n首个文件：${first}`,
+      },
+    ],
+    structuredContent: {
+      ok: true,
+      summary,
+      safe_subdir: safeSubdir,
+      files,
+      notify_tts: !!data.notify_tts,
+      notify_status: data.notify_status || "unknown",
+      download_root: DOWNLOAD_ROOT_LABEL,
+    },
+  };
+}
+
+async function onToolCall(id, params) {
+  const name = params && params.name;
+  const args = (params && params.arguments) || {};
+
+  if (name !== TOOL.name) {
+    ok(id, {
+      content: [{ type: "text", text: `未知工具: ${name}` }],
+      isError: true,
+    });
+    return;
+  }
+
+  const ret = await callDownloadApi(args);
+  if (!ret.ok) {
+    const msg = ret.data && ret.data.error ? ret.data.error : ret.error || "下载失败";
+    ok(id, {
+      content: [
+        {
+          type: "text",
+          text: `下载失败：${msg}`,
+        },
+      ],
+      isError: true,
+      structuredContent: {
+        ok: false,
+        status: ret.status,
+        error: msg,
+        download_root: DOWNLOAD_ROOT_LABEL,
+      },
+    });
+    return;
+  }
+
+  ok(id, renderSuccess(ret.data || {}));
+}
+
+async function handle(msg) {
+  if (!msg || msg.jsonrpc !== "2.0") return;
+
+  const id = Object.prototype.hasOwnProperty.call(msg, "id") ? msg.id : null;
+  const method = msg.method;
+
+  if (!method) return;
+
+  if (method === "initialize") {
+    ok(id, {
+      protocolVersion: (msg.params && msg.params.protocolVersion) || "2024-11-05",
+      capabilities: { tools: {} },
+      serverInfo: { name: "download-media-mcp", version: "0.1.0" },
+    });
+    return;
+  }
+
+  if (method === "initialized") {
+    return;
+  }
+
+  if (method === "ping") {
+    if (id !== null) ok(id, {});
+    return;
+  }
+
+  if (method === "tools/list") {
+    ok(id, { tools: [TOOL] });
+    return;
+  }
+
+  if (method === "tools/call") {
+    await onToolCall(id, msg.params || {});
+    return;
+  }
+
+  if (id !== null) {
+    fail(id, -32601, `Method not found: ${method}`);
+  }
+}
+
+let buf = Buffer.alloc(0);
+process.stdin.on("data", async (chunk) => {
+  buf = Buffer.concat([buf, chunk]);
+
+  while (true) {
+    // 协议1：MCP SDK 换行分隔 JSON（优先）
+    const nl = buf.indexOf("\n");
+    if (nl !== -1) {
+      const line = buf.slice(0, nl).toString("utf8").replace(/\r$/, "");
+      buf = buf.slice(nl + 1);
+      const trimmed = line.trim();
+      if (trimmed) {
+        let msg;
+        try {
+          msg = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        try {
+          await handle(msg);
+        } catch (err) {
+          const id = Object.prototype.hasOwnProperty.call(msg, "id") ? msg.id : null;
+          if (id !== null) {
+            fail(id, -32000, String(err));
+          }
+        }
+      }
+      continue;
+    }
+
+    // 协议2：旧式 Content-Length 帧（兼容）
+    const idx = buf.indexOf("\r\n\r\n");
+    if (idx === -1) break;
+
+    const header = buf.slice(0, idx).toString("utf8");
+    const m = /Content-Length:\s*(\d+)/i.exec(header);
+    if (!m) {
+      buf = buf.slice(idx + 4);
+      continue;
+    }
+
+    const len = Number(m[1]);
+    const total = idx + 4 + len;
+    if (buf.length < total) break;
+
+    const raw = buf.slice(idx + 4, total).toString("utf8");
+    buf = buf.slice(total);
+
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    try {
+      await handle(msg);
+    } catch (err) {
+      const id = Object.prototype.hasOwnProperty.call(msg, "id") ? msg.id : null;
+      if (id !== null) {
+        fail(id, -32000, String(err));
+      }
+    }
+  }
+});
+
+process.stdin.resume();

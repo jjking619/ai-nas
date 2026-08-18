@@ -31,6 +31,23 @@ services:
       - /DATA/AppData/openclaw:/home/node/.openclaw
       - /home/pi/nas_share:/nas_share
 
+  media_downloader:
+    build:
+      context: ./media_downloader
+    container_name: media_downloader
+    restart: unless-stopped
+    environment:
+      DOWNLOAD_ROOT: /downloads
+      PORT: 8081
+      YTDLP_TIMEOUT_SEC: 1800
+      # Optional: point to an existing TTS webhook if available.
+      TTS_WEBHOOK_URL: ""
+      DOWNLOAD_TTS_TEXT: 下载已完成
+    volumes:
+      - /home/pi/nas_share/downloads:/downloads
+    ports:
+      - "28081:8081"
+
 networks:
   immich-net:
     external: true

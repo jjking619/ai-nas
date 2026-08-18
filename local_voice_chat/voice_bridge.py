@@ -211,7 +211,7 @@ def ensure_openclaw_exec_access(container_name: str) -> None:
     if container_name not in names:
         raise RuntimeError(
             f"OpenClaw container '{container_name}' is not running. "
-            "Please run: /home/pi/openclaw-casaos/oc.sh status"
+            "Please run: /home/pi/NAS-Demo/oc.sh status"
         )
 
 
@@ -378,6 +378,9 @@ def ask_openclaw(args, user_text):
         "可调用你已有工具（如文件/NAS/相册等）来完成任务。"
         "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过20字。"
         "严禁使用markdown格式（如**加粗**、-列表、#标题），只输出纯文字。\n"
+        "当用户要求下载电影/预告片/视频/音频到NAS时，必须调用 download_media 工具执行，禁止编造下载结果。\n"
+        "download_media 目标目录只允许 /home/pi/nas_share/downloads 下子目录；若用户说“家庭影院文件夹”，映射为 家庭影院。\n"
+        "下载完成后默认通知文案为“下载已完成”，除非用户明确关闭或修改。\n"
         "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
         "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
         "  备份、家庭相册、工作文档、手机相册、旅行\n"

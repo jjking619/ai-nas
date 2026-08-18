@@ -1,0 +1,70 @@
+name: jellyfin
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - type: bind
+        source: /DATA/AppData/jellyfin/config
+        target: /config
+        bind:
+          create_host_path: true
+      - type: bind
+        source: /DATA/AppData/jellyfin/cache
+        target: /cache
+        bind:
+          create_host_path: true
+      - type: bind
+        source: /home/pi/nas_share/downloads
+        target: /media
+        read_only: true
+        bind:
+          create_host_path: true
+    ports:
+      - mode: ingress
+        target: 8096
+        published: "8096"
+        protocol: tcp
+    x-casaos:
+      envs:
+        - container: TZ
+          description:
+            en_US: "Timezone"
+      ports:
+        - container: "8096"
+          description:
+            en_US: "Jellyfin Web UI"
+      volumes:
+        - container: /config
+          description:
+            en_US: "Container Path: /config -> /DATA/AppData/jellyfin/config"
+        - container: /cache
+          description:
+            en_US: "Container Path: /cache -> /DATA/AppData/jellyfin/cache"
+        - container: /media
+          description:
+            en_US: "Container Path: /media -> nas_share/downloads (read-only)"
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  author: jellyfin
+  category: Media
+  description:
+    en_US: The Free Software Media System - stream your media library.
+  developer: Jellyfin Contributors
+  icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/jellyfin.png
+  id: org.jellyfin.server
+  is_uncontrolled: false
+  main: jellyfin
+  port_map: "8096"
+  store_app_id: jellyfin
+  tagline:
+    en_US: Jellyfin – Free Software Media System
+  thumbnail: ""
+  title:
+    en_US: Jellyfin
