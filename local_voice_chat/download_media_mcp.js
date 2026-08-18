@@ -5,24 +5,72 @@ const DOWNLOAD_ROOT_LABEL = process.env.DOWNLOAD_ROOT_LABEL || "/home/pi/nas_sha
 const DEFAULT_NOTIFY_TEXT = process.env.DOWNLOAD_NOTIFY_TEXT || "下载已完成";
 const REQUEST_TIMEOUT_MS = Number(process.env.DOWNLOAD_API_TIMEOUT_MS || 15 * 60 * 1000);
 
+// 视频关键词库：用户可说关键词而不是URL
+const MEDIA_LIBRARY = {
+  // 环境纪录片
+  "海洋": {
+    url: "https://vjs.zencdn.net/v/oceans.mp4",
+    label: "海洋纪录片",
+    default_folder: "视频",
+  },
+  "大海": { url: "https://vjs.zencdn.net/v/oceans.mp4", label: "海洋纪录片", default_folder: "视频" },
+  // 电影预告片
+  "预告片": {
+    url: "https://media.w3.org/2010/05/sintel/trailer.mp4",
+    label: "Sintel电影预告片",
+    default_folder: "家庭影院/电影",
+  },
+  "sintel": {
+    url: "https://media.w3.org/2010/05/sintel/trailer.mp4",
+    label: "Sintel电影预告片",
+    default_folder: "家庭影院/电影",
+  },
+  "兔子": {
+    url: "https://www.w3schools.com/html/mov_bbb.mp4",
+    label: "Big Buck Bunny动画短片",
+    default_folder: "家庭影院/电影",
+  },
+  "bunny": {
+    url: "https://www.w3schools.com/html/mov_bbb.mp4",
+    label: "Big Buck Bunny动画短片",
+    default_folder: "家庭影院/电影",
+  },
+  // 通用样本
+  "样本": {
+    url: "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4",
+    label: "通用视频样本",
+    default_folder: "视频",
+  },
+  "测试": {
+    url: "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4",
+    label: "通用视频样本",
+    default_folder: "视频",
+  },
+};
+
 const TOOL = {
   name: "download_media",
   description:
-    "下载媒体到NAS目录。仅允许写入 /home/pi/nas_share/downloads 及其子目录。支持 URL 或关键词搜索。",
+    "下载媒体到NAS目录。支持关键词快速下载（如'海洋'、'预告片'）或自定义URL/搜索。" +
+    "预定义关键词：" + Object.keys(MEDIA_LIBRARY).join("、"),
   inputSchema: {
     type: "object",
     properties: {
       url: {
         type: "string",
-        description: "媒体链接（可选，与query二选一）",
+        description: "媒体链接（可选，与query/keyword二选一）",
       },
       query: {
         type: "string",
-        description: "搜索关键词（可选，例如：流浪地球3 预告片）",
+        description: "搜索关键词（可选，例如：流浪地球3 预告片；或预定义词：海洋、预告片、兔子、样本）",
+      },
+      keyword: {
+        type: "string",
+        description: "快速关键词（可选，会从库中查找对应URL。支持：" + Object.keys(MEDIA_LIBRARY).join("、") + "）",
       },
       target_folder: {
         type: "string",
-        description: "目标文件夹描述，例如：家庭影院文件夹、电影",
+        description: "目标文件夹描述，例如：家庭影院文件夹、电影。不指定时使用关键词默认值",
       },
       notify_tts: {
         type: "boolean",
@@ -87,14 +135,43 @@ function fail(id, code, message) {
   send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
+// 根据关键词查找URL
+function matchMediaKeyword(keyword) {
+  if (!keyword) return null;
+  const key = String(keyword).toLowerCase().trim();
+  for (const [k, v] of Object.entries(MEDIA_LIBRARY)) {
+    if (k.toLowerCase() === key) {
+      return v;
+    }
+  }
+  return null;
+}
+
 async function callDownloadApi(args) {
-  const url = String(args.url || "").trim();
-  const query = String(args.query || "").trim();
+  let url = String(args.url || "").trim();
+  let query = String(args.query || "").trim();
+  let keyword = String(args.keyword || "").trim();
+  let targetFolderOverride = String(args.target_folder || "").trim();
+
+  // 优先级：keyword > url > query
+  if (keyword && !url) {
+    const matched = matchMediaKeyword(keyword);
+    if (matched) {
+      url = matched.url;
+      // 如果没有显式指定目标文件夹，使用关键词的默认文件夹
+      if (!targetFolderOverride) {
+        targetFolderOverride = matched.default_folder;
+      }
+    } else {
+      // 关键词未找到，将其作为搜索词处理
+      query = keyword;
+    }
+  }
 
   if (!url && !query) {
     return {
       ok: false,
-      error: "url 或 query 至少提供一个",
+      error: "url、query 或 keyword 至少提供一个",
       status: 400,
     };
   }
@@ -102,7 +179,7 @@ async function callDownloadApi(args) {
   const payload = {
     url,
     query,
-    target_subdir: mapTargetFolder(args.target_folder),
+    target_subdir: mapTargetFolder(targetFolderOverride),
     notify_tts: args.notify_tts !== false,
     tts_message: String(args.tts_message || DEFAULT_NOTIFY_TEXT).trim() || DEFAULT_NOTIFY_TEXT,
   };
