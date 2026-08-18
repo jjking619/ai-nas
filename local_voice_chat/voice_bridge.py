@@ -396,10 +396,10 @@ def ask_openclaw(args, user_text):
         "照片分类归档规则：当用户要求按内容分类/归档/整理时，禁止仅凭文件名猜测。"
         "优先用 exec 工具一次性执行脚本自动归档（识别+重命名+移动）：\n"
         "  timeout 120 python3 /nas_share/tools/nas_classify.py --dir <目录> --recursive --archive\n"
-        "默认直接执行归档；只有用户明确说"预览/先别动"才允许 dry-run。\n"
+        "默认直接执行归档；只有用户明确说“预览/先别动”才允许 dry-run。\n"
         "发现重复前缀文件名时，直接自动清理并重命名，不要询问用户确认。\n"
         "脚本归档规则：按内容分类到类别目录，并重命名为 YYYYMMDD_HHMMSS_类别_原文件名.ext；"
-        "低置信度会归入"待确认"。只有脚本模式失败时，才回退 nas_files 手动逐个移动。\n"
+        "低置信度会归入“待确认”。只有脚本模式失败时，才回退 nas_files 手动逐个移动。\n"
         f"用户指令：{user_text}"
     )
 
