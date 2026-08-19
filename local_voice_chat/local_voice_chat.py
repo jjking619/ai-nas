@@ -214,16 +214,30 @@ def record_speech_until_silence(
 		chunk_wav = out_wav.parent / f"{out_wav.stem}.chunk.{len(tmp_files)}.wav"
 		tmp_files.append(chunk_wav)
 
-		record_audio_auto_backend(
-			chunk_wav,
-			duration=this_dur,
-			mic_input=mic_input,
-			backend=backend,
-		)
+		# ffmpeg 偶发返回 0 但未落盘（PulseAudio 源不稳定时），重试最多 3 次
+		recorded = False
+		for attempt in range(3):
+			record_audio_auto_backend(
+				chunk_wav,
+				duration=this_dur,
+				mic_input=mic_input,
+				backend=backend,
+			)
+			if chunk_wav.exists() and chunk_wav.stat().st_size > 44:  # WAV 头至少 44 字节
+				recorded = True
+				break
+			print(f"[MIC] chunk recording produced no file, retry {attempt + 1}/3")
+			chunk_wav.unlink(missing_ok=True)
+		if not recorded:
+			raise RuntimeError(
+				f"Failed to record audio chunk after retries: {chunk_wav} "
+				"(mic busy or PulseAudio unstable)"
+			)
 
-		sr, chunk_samples = load_wav_mono_16k_float(chunk_wav)
-		if sr != 16000:
-			raise RuntimeError(f"Unexpected sample rate {sr}, expected 16000")
+		try:
+			sr, chunk_samples = load_wav_mono_16k_float(chunk_wav)
+		except FileNotFoundError:
+			raise RuntimeError(f"Recorded chunk vanished: {chunk_wav}")
 
 		all_chunks.append(chunk_samples)
 		total_sec += (len(chunk_samples) / float(sr))

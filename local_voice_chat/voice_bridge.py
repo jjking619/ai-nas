@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import gc
 import json
 import os
 import re
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from local_voice_chat import (
     asr_transcribe,
@@ -107,9 +114,14 @@ def parse_args():
     parser.add_argument("--session-idle-rounds", type=int, default=3)
 
     parser.add_argument("--openclaw-container", default="openclaw")
-    parser.add_argument("--openclaw-session-key", default="agent:main:voice-bridge")
+    parser.add_argument("--openclaw-session-key", default="agent:main:voice-bridge-v2")
     parser.add_argument("--openclaw-timeout", type=int, default=300)
     parser.add_argument("--openclaw-dry-run", action="store_true")
+
+    parser.add_argument("--jellyfin-url", default="http://10.55.84.133:8096",
+                        help="Jellyfin 服务地址")
+    parser.add_argument("--jellyfin-api-key", default="",
+                        help="Jellyfin API Key（管理后台→控制台→API 密钥→新增密钥）")
 
     parser.add_argument(
         "--tts-max-chars",
@@ -132,8 +144,223 @@ def parse_args():
 
     parser.add_argument("--no-play", action="store_true")
     parser.add_argument("--work-dir", default="/tmp/voice_bridge")
+    parser.add_argument(
+        "--http-mode",
+        action="store_true",
+        help="Run lightweight HTTP trigger server instead of always-on wake loop",
+    )
+    parser.add_argument(
+        "--wake-mode",
+        action="store_true",
+        help="Force the legacy always-on wake loop even in non-interactive sessions",
+    )
+    parser.add_argument(
+        "--http-trigger-host",
+        default="0.0.0.0",
+        help="Bind host for HTTP trigger server",
+    )
+    parser.add_argument(
+        "--http-trigger-port",
+        type=int,
+        default=28082,
+        help="Bind port for HTTP trigger server",
+    )
+    parser.add_argument(
+        "--http-trigger-token",
+        default="",
+        help="Optional token for /trigger requests",
+    )
+    parser.add_argument(
+        "--http-keep-models",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep ASR/TTS models in memory in HTTP mode for lower latency",
+    )
+    parser.add_argument(
+        "--log-file",
+        default="/home/pi/NAS-Demo/logs/voice_bridge.log",
+        help="Local log file path",
+    )
 
     return parser.parse_args()
+
+
+_HTTP_MODEL_CACHE = {
+    "tts": None,
+    "recognizers": {},
+}
+
+
+class _TeeStream:
+    def __init__(self, stream, log_fh):
+        self._stream = stream
+        self._log_fh = log_fh
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log_fh.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log_fh.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+
+def _setup_file_logging(log_file: str) -> None:
+    if not log_file:
+        return
+    try:
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = path.open("a", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStream(sys.stdout, fh)
+        sys.stderr = _TeeStream(sys.stderr, fh)
+        print(f"[LOG] file logging enabled: {path}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[LOG] file logging setup failed: {e}")
+
+
+def _json_response(handler, status: int, payload: dict) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _html_response(handler, status: int, html: str) -> None:
+    body = html.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _http_ui_html(trigger_port: int) -> str:
+    return f"""<!DOCTYPE html>
+<html lang=\"zh-CN\">
+<head>
+    <meta charset=\"utf-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <title>语音助手</title>
+    <style>
+        :root {{
+            --bg-1: #08131c;
+            --bg-2: #163247;
+            --card: rgba(255,255,255,0.08);
+            --line: rgba(255,255,255,0.16);
+            --text: #f5f7fa;
+            --muted: #a9bac7;
+            --accent: #f59e0b;
+            --accent-2: #ea580c;
+            --ok: #22c55e;
+            --warn: #fbbf24;
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            background:
+                radial-gradient(circle at top left, rgba(245,158,11,0.22), transparent 34%),
+                radial-gradient(circle at bottom right, rgba(14,165,233,0.24), transparent 30%),
+                linear-gradient(145deg, var(--bg-1), var(--bg-2));
+            color: var(--text);
+            font-family: "Noto Sans CJK SC", "Source Han Sans SC", "Segoe UI", sans-serif;
+            padding: 24px;
+        }}
+        .panel {{
+            width: min(560px, 100%);
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            padding: 28px;
+            backdrop-filter: blur(14px);
+            box-shadow: 0 18px 60px rgba(0,0,0,0.28);
+        }}
+        h1 {{ margin: 0 0 10px; font-size: 30px; }}
+        p {{ margin: 0; color: var(--muted); line-height: 1.7; }}
+        .hero {{ margin-bottom: 22px; }}
+        .button {{
+            margin-top: 22px;
+            width: 100%;
+            border: 0;
+            border-radius: 18px;
+            padding: 20px 18px;
+            font-size: 22px;
+            font-weight: 700;
+            color: #fff;
+            cursor: pointer;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            box-shadow: 0 14px 36px rgba(234,88,12,0.35);
+        }}
+        .button[disabled] {{ cursor: not-allowed; opacity: 0.65; }}
+        .status {{
+            margin-top: 18px;
+            min-height: 84px;
+            border-radius: 16px;
+            padding: 16px 18px;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.08);
+            white-space: pre-wrap;
+            line-height: 1.7;
+        }}
+        .meta {{ margin-top: 16px; font-size: 13px; color: var(--muted); }}
+        .ok {{ color: var(--ok); }}
+        .warn {{ color: var(--warn); }}
+    </style>
+</head>
+<body>
+    <main class=\"panel\">
+        <div class=\"hero\">
+            <h1>点击后直接说话</h1>
+            <p>按钮触发后会立即开始录音，不再常驻监听唤醒词。这样待机几乎不占 CPU，只在你点击时才加载识别与播报能力。</p>
+        </div>
+
+        <button id=\"triggerBtn\" class=\"button\">开始一次语音指令</button>
+        <div id=\"status\" class=\"status\">待机中。点击按钮后，请立刻对麦克风说话。</div>
+        <div class=\"meta\">接口地址：/trigger · 端口：{trigger_port}</div>
+    </main>
+
+    <script>
+        const btn = document.getElementById('triggerBtn');
+        const status = document.getElementById('status');
+
+        async function triggerVoice() {{
+            btn.disabled = true;
+            status.textContent = '已触发，正在准备录音，请立刻说话...';
+            try {{
+                const resp = await fetch('/trigger', {{ cache: 'no-store' }});
+                const data = await resp.json();
+                if (!resp.ok) {{
+                    status.textContent = '触发失败：' + (data.error || resp.statusText);
+                    return;
+                }}
+                const lines = [
+                    data.message || '处理完成',
+                    data.text ? '识别内容：' + data.text : '',
+                    data.reply ? '系统回复：' + data.reply : ''
+                ].filter(Boolean);
+                status.textContent = lines.join('\n');
+            }} catch (err) {{
+                status.textContent = '接口请求失败：' + err;
+            }} finally {{
+                btn.disabled = false;
+            }}
+        }}
+
+        btn.addEventListener('click', triggerVoice);
+    </script>
+</body>
+</html>
+"""
 
 
 def _run_agent_cmd(cmd, timeout_sec):
@@ -365,6 +592,327 @@ def _fast_local_classify_reply(args, user_text):
     return f"{target}分类完成：{summary}。"
 
 
+# 口语/别名 → 库中媒体名（ASR 常把英文媒体名识别成中文口语）
+_PLAY_ALIASES = {
+    "兔子": "Big_Buck_Bunny",
+    "bunny": "Big_Buck_Bunny",
+    "大兔": "Big_Buck_Bunny",
+    "大兔子": "Big_Buck_Bunny",
+    "bbb": "Big_Buck_Bunny",
+    "bb": "Big_Buck_Bunny",
+    "预告片": "Sintel",
+    "sintel": "Sintel",
+    "十三罗汉": "十三罗汉",
+    "罗汉": "十三罗汉",
+}
+
+
+def _open_jellyfin_in_firefox(jellyfin_url: str, item_id: str | None = None) -> bool:
+    target_url = _jellyfin_target_url(jellyfin_url, item_id=item_id)
+    env = _build_firefox_desktop_env()
+
+    try:
+        subprocess.Popen(
+            ["firefox", "--new-tab", target_url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        print(f"[Jellyfin] firefox opened: {target_url}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[Jellyfin] firefox open failed: {e}")
+        return False
+
+
+def _jellyfin_target_url(jellyfin_url: str, item_id: str | None = None) -> str:
+    import urllib.parse as _up
+
+    base = jellyfin_url.rstrip("/")
+    if item_id:
+        return f"{base}/web/index.html#!/details?id={_up.quote(item_id)}"
+    return f"{base}/web/index.html"
+
+
+def _build_firefox_desktop_env() -> dict[str, str]:
+    import glob
+
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    runtime_dir = env.get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        candidate = f"/run/user/{os.getuid()}"
+        if os.path.isdir(candidate):
+            env["XDG_RUNTIME_DIR"] = candidate
+            runtime_dir = candidate
+
+    # systemd 服务进程通常没有 XAUTHORITY；不补齐会出现
+    # "cannot open display: :0"，导致日志显示已打开但实际未打开。
+    if not env.get("XAUTHORITY") and runtime_dir:
+        xauth_candidates = sorted(glob.glob(os.path.join(runtime_dir, ".mutter-Xwaylandauth.*")))
+        xauth_candidates.append(os.path.join(os.path.expanduser("~"), ".Xauthority"))
+        for xauth_path in xauth_candidates:
+            if os.path.isfile(xauth_path):
+                env["XAUTHORITY"] = xauth_path
+                break
+
+    return env
+
+
+def _focus_firefox_for_jellyfin(
+    jellyfin_url: str,
+    item_id: str | None = None,
+    *,
+    open_if_missing: bool = True,
+) -> bool:
+    target_url = _jellyfin_target_url(jellyfin_url, item_id=item_id)
+    env = _build_firefox_desktop_env()
+
+    try:
+        check_cmd_exists("xdotool")
+    except Exception:
+        if open_if_missing:
+            print("[Jellyfin] xdotool not found, fallback opening tab")
+            return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+        print("[Jellyfin] xdotool not found, skip opening new tab")
+        return False
+
+    try:
+        res = subprocess.run(
+            ["xdotool", "search", "--class", "firefox"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        windows = [w.strip() for w in res.stdout.splitlines() if w.strip()]
+        if not windows:
+            if open_if_missing:
+                print("[Jellyfin] firefox window not found, opening new tab")
+                return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+            print("[Jellyfin] firefox window not found, skip opening new tab")
+            return False
+
+        subprocess.run(
+            ["xdotool", "windowactivate", "--sync", windows[-1]],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            check=False,
+        )
+
+        active_title = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowname"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        ).stdout.strip()
+
+        if "Jellyfin" in active_title:
+            print(f"[Jellyfin] firefox focused: {active_title}")
+            return True
+
+        subprocess.Popen(
+            ["firefox", "--new-tab", target_url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        print(f"[Jellyfin] firefox focused; opened target tab: {target_url}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[Jellyfin] firefox focus failed: {e}")
+        if open_if_missing:
+            return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+        return False
+
+
+def _fast_local_play_reply(args, user_text: str):
+    """命中明确播放指令时，直接调 Jellyfin API，返回回复文本。
+
+    返回 None 表示不命中，交给 agent 正常处理。
+    """
+    if not args.jellyfin_api_key:
+        return None
+
+    # 1. 检测播放意图
+    #    显式播放词：含下列任意一个即命中
+    explicit_play = ("播放", "放一下", "放出来", "放视频", "放电影", "放个", "放部",
+                     "看一下", "看看", "看视频", "看电影", "看个", "看部", "看",
+                     "一下", "一部", "一个", "给我放",
+                     "视频", "电影", "影片", "片子")
+    #    口语 "放" 需搭配媒体词才算播放意图
+    media_words = ("视频", "电影", "影片", "片子", "片", "纪录片", "预告片", "剧集", "短片", "动画")
+
+    has_play = any(k in user_text for k in explicit_play)
+    if not has_play:
+        # 口语"放 + 内容名"（排除 放弃/放大/放小/放下/放手/放心/放松/放开 等非播放义）
+        import re as _re
+        if _re.search(r'放(?!弃|大|小|下|手|心|松|开)', user_text):
+            has_play = True
+    if not has_play:
+        return None
+
+    # 2. 剥离命令词，提取内容关键词
+    term = user_text
+    for w in ("帮我", "请帮", "请", "帮", "给我",
+              "播放", "放一下", "放出来", "放视频", "放电影", "放个", "放部", "放",
+              "看一下", "看看", "看视频", "看电影", "看个", "看部", "看",
+              "一下", "一部", "一个", "给我放",
+              "视频", "电影", "影片", "片子"):
+        term = term.replace(w, "")
+    term = term.strip()
+    is_generic = not term   # 泛称"放视频"，未指定具体内容
+
+    import json as _json
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    base = args.jellyfin_url.rstrip("/")
+    hdrs_json = {"X-MediaBrowser-Token": args.jellyfin_api_key, "Content-Type": "application/json"}
+    hdrs_get  = {"X-MediaBrowser-Token": args.jellyfin_api_key}
+
+    def _req(method, path, body=None, timeout=8):
+        url  = base + path
+        data = _json.dumps(body).encode() if body is not None else None
+        req  = _ur.Request(url, data=data, method=method,
+                           headers=hdrs_json if data else hdrs_get)
+        with _ur.urlopen(req, timeout=timeout) as r:
+            content = r.read()
+            return _json.loads(content) if content.strip() else {}
+
+    def _fetch_library(limit=50):
+        """拉取库中全部可播视频，供泛称/模糊匹配使用。"""
+        try:
+            result = _req(
+                "GET",
+                f"/Items?IncludeItemTypes=Movie,Video&Recursive=true&Limit={limit}",
+            )
+            return result.get("Items", [])
+        except Exception as e:
+            print(f"[Jellyfin] library fetch failed: {e}")
+            return []
+
+    # 3. 确定播放目标
+    item_id = item_name = None
+
+    if is_generic:
+        # 泛称"放视频"：列出库中视频让用户选择
+        lib_items = _fetch_library()
+        if not lib_items:
+            return "Jellyfin 库中暂无视频，可先下载内容。"
+        if len(lib_items) > 1:
+            names = "、".join(i["Name"] for i in lib_items[:4])
+            return f"库中有：{names}，请说具体片名。"
+        item_id, item_name = lib_items[0]["Id"], lib_items[0]["Name"]
+    else:
+        # 指定片名：先精确搜索
+        try:
+            result = _req(
+                "GET",
+                f"/Items?IncludeItemTypes=Movie,Video&Recursive=true&Limit=5"
+                f"&searchTerm={_up.quote(term)}",
+            )
+            items = result.get("Items", [])
+        except Exception as e:
+            print(f"[Jellyfin] search failed: {e}")
+            return None  # 网络/认证异常才降级 agent
+
+        if not items and term in _PLAY_ALIASES:
+            # 口语别名兜底：如"兔子"→ Big_Buck_Bunny
+            alias = _PLAY_ALIASES[term]
+            print(f"[Jellyfin] alias: {term!r} -> {alias!r}")
+            try:
+                result = _req(
+                    "GET",
+                    f"/Items?IncludeItemTypes=Movie,Video&Recursive=true&Limit=5"
+                    f"&searchTerm={_up.quote(alias)}",
+                )
+                items = result.get("Items", [])
+            except Exception as e:
+                print(f"[Jellyfin] alias search failed: {e}")
+
+        if items:
+            item_id, item_name = items[0]["Id"], items[0]["Name"]
+        else:
+            # 模糊匹配兜底（ASR 轻微误识别）
+            lib_items = _fetch_library()
+            if lib_items:
+                import difflib
+                best = max(
+                    lib_items,
+                    key=lambda i: difflib.SequenceMatcher(None, term, i["Name"]).ratio(),
+                )
+                ratio = difflib.SequenceMatcher(None, term, best["Name"]).ratio()
+                if ratio >= 0.45:
+                    item_id, item_name = best["Id"], best["Name"]
+                    print(f"[Jellyfin] fuzzy: {term!r} -> {item_name} (ratio={ratio:.2f})")
+                else:
+                    names = "、".join(i["Name"] for i in lib_items[:4])
+                    return f"没找到{term}，库中有：{names}，请说具体片名。"
+            else:
+                return f"没找到{term}，Jellyfin 库中暂无视频。"
+
+    # 4. 发送播放指令
+    print(f"[Jellyfin] play target: {item_name} (id={item_id})")
+    try:
+        sessions = _req("GET", "/Sessions")
+        candidates = [
+            s for s in sessions
+            if "Video" in s.get("Capabilities", {}).get("PlayableMediaTypes", [])
+        ]
+    except Exception as e:
+        print(f"[Jellyfin] sessions failed: {e}")
+        return f"请在 Jellyfin 手动播放：{item_name}"
+
+    if not candidates:
+        print("[Jellyfin] no controllable session found")
+        opened = _focus_firefox_for_jellyfin(args.jellyfin_url, item_id=item_id)
+        if opened:
+            import time as _time
+
+            for attempt in range(5):
+                _time.sleep(2)
+                try:
+                    sessions = _req("GET", "/Sessions")
+                    candidates = [
+                        s for s in sessions
+                        if "Video" in s.get("Capabilities", {}).get("PlayableMediaTypes", [])
+                    ]
+                    if candidates:
+                        print(f"[Jellyfin] session detected after firefox open: attempt={attempt + 1}")
+                        break
+                except Exception as e:
+                    print(f"[Jellyfin] sessions retry failed: {e}")
+                    break
+
+        if not candidates:
+            if opened:
+                return f"已打开 Jellyfin，正在进入：{item_name}"
+            return f"请先打开 Jellyfin 网页，再说播放。"
+
+    # 已有会话时也要主动前置窗口，避免后台播放看不到界面
+    _focus_firefox_for_jellyfin(
+        args.jellyfin_url,
+        item_id=item_id,
+        open_if_missing=False,
+    )
+
+    sid = candidates[0]["Id"]
+    try:
+        _req("POST",
+             f"/Sessions/{sid}/Playing"
+             f"?ItemIds={_up.quote(item_id)}&PlayCommand=PlayNow")
+        print(f"[Jellyfin] play sent: {item_name} -> session {sid}")
+        return f"正在播放：{item_name}"
+    except Exception as e:
+        print(f"[Jellyfin] play failed: {e}")
+        return f"播放失败，请在 Jellyfin 手动播放：{item_name}"
+
+
 def ask_openclaw(args, user_text):
     if args.openclaw_dry_run:
         return f"[dry-run] 你说的是：{user_text}"
@@ -372,6 +920,10 @@ def ask_openclaw(args, user_text):
     fast_reply = _fast_local_classify_reply(args, user_text)
     if fast_reply is not None:
         return fast_reply
+
+    play_reply = _fast_local_play_reply(args, user_text)
+    if play_reply is not None:
+        return play_reply
 
     bridge_prompt = (
         "你是quectel pi上的语音助手，负责执行用户口头指令。"
@@ -390,6 +942,7 @@ def ask_openclaw(args, user_text):
         "  4. 用户说搜索某部影视作品，用 query 参数（会用yt-dlp搜索，如'流浪地球'）\n"
         "  5. 用户没指定目标文件夹时，关键词会自动用默认位置；用户明确指定则覆盖\n"
         "  6. 下载完成后默认通知文案为'下载已完成'\n"
+        "用户要求播放库中视频时，先尝试在Jellyfin播放；如无法播放，回复'请在Jellyfin打开'并给出可播放列表，禁止直接说无法播放。\n"
         "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
         "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
         "  备份、家庭相册、工作文档、手机相册、旅行\n"
@@ -470,6 +1023,68 @@ _SHORT_CMD_HINTS = (
     "重命名",
 )
 
+# ── 无关语音过滤 ─────────────────────────────────────────────────────────────
+# Level 1: 纯语气词 / 噪音
+_IRRELEVANT_EXACT = frozenset({
+    "嗯", "啊", "哦", "呢", "哈", "呀", "唉", "哎", "噢", "哟", "喔", "呵", "嘿", "哼",
+    "嗯嗯", "嗯哼", "哈哈", "啊啊", "哦哦", "呀呀",
+})
+_IRRELEVANT_RE = re.compile(r'^[嗯啊哦呢哈呀唉哎噢哟喔呵嘿哼]{1,5}$')
+
+# Level 2: 社交/确认/客套用语 —— 无任务意图，直接跳过
+_SOCIAL_IRRELEVANT = frozenset({
+    "谢谢", "谢谢你", "谢谢了", "谢谢啊", "谢谢哈", "多谢", "感谢", "不用谢",
+    "好的", "好吧", "好呢", "好嘞", "行", "行吧", "行的", "可以", "没问题",
+    "知道了", "知道", "明白了", "明白", "懂了", "收到", "了解",
+    "对", "对的", "对对", "是的", "是", "没错", "正确",
+    "不用了", "算了", "不用",
+    "再见", "拜拜",
+    "没有", "没", "没事", "没关系",
+    "等等", "等一下", "稍等",
+    "哇", "哇哦", "厉害", "厉害了", "好厉害", "太棒了", "太好了", "真棒",
+})
+
+# Level 3: 任务关键词白名单 —— 含任意一个则视为有任务意图，不过滤
+_TASK_KEYWORDS = frozenset({
+    # 操作动词
+    "分类", "归档", "整理", "移动", "重命名", "删除", "复制", "备份",
+    "下载", "上传", "创建", "新建", "同步",
+    "播放", "放", "暂停", "查询", "查找", "搜索", "查", "找", "看看",
+    "显示", "列出", "打开", "关闭",
+    # 目标对象
+    "照片", "图片", "相册", "文件", "目录", "文件夹",
+    "视频", "音乐", "电影", "预告片", "纪录片", "剧集", "电视剧",
+    "文档", "报告",
+    # NAS 路径/业务词
+    "家庭", "手机", "旅行", "家庭相册", "手机相册",
+    "nas_share", "NAS",
+})
+
+
+def _is_irrelevant_speech(text: str) -> bool:
+    """判断 ASR 结果是否为无关输入，需静默跳过（不调用 TTS / OpenClaw）。
+
+    三级过滤：
+      L1 - 单字或纯语气音节（嗯/啊/哦…）
+      L2 - 社交/确认用语（谢谢/好的/知道了…）
+      L3 - 短文本（≤8字）且不含任何任务关键词
+    """
+    s = text.strip()
+    # L1
+    if len(s) <= 1:
+        return True
+    if s in _IRRELEVANT_EXACT:
+        return True
+    if _IRRELEVANT_RE.match(s):
+        return True
+    # L2
+    if s in _SOCIAL_IRRELEVANT:
+        return True
+    # L3
+    if len(s) <= 8 and not any(k in s for k in _TASK_KEYWORDS):
+        return True
+    return False
+
 
 def _sanitize_reply_for_tts(reply: str) -> str:
     reply = re.sub(r"\*+", "", reply)
@@ -513,8 +1128,416 @@ def _adaptive_tts_reply(user_text: str, reply: str, max_chars: int, brief_max_ch
     return reply, ""
 
 
+def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: str, api_key: str) -> str:
+    """下载完成且含播放意图时，触发 Jellyfin 扫库并在活跃 session 播放。
+
+    返回额外 TTS 播报文本；空字符串表示未触发或无需提示。
+    需要先在 Jellyfin 管理后台 → 控制台 → API 密钥 创建密钥，
+    并通过 --jellyfin-api-key <key> 传入。
+    """
+    if not any(k in user_text for k in ("播放", "放一下", "放出来", "看一下", "看看")):
+        return ""
+    # 触发条件：回复含下载完成类关键词，或用户指令本身含下载意图
+    has_completion = any(k in raw_reply for k in (
+        "下载完成", "已保存到", "下载已完成", "已下载",
+        "已存", "存入", "保存到", "已保存",
+    ))
+    has_dl_intent = any(k in user_text for k in ("下载", "找一下", "搜一个", "要看"))
+    if not has_completion and not has_dl_intent:
+        return ""
+
+    import json as _json
+    import re as _re
+    import time as _time
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    base = jellyfin_url.rstrip("/")
+    hdrs_json = {"X-MediaBrowser-Token": api_key, "Content-Type": "application/json"}
+    hdrs_get  = {"X-MediaBrowser-Token": api_key}
+
+    def _req(method, path, body=None, timeout=8):
+        url  = base + path
+        data = _json.dumps(body).encode() if body is not None else None
+        req  = _ur.Request(url, data=data, method=method,
+                           headers=hdrs_json if data else hdrs_get)
+        with _ur.urlopen(req, timeout=timeout) as r:
+            content = r.read()
+            return _json.loads(content) if content.strip() else {}
+
+    # 1. 动态查找"扫描媒体库"任务并触发
+    try:
+        tasks = _req("GET", "/ScheduledTasks")
+        scan_id = next(
+            (t["Id"] for t in tasks
+             if "扫描媒体库" in t.get("Name", "") or "Scan Media" in t.get("Name", "")),
+            None,
+        )
+        if scan_id:
+            _req("POST", f"/ScheduledTasks/Running/{scan_id}")
+            print(f"[Jellyfin] library scan triggered (taskId={scan_id})")
+        else:
+            _req("POST", "/Library/Refresh")  # 旧版兜底
+            print("[Jellyfin] library refresh triggered (fallback)")
+    except Exception as e:
+        print(f"[Jellyfin] scan failed: {e}")
+        return ""
+
+    # 2. 从回复提取文件名作为搜索词；提取失败时降级到 user_text 剥离命令词
+    m = _re.search(r'文件名\s*[`「]([^`「」\n]+)[`」]', raw_reply)
+    if m:
+        raw_name = m.group(1)
+        term = _re.sub(r'\s*[\[（【（][^\]）】]*[\]）】]', '', raw_name)
+        term = _re.sub(r'\.\w{2,5}$', '', term).strip()
+    else:
+        # 降级：从用户原始指令中剥离命令词，提取核心内容词
+        term = user_text
+        for _w in ("帮我", "请帮", "请", "帮", "给我",
+                   "下载", "搜索", "查找", "找",
+                   "播放", "放一下", "放出来", "看一下", "看看",
+                   "视频", "电影", "影片", "一下", "一部"):
+            term = term.replace(_w, "")
+        term = term.strip()
+    if not term:
+        return ""
+    print(f"[Jellyfin] search: {term!r} (from={'reply' if m else 'user_text'})")
+
+    # 3. 等扫描写入后搜索（最多 4 次，每次间隔 3 秒）
+    item_id, item_name = None, term
+    for i in range(4):
+        _time.sleep(3)
+        try:
+            result = _req(
+                "GET",
+                f"/Items?searchTerm={_up.quote(term)}"
+                "&IncludeItemTypes=Movie,Video&Limit=5&Recursive=true",
+            )
+            items = result.get("Items", [])
+            if items:
+                item_id   = items[0]["Id"]
+                item_name = items[0]["Name"]
+                print(f"[Jellyfin] found: {item_name} (id={item_id}) attempt={i+1}")
+                break
+        except Exception as e:
+            print(f"[Jellyfin] search [{i+1}]: {e}")
+
+    if not item_id:
+        return "Jellyfin 库已刷新，视频扫描中，稍后可在家庭影院查看。"
+
+    # 4. 查找能播放 Video 的活跃 session，发送播放指令
+    try:
+        sessions = _req("GET", "/Sessions")
+        # SupportsRemoteControl 在 Web 客户端通常为 null，改用 PlayableMediaTypes 过滤
+        candidates = [
+            s for s in sessions
+            if "Video" in s.get("Capabilities", {}).get("PlayableMediaTypes", [])
+        ]
+        if candidates:
+            sid = candidates[0]["Id"]
+            # Jellyfin 播放接口用 query 参数，不是 body
+            _req("POST",
+                 f"/Sessions/{sid}/Playing"
+                 f"?ItemIds={_up.quote(item_id)}&PlayCommand=PlayNow")
+            print(f"[Jellyfin] play sent to session {sid}")
+            return f"正在 Jellyfin 播放：{item_name}"
+        print("[Jellyfin] no controllable session found")
+        opened = _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+        if opened:
+            for attempt in range(5):
+                _time.sleep(2)
+                sessions = _req("GET", "/Sessions")
+                candidates = [
+                    s for s in sessions
+                    if "Video" in s.get("Capabilities", {}).get("PlayableMediaTypes", [])
+                ]
+                if candidates:
+                    sid = candidates[0]["Id"]
+                    _req("POST",
+                         f"/Sessions/{sid}/Playing"
+                         f"?ItemIds={_up.quote(item_id)}&PlayCommand=PlayNow")
+                    print(f"[Jellyfin] play sent after firefox open: session {sid}")
+                    return f"正在 Jellyfin 播放：{item_name}"
+        return f"已打开 Jellyfin，正在进入：{item_name}" if opened else f"请在 Jellyfin 播放：{item_name}"
+    except Exception as e:
+        print(f"[Jellyfin] play failed: {e}")
+        return f"视频已就绪，请在 Jellyfin 播放：{item_name}"
+
+
+def _resolve_asr_model_path(args, asr_root: Path):
+    if args.asr_engine == "sensevoice":
+        return Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
+            asr_root / "model",
+            force_download=not args.no_auto_download_asr,
+        )
+    return Path(args.asr_model) if args.asr_model else None
+
+
+def _run_single_http_turn(
+    args,
+    work_dir: Path,
+    asr_root: Path,
+    tts_root: Path,
+    forced_text: str | None = None,
+) -> dict:
+    user_wav = work_dir / "user_http.wav"
+    reply_wav = work_dir / "reply_http.wav"
+    recognizer = None
+    keep_models = bool(getattr(args, "http_keep_models", True))
+
+    if not forced_text:
+        if keep_models:
+            cache_key = (
+                args.asr_engine,
+                args.asr_language,
+                str(args.asr_model or ""),
+                str(args.hotwords_file or ""),
+                float(args.hotwords_score),
+            )
+            recognizer = _HTTP_MODEL_CACHE["recognizers"].get(cache_key)
+            if recognizer is None:
+                asr_model_path = _resolve_asr_model_path(args, asr_root)
+                print(f"[HTTP] building ASR recognizer (engine={args.asr_engine})...")
+                recognizer = build_asr_recognizer(
+                    asr_root,
+                    asr_model_path,
+                    args.asr_language,
+                    engine=args.asr_engine,
+                    hotwords_file=args.hotwords_file,
+                    hotwords_score=args.hotwords_score,
+                )
+                _HTTP_MODEL_CACHE["recognizers"][cache_key] = recognizer
+            else:
+                print(f"[HTTP] reusing ASR recognizer (engine={args.asr_engine})")
+        else:
+            asr_model_path = _resolve_asr_model_path(args, asr_root)
+            print(f"[HTTP] building ASR recognizer (engine={args.asr_engine})...")
+            recognizer = build_asr_recognizer(
+                asr_root,
+                asr_model_path,
+                args.asr_language,
+                engine=args.asr_engine,
+                hotwords_file=args.hotwords_file,
+                hotwords_score=args.hotwords_score,
+            )
+
+    if keep_models:
+        tts = _HTTP_MODEL_CACHE.get("tts")
+        if tts is None:
+            print("[HTTP] building TTS engine...")
+            tts = build_tts(tts_root)
+            _HTTP_MODEL_CACHE["tts"] = tts
+        else:
+            print("[HTTP] reusing TTS engine")
+    else:
+        print("[HTTP] building TTS engine...")
+        tts = build_tts(tts_root)
+
+    try:
+        if forced_text:
+            text = forced_text.strip()
+            print(f"[HTTP] text mode input: {text}")
+        else:
+            print("[HTTP] listening for one command...")
+            record_speech_until_silence(
+                user_wav,
+                mic_input=args.mic_input,
+                backend=args.record_backend,
+                min_duration=args.speech_min_duration,
+                max_duration=args.speech_duration,
+                tail_window_sec=args.speech_tail_window,
+                silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
+            )
+            level = wav_level_dbfs(user_wav)
+            print(f"[HTTP] speech clip level: {level:.1f} dBFS")
+
+            text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
+            normalized = normalize_asr_text(text)
+            if normalized != text:
+                print(f"[HTTP] normalized: {normalized}")
+                text = normalized
+        print(f"[HTTP] text: {text}")
+
+        if not text:
+            return {
+                "ok": True,
+                "message": "未识别到有效语音，请重试。",
+                "text": "",
+                "reply": "",
+            }
+
+        if _is_irrelevant_speech(text):
+            return {
+                "ok": True,
+                "message": "识别到的是无任务语音，已跳过。",
+                "text": text,
+                "reply": "",
+            }
+
+        processing_hint = "正在处理，请稍等。"
+        print(f"[HTTP] processing: {processing_hint}")
+        tts_speak(tts, processing_hint, reply_wav, play=not args.no_play)
+
+        raw_reply = ask_openclaw(args, text)
+        reply = _sanitize_reply_for_tts(raw_reply)
+        spoken_reply, _tail = _adaptive_tts_reply(
+            text,
+            reply,
+            max_chars=args.tts_max_chars,
+            brief_max_chars=args.tts_brief_max_chars,
+            brief_user_len=args.tts_brief_user_len,
+        )
+        print(f"[HTTP] reply: {spoken_reply}")
+        tts_speak(tts, spoken_reply, reply_wav, play=not args.no_play)
+
+        if args.jellyfin_api_key:
+            jf_hint = _jellyfin_play_after_download(
+                text, raw_reply, args.jellyfin_url, args.jellyfin_api_key
+            )
+            if jf_hint:
+                jf_hint = _sanitize_reply_for_tts(jf_hint)
+                print(f"[HTTP][Jellyfin] {jf_hint}")
+                tts_speak(tts, jf_hint, reply_wav, play=not args.no_play)
+
+        return {
+            "ok": True,
+            "message": "文本指令处理完成。" if forced_text else "语音指令处理完成。",
+            "text": text,
+            "reply": spoken_reply,
+        }
+    finally:
+        if recognizer is not None and not keep_models:
+            del recognizer
+        if not keep_models:
+            del tts
+            gc.collect()
+
+
+def _run_http_server(args) -> None:
+    check_cmd_exists("ffmpeg")
+    check_cmd_exists("ffplay")
+    check_cmd_exists("curl")
+    check_cmd_exists("docker")
+
+    ensure_openclaw_exec_access(args.openclaw_container)
+    sync_nas_classify_script()
+
+    asr_root = Path(args.asr_root)
+    tts_root = Path(args.tts_root)
+    work_dir = Path(args.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    trigger_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *values):
+            print(f"[HTTP] {self.address_string()} - {fmt % values}")
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                _html_response(self, HTTPStatus.OK, _http_ui_html(args.http_trigger_port))
+                return
+            if parsed.path == "/healthz":
+                _json_response(self, HTTPStatus.OK, {
+                    "ok": True,
+                    "mode": "http-trigger",
+                    "busy": trigger_lock.locked(),
+                    "port": args.http_trigger_port,
+                })
+                return
+            if parsed.path == "/trigger":
+                self._handle_trigger(parsed)
+                return
+            _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/trigger":
+                self._handle_trigger(parsed)
+                return
+            _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+
+        def _handle_trigger(self, parsed):
+            req_start = time.monotonic()
+            if args.http_trigger_token:
+                token = parse_qs(parsed.query).get("token", [""])[0]
+                if token != args.http_trigger_token:
+                    print(f"[HTTP] trigger rejected: invalid token from={self.address_string()}")
+                    _json_response(self, HTTPStatus.FORBIDDEN, {
+                        "ok": False,
+                        "error": "invalid token",
+                    })
+                    return
+
+            text = parse_qs(parsed.query).get("text", [""])[0].strip()
+            if not text and self.command == "POST":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length > 0 else b""
+                if raw:
+                    ctype = (self.headers.get("Content-Type") or "").lower()
+                    if "application/json" in ctype:
+                        try:
+                            obj = json.loads(raw.decode("utf-8", errors="ignore"))
+                            if isinstance(obj, dict):
+                                text = str(obj.get("text", "")).strip()
+                        except Exception:  # noqa: BLE001
+                            text = ""
+                    elif "application/x-www-form-urlencoded" in ctype:
+                        data = parse_qs(raw.decode("utf-8", errors="ignore"))
+                        text = (data.get("text", [""]) or [""])[0].strip()
+
+            mode = "text" if text else "voice"
+            print(
+                f"[HTTP] trigger start method={self.command} mode={mode} "
+                f"text_len={len(text)} from={self.address_string()}"
+            )
+
+            if not trigger_lock.acquire(blocking=False):
+                print(f"[HTTP] trigger busy mode={mode} from={self.address_string()}")
+                _json_response(self, HTTPStatus.CONFLICT, {
+                    "ok": False,
+                    "error": "busy",
+                    "message": "上一条语音仍在处理中，请稍后再试。",
+                })
+                return
+
+            try:
+                result = _run_single_http_turn(
+                    args,
+                    work_dir,
+                    asr_root,
+                    tts_root,
+                    forced_text=text or None,
+                )
+                cost_ms = int((time.monotonic() - req_start) * 1000)
+                print(f"[HTTP] trigger done mode={mode} cost_ms={cost_ms}")
+                _json_response(self, HTTPStatus.OK, result)
+            except Exception as e:  # noqa: BLE001
+                cost_ms = int((time.monotonic() - req_start) * 1000)
+                print(f"[HTTP] trigger failed mode={mode} cost_ms={cost_ms}: {e}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {
+                    "ok": False,
+                    "error": str(e),
+                })
+            finally:
+                trigger_lock.release()
+
+    server = ThreadingHTTPServer((args.http_trigger_host, args.http_trigger_port), Handler)
+    print(
+        f"[HTTP] ready: http://{args.http_trigger_host}:{args.http_trigger_port} "
+        "(click page at /, trigger API at /trigger)"
+    )
+    server.serve_forever()
+
+
 def main():
     args = parse_args()
+    _setup_file_logging(args.log_file)
+
+    use_http_mode = args.http_mode or (not args.wake_mode and not os.isatty(0))
+    if use_http_mode:
+        _run_http_server(args)
+        return
 
     check_cmd_exists("ffmpeg")
     check_cmd_exists("ffplay")
@@ -691,15 +1714,19 @@ def main():
             f"max={args.speech_duration:.1f}s, silence<{args.speech_silence_threshold_dbfs:.1f}dBFS"
         )
 
-        record_speech_until_silence(
-            user_wav,
-            mic_input=args.mic_input,
-            backend=args.record_backend,
-            min_duration=args.speech_min_duration,
-            max_duration=args.speech_duration,
-            tail_window_sec=args.speech_tail_window,
-            silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
-        )
+        try:
+            record_speech_until_silence(
+                user_wav,
+                mic_input=args.mic_input,
+                backend=args.record_backend,
+                min_duration=args.speech_min_duration,
+                max_duration=args.speech_duration,
+                tail_window_sec=args.speech_tail_window,
+                silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
+            )
+        except Exception as e:
+            print(f"[MIC] recording failed, re-listening: {e}")
+            continue
 
         level = wav_level_dbfs(user_wav)
         print(f"[MIC] speech clip level: {level:.1f} dBFS")
@@ -755,11 +1782,16 @@ def main():
             print("[EXIT] done")
             break
 
+        if _is_irrelevant_speech(text):
+            print(f"[ASR] irrelevant speech skipped: {text!r}")
+            continue
+
         processing_hint = "正在处理，请稍等。"
         print(f"[OpenClaw] processing: {processing_hint}")
         tts_speak(tts, processing_hint, reply_wav, play=not args.no_play)
 
         reply = ask_openclaw(args, text)
+        raw_reply = reply  # 保留原始回复供 Jellyfin 下载检测使用
         reply = _sanitize_reply_for_tts(reply)
         spoken_reply, tail = _adaptive_tts_reply(
             text,
@@ -774,6 +1806,16 @@ def main():
 
         print(f"[OpenClaw] reply: {spoken_reply}")
         tts_speak(tts, spoken_reply, reply_wav, play=not args.no_play)
+
+        # 下载完成+播放意图时，自动触发 Jellyfin 扫库并播放
+        if args.jellyfin_api_key:
+            jf_hint = _jellyfin_play_after_download(
+                text, raw_reply, args.jellyfin_url, args.jellyfin_api_key
+            )
+            if jf_hint:
+                jf_hint = _sanitize_reply_for_tts(jf_hint)
+                print(f"[Jellyfin] {jf_hint}")
+                tts_speak(tts, jf_hint, reply_wav, play=not args.no_play)
 
 
 if __name__ == "__main__":

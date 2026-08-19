@@ -363,6 +363,22 @@ CasaOS 图标点击
   → OpenClaw 界面
 ```
 
+### 0.2.1 隐藏指定 Legacy 卡片不生效（简要排障）
+
+现象：刷新 CasaOS 后，`media_downloader`、`immich-server`、`immich-machine-learning` 仍显示在 Legacy 区。
+
+根因（关键点）：
+- 首页数据来自 `/v2/app_management/web/appgrid`。
+- Legacy 条目的 `name` 是容器哈希，不是容器名；容器名在 `title.en_us`（或 `title.en_US`）。
+- 因此按 `item.name` 过滤会失效，需按 `title` 过滤。
+
+最小改动修复：
+- 在 Home 分包 `AppSection.getList()` 的 `oldAppList` 赋值处改为按 `title.en_us || title.en_US` 做黑名单过滤。
+- 重启网关：`sudo systemctl restart casaos-gateway`
+- 浏览器强刷：`Ctrl+F5`
+
+说明：该方案只隐藏卡片显示，不会停止或删除容器。
+
 ## 0.3 Jellyfin 家庭影院（播放下载的视频）
 
 目标：用 Jellyfin 播放 `media_downloader` 下载到 `/home/pi/nas_share/downloads` 的视频，

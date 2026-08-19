@@ -9,7 +9,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/NAS-Demo/local_voice_chat
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/pi/NAS-Demo/local_voice_chat/voice_bridge.py --wake-duration 4 --kws-root /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h --asr-root /home/pi/voice/asr_cpu_1.19 --tts-root /home/pi/voice/tts_cpu_2.1 --wake-keyword-bin /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_xiaoyuantongxue.bin
+ExecStart=/home/pi/.pyenv/versions/3.10.15/bin/python3 /home/pi/NAS-Demo/local_voice_chat/voice_bridge.py --http-mode --http-trigger-host 0.0.0.0 --http-trigger-port 28082 --wake-duration 4 --kws-root /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h --asr-root /home/pi/voice/asr_cpu_1.19 --tts-root /home/pi/voice/tts_cpu_2.1 --wake-keyword-bin /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_xiaoyuantongxue.bin --jellyfin-api-key 2dd04b84ab444fce831823a601b7b26d
 Restart=always
 RestartSec=3
 

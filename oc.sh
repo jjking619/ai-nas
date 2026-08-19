@@ -38,6 +38,8 @@ Usage:
   ./oc.sh immich-sync-jobs   Trigger Immich ML jobs (faceDetection + smartSearch)
   ./oc.sh jellyfin-deploy    Start Jellyfin (jellyfin-compose.yml)
   ./oc.sh jellyfin-show      Show Jellyfin container status
+  ./oc.sh voice-assistant-deploy  Install Voice Assistant (CasaOS web app)
+  ./oc.sh voice-assistant-show    Show Voice Assistant container status
 EOF
 }
 
@@ -188,6 +190,19 @@ case "${1:-}" in
     ;;
   jellyfin-show)
     docker_cmd ps -a --filter name=jellyfin --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    ;;
+  voice-assistant-deploy)
+    VOICE_COMPOSE="${APP_DIR}/voice-assistant-compose.yml"
+    if [[ ! -f "${VOICE_COMPOSE}" ]]; then
+      echo "ERROR: ${VOICE_COMPOSE} not found"
+      exit 1
+    fi
+    casaos-cli app-management install -f "${VOICE_COMPOSE}"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "Voice Assistant installed to CasaOS (asynchronous). Open http://${ip:-<your-host-ip>}:28083"
+    ;;
+  voice-assistant-show)
+    docker_cmd ps -a --filter name=voice_assistant --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     ;;
   ""|-h|--help|help)
     usage
