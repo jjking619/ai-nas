@@ -232,7 +232,7 @@ def _detect_archive_root(path: Path) -> Path:
 def _build_target_path(src: Path, category: str, unknown_dir: str) -> Path:
     root = _detect_archive_root(src)
     cat_dir = unknown_dir if category == "不确定" else category
-    ts = datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = _safe_stem(_strip_archive_prefix(src.stem))
     suffix = src.suffix.lower()
 

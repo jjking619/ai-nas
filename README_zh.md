@@ -52,6 +52,26 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 - `list_files` 对应 `list_directory`
 - `create_folder` 对应 `create_directory`
 
+### 0.1.0 本地快速通道注册表（classify / download / play）
+
+`voice_bridge.py` 里新增了统一的本地快速通道注册表 `LOCAL_FAST_CHANNELS`，用于把高频、确定性动作先在本地执行，避免进入 agent 长链路。
+
+当前登记顺序（也是优先级）：
+- `classify`：照片分类归档（脚本执行）
+- `download`：媒体下载（直连 `media_downloader`）
+- `play`：Jellyfin 播放
+
+处理流程：
+
+```text
+语音/文本 -> _run_local_fast_channels() -> 命中本地通道即返回
+                                   \-> 未命中才进入 OpenClaw agent
+```
+
+扩展方式（最小改动）：
+- 在 `LOCAL_FAST_CHANNELS` 里新增一项 `(name, handler)`
+- `handler(args, user_text)` 返回 `None` 表示未命中；返回字符串表示已处理并直接回复
+
 ### 0.1.0 媒体下载工具（download_media）
 
 目标：最小改动接入 yt-dlp 下载能力，默认落盘到 `/home/pi/nas_share/downloads`。
@@ -239,6 +259,11 @@ timeout 120 python3 /nas_share/tools/nas_classify.py --dir /nas_share/家庭相�
 
 - 当你说“按内容归档/整理照片”时，`voice_bridge.py` 会优先引导 OpenClaw 调用脚本的 `--archive` 模式。
 - 未明确“立即执行”时，优先 `--dry-run` 预览；失败时才回退到 `nas_files` 逐个移动。
+
+> **时间戳语义（2026-08-20 起）**：归档文件名前缀由“文件 mtime”改为“**当前处理时间**”。
+> 因此每次执行分类都会刷新为本次处理时间戳，文件名每次都会变化，能直观看出“这次执行了分类操作”；
+> 原有“已归档前缀自动剥离”仍生效，重复归档不会叠加前缀。
+> 命名示例：`20260820_153322_风景_test_2.jpg`（前缀=本次处理时间）。
 
 ### 0.1.5 语音照片分类超时（OpenClaw agent timeout after 180s）根因与修复
 
@@ -578,6 +603,32 @@ journalctl -u voice-bridge -f
 - 语音控制词：
   - 说「休眠 / 停止监听 / 待机」：进入待机，重新等待唤醒词
   - 说「退出程序 / 关闭语音助手」：退出桥接进程
+
+### 6.4 排障记录：systemd 下语音识别失效/唤醒词失灵（2026-08-20）
+
+现象：网页点击语音或说唤醒词都没反应，识别结果多为单字（“啊/好/不知”）。
+
+根因（已实验实锤）：
+- 本机 `/etc/environment` 配置了 `LD_PRELOAD`（预加载 pulse 库）与 `PULSE_SERVER`，终端录音正常。
+- **systemd 服务默认不读取 `/etc/environment`**，服务的 ffmpeg 子进程缺少 `LD_PRELOAD` 的 pulse 库，
+  录音只录到 0.01~0.03s 碎片（`pa_stream_get_latency() failed` / `Generic error in an external library`），
+  ASR 只能识别出单字。
+
+修复（已在 `voice-bridge.service` 固化，仓库文件与 `/etc/systemd/system/` 均一致）：
+```ini
+Environment=LD_PRELOAD=/usr/lib/libpulse.so:/usr/lib/libpulse-mainloop-glib.so.0:/usr/lib/libpulse-mainloop-glib.so:/usr/lib/libpulse-simple.so:/usr/lib/pulseaudio/libpulsedsp.so:/usr/lib/pulseaudio/libpulsecommon-15.0.so:/usr/lib/pulseaudio/libpulsecore-15.0.so
+Environment=PULSE_SERVER=unix:/run/pulse/native
+```
+改后需 `sudo systemctl daemon-reload && sudo systemctl restart voice-bridge`。
+
+排查要点（后续遇到同类问题先看这三点）：
+1. 看 `[HTTP][AUDIO]` 日志里的 `dur=` 是否只有 0.01~0.03s（正常应数秒）。
+2. 对比服务进程环境：`tr '\0' '\n' < /proc/<PID>/environ | grep -i pulse`，确认 `LD_PRELOAD`/`PULSE_SERVER` 是否存在。
+3. `voice_bridge.py` 的 `_ensure_audio_runtime_env()` 会补 `PULSE_SERVER`/`XDG_RUNTIME_DIR`，但**不补 `LD_PRELOAD`**，依赖 systemd unit 里的 `Environment=`。
+
+其他已解决项：
+- HTTP 模式（28082，systemd 非交互启动默认进入）与本地终端唤醒词模式并存：HTTP 模式下已内置后台唤醒线程（`--http-wakeword`，默认开启）。
+- HTTP 唤醒线程与 `/trigger` 语音触发共享 `audio_lock` 串行化录音，避免并发抢麦克风导致 ffmpeg 卡死。
 
 3. 看端口：
 

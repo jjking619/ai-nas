@@ -322,7 +322,7 @@ def _index_html():
 
       <article class=\"card\">
         <h2>文本模式</h2>
-        <p class=\"hint\">输入示例：播放十三罗汉 / 帮我按内容归档手机相册</p>
+                <p class=\"hint\">输入示例：播放测试视频 / 帮我按内容归档手机相册</p>
         <div class=\"row\">
           <input id=\"textInput\" type=\"text\" placeholder=\"输入文本指令\" />
           <button id=\"textBtn\" class=\"btn\" style=\"width: 140px;\">发送文本</button>

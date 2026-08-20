@@ -177,6 +177,17 @@ def parse_args():
         help="Keep ASR/TTS models in memory in HTTP mode for lower latency",
     )
     parser.add_argument(
+        "--http-wakeword",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable background wake-word loop in HTTP mode",
+    )
+    parser.add_argument(
+        "--http-wakeword-prompt",
+        default="我在，请说。",
+        help="TTS prompt after wake-word in HTTP mode",
+    )
+    parser.add_argument(
         "--log-file",
         default="/home/pi/NAS-Demo/logs/voice_bridge.log",
         help="Local log file path",
@@ -220,6 +231,41 @@ def _setup_file_logging(log_file: str) -> None:
         print(f"[LOG] file logging enabled: {path}")
     except Exception as e:  # noqa: BLE001
         print(f"[LOG] file logging setup failed: {e}")
+
+
+def _ensure_audio_runtime_env() -> None:
+    """补齐 systemd 场景常缺失的音频环境变量，避免 ffmpeg 只录到极短片段。"""
+    if not os.getenv("XDG_RUNTIME_DIR"):
+        runtime_dir = Path(f"/run/user/{os.getuid()}")
+        if runtime_dir.exists():
+            os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
+            print(f"[AUDIO] XDG_RUNTIME_DIR not set, using {runtime_dir}")
+
+    if not os.getenv("PULSE_SERVER"):
+        pulse_native = Path("/run/pulse/native")
+        if pulse_native.exists():
+            os.environ["PULSE_SERVER"] = f"unix:{pulse_native}"
+            print(f"[AUDIO] PULSE_SERVER not set, using unix:{pulse_native}")
+
+
+def _wav_meta_for_log(path: Path) -> str:
+    """返回录音文件的关键元信息，便于排查录音异常。"""
+    if not path.exists():
+        return f"missing path={path}"
+
+    size = path.stat().st_size
+    try:
+        import wave
+
+        with wave.open(str(path), "rb") as wf:
+            sr = wf.getframerate()
+            ch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            n = wf.getnframes()
+        dur = (float(n) / float(sr)) if sr else 0.0
+        return f"path={path} size={size}B dur={dur:.2f}s sr={sr} ch={ch} sw={sw}"
+    except Exception as e:  # noqa: BLE001
+        return f"path={path} size={size}B wave_err={e}"
 
 
 def _json_response(handler, status: int, payload: dict) -> None:
@@ -527,6 +573,11 @@ def normalize_asr_text(text: str) -> str:
         "手机册": "手机相册",
         "手机像册": "手机相册",
         "手机象册": "手机相册",
+        "特视频": "测试视频",
+        "测视频": "测试视频",
+        "下载特": "下载测试",
+        "下载测": "下载测试",
+        "下载韩纪录片": "下载海洋纪录片",
     }
     for wrong, right in replacements.items():
         text = text.replace(wrong, right)
@@ -543,6 +594,13 @@ def normalize_asr_text(text: str) -> str:
                         break
         text = text.replace("所有图", "所有图片")
         text = text.replace("全部图", "全部图片")
+
+    # 下载/播放语境下的轻量纠偏（避免把"测试视频"识别成"特视频/测视频"）
+    is_media_cmd = any(k in text for k in ("下载", "播放", "视频", "电影", "预告片", "纪录片"))
+    if is_media_cmd:
+        text = text.replace("特视频", "测试视频")
+        text = text.replace("测视频", "测试视频")
+        text = text.replace("测试试视频", "测试视频")
     return text
 
 
@@ -602,9 +660,121 @@ _PLAY_ALIASES = {
     "bb": "Big_Buck_Bunny",
     "预告片": "Sintel",
     "sintel": "Sintel",
-    "十三罗汉": "十三罗汉",
-    "罗汉": "十三罗汉",
 }
+
+_DOWNLOAD_MEDIA_LIBRARY = {
+    "海洋": {
+        "url": "https://vjs.zencdn.net/v/oceans.mp4",
+        "default_folder": "视频",
+    },
+    "大海": {
+        "url": "https://vjs.zencdn.net/v/oceans.mp4",
+        "default_folder": "视频",
+    },
+    "预告片": {
+        "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
+        "default_folder": "家庭影院/电影",
+    },
+    "sintel": {
+        "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
+        "default_folder": "家庭影院/电影",
+    },
+    "兔子": {
+        "url": "https://www.w3schools.com/html/mov_bbb.mp4",
+        "default_folder": "家庭影院/电影",
+    },
+    "bunny": {
+        "url": "https://www.w3schools.com/html/mov_bbb.mp4",
+        "default_folder": "家庭影院/电影",
+    },
+    "样本": {
+        "url": "https://www.w3schools.com/html/mov_bbb.mp4",
+        "default_folder": "视频",
+    },
+    "测试": {
+        "url": "https://vjs.zencdn.net/v/oceans.mp4",
+        "default_folder": "视频",
+    },
+    "测试视频": {
+        "url": "https://vjs.zencdn.net/v/oceans.mp4",
+        "default_folder": "视频",
+    },
+}
+
+
+def _fast_local_download_reply(user_text: str):
+    """命中下载指令时，直连 media_downloader API，避免走 agent 长链路。"""
+    short_dl = bool(re.search(r"(^|帮我|给我|请)下(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny)", user_text))
+    if ("下载" not in user_text) and (not short_dl):
+        return None
+    if "下载的" in user_text and not user_text.strip().startswith("下载") and "帮我下载" not in user_text:
+        return None
+
+    matched = None
+    matched_key = ""
+    for key in sorted(_DOWNLOAD_MEDIA_LIBRARY.keys(), key=len, reverse=True):
+        if key in user_text:
+            matched = _DOWNLOAD_MEDIA_LIBRARY[key]
+            matched_key = key
+            break
+
+    term = user_text
+    for w in (
+        "帮我", "请帮", "请", "帮", "给我",
+        "下载", "搜索", "查找", "找",
+        "播放", "放一下", "放出来", "看一下", "看看", "并播放", "并且播放",
+        "视频", "电影", "影片", "纪录片", "一下", "一部", "一个",
+    ):
+        term = term.replace(w, "")
+    term = term.replace("并且", "").replace("并", "")
+    term = term.strip()
+
+    if not matched and not term:
+        return None
+
+    target_subdir = "视频"
+    if matched:
+        target_subdir = matched.get("default_folder", "视频")
+    elif any(k in user_text for k in ("电影", "预告片", "剧集", "电视剧")):
+        target_subdir = "家庭影院/电影"
+
+    import json as _json
+    import urllib.request as _ur
+
+    api_url = (os.getenv("DOWNLOAD_API_URL", "http://127.0.0.1:28081/download") or "").strip()
+    payload = {
+        "url": matched.get("url", "") if matched else "",
+        "query": "" if matched else term,
+        "target_subdir": target_subdir,
+        "notify_tts": False,
+        "tts_message": "下载已完成",
+    }
+
+    try:
+        req = _ur.Request(
+            api_url,
+            data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        with _ur.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            data = _json.loads(raw) if raw else {}
+            if not (200 <= resp.status < 300) or not data.get("ok"):
+                print(f"[DL] local download not ok status={resp.status} body={raw[:240]}")
+                return None
+
+        files = data.get("files") if isinstance(data.get("files"), list) else []
+        safe_subdir = str(data.get("safe_subdir") or target_subdir)
+        if files:
+            first_name = Path(files[0]).name
+            print(f"[DL] local download success key={matched_key or '(query)'} file={first_name}")
+            return f"下载已完成，文件名{first_name}，已保存到{safe_subdir}。"
+        print(f"[DL] local download success key={matched_key or '(query)'}")
+        return f"下载已完成，已保存到{safe_subdir}。"
+    except Exception as e:  # noqa: BLE001
+        print(f"[DL] local download failed, fallback to agent: {e}")
+        return None
 
 
 def _open_jellyfin_in_firefox(jellyfin_url: str, item_id: str | None = None) -> bool:
@@ -735,6 +905,10 @@ def _fast_local_play_reply(args, user_text: str):
 
     返回 None 表示不命中，交给 agent 正常处理。
     """
+    short_dl = bool(re.search(r"(^|帮我|给我|请)下(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny)", user_text))
+    if ("下载" in user_text and "下载的" not in user_text) or short_dl:
+        return None
+
     if not args.jellyfin_api_key:
         return None
 
@@ -759,11 +933,14 @@ def _fast_local_play_reply(args, user_text: str):
     # 2. 剥离命令词，提取内容关键词
     term = user_text
     for w in ("帮我", "请帮", "请", "帮", "给我",
+              "下载", "搜索", "查找", "找",
               "播放", "放一下", "放出来", "放视频", "放电影", "放个", "放部", "放",
               "看一下", "看看", "看视频", "看电影", "看个", "看部", "看",
               "一下", "一部", "一个", "给我放",
               "视频", "电影", "影片", "片子"):
         term = term.replace(w, "")
+    term = re.sub(r"(并且播放|并播放|然后播放)$", "", term)
+    term = term.replace("并且", "").replace("并", "")
     term = term.strip()
     is_generic = not term   # 泛称"放视频"，未指定具体内容
 
@@ -913,17 +1090,37 @@ def _fast_local_play_reply(args, user_text: str):
         return f"播放失败，请在 Jellyfin 手动播放：{item_name}"
 
 
+def _fast_local_download_reply_with_args(_args, user_text: str):
+    return _fast_local_download_reply(user_text)
+
+
+LOCAL_FAST_CHANNELS = (
+    ("classify", _fast_local_classify_reply),
+    ("download", _fast_local_download_reply_with_args),
+    ("play", _fast_local_play_reply),
+)
+
+
+def _run_local_fast_channels(args, user_text: str):
+    for name, handler in LOCAL_FAST_CHANNELS:
+        try:
+            reply = handler(args, user_text)
+        except Exception as e:  # noqa: BLE001
+            print(f"[FAST] channel={name} error: {e}")
+            continue
+        if reply is not None:
+            print(f"[FAST] hit channel={name}")
+            return reply
+    return None
+
+
 def ask_openclaw(args, user_text):
     if args.openclaw_dry_run:
         return f"[dry-run] 你说的是：{user_text}"
 
-    fast_reply = _fast_local_classify_reply(args, user_text)
+    fast_reply = _run_local_fast_channels(args, user_text)
     if fast_reply is not None:
         return fast_reply
-
-    play_reply = _fast_local_play_reply(args, user_text)
-    if play_reply is not None:
-        return play_reply
 
     bridge_prompt = (
         "你是quectel pi上的语音助手，负责执行用户口头指令。"
@@ -1023,6 +1220,30 @@ _SHORT_CMD_HINTS = (
     "重命名",
 )
 
+_SHORT_MEDIA_PHRASES = {
+    "测": "播放测试视频",
+    "试": "播放测试视频",
+    "测试": "播放测试视频",
+    "下测": "下载测试视频",
+    "下试": "下载测试视频",
+    "下测试": "下载测试视频",
+    "帮我下测": "帮我下载测试视频",
+    "帮我下试": "帮我下载测试视频",
+    "帮我下测试": "帮我下载测试视频",
+    "给我下测": "给我下载测试视频",
+    "给我下试": "给我下载测试视频",
+    "给我下测试": "给我下载测试视频",
+}
+
+
+def _expand_short_media_phrase(text: str) -> str:
+    """将高频短口令补全为可执行指令，避免被短句过滤误跳过。"""
+    compact = re.sub(r"\s+", "", (text or "").strip())
+    compact = compact.strip("，。！？,.!?；;：:")
+    if compact in _SHORT_MEDIA_PHRASES:
+        return _SHORT_MEDIA_PHRASES[compact]
+    return text
+
 # ── 无关语音过滤 ─────────────────────────────────────────────────────────────
 # Level 1: 纯语气词 / 噪音
 _IRRELEVANT_EXACT = frozenset({
@@ -1086,6 +1307,22 @@ def _is_irrelevant_speech(text: str) -> bool:
     return False
 
 
+def _irrelevant_speech_reason(text: str) -> str | None:
+    """返回被无关语音过滤命中的原因；未命中返回 None。"""
+    s = text.strip()
+    if len(s) <= 1:
+        return "L1:len<=1"
+    if s in _IRRELEVANT_EXACT:
+        return "L1:exact"
+    if _IRRELEVANT_RE.match(s):
+        return "L1:regex"
+    if s in _SOCIAL_IRRELEVANT:
+        return "L2:social"
+    if len(s) <= 8 and not any(k in s for k in _TASK_KEYWORDS):
+        return "L3:short-no-task-keyword"
+    return None
+
+
 def _sanitize_reply_for_tts(reply: str) -> str:
     reply = re.sub(r"\*+", "", reply)
     reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
@@ -1135,14 +1372,15 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
     需要先在 Jellyfin 管理后台 → 控制台 → API 密钥 创建密钥，
     并通过 --jellyfin-api-key <key> 传入。
     """
-    if not any(k in user_text for k in ("播放", "放一下", "放出来", "看一下", "看看")):
+    has_play_intent = any(k in user_text for k in ("播放", "放一下", "放出来", "看一下", "看看"))
+    has_dl_intent = any(k in user_text for k in ("下载", "找一下", "搜一个", "要看"))
+    if not has_play_intent and not has_dl_intent:
         return ""
     # 触发条件：回复含下载完成类关键词，或用户指令本身含下载意图
     has_completion = any(k in raw_reply for k in (
         "下载完成", "已保存到", "下载已完成", "已下载",
         "已存", "存入", "保存到", "已保存",
     ))
-    has_dl_intent = any(k in user_text for k in ("下载", "找一下", "搜一个", "要看"))
     if not has_completion and not has_dl_intent:
         return ""
 
@@ -1185,8 +1423,14 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
 
     # 2. 从回复提取文件名作为搜索词；提取失败时降级到 user_text 剥离命令词
     m = _re.search(r'文件名\s*[`「]([^`「」\n]+)[`」]', raw_reply)
+    if not m:
+        m = _re.search(r'文件名[:：]?\s*([^，。\n]+)', raw_reply)
+    if not m:
+        m = _re.search(r'([A-Za-z0-9_\-\[\] .]+\.(?:mp4|mkv|avi|mov|webm))', raw_reply, flags=_re.IGNORECASE)
+    raw_name_stem = ""
     if m:
         raw_name = m.group(1)
+        raw_name_stem = _re.sub(r'\.\w{2,5}$', '', raw_name).strip().lower()
         term = _re.sub(r'\s*[\[（【（][^\]）】]*[\]）】]', '', raw_name)
         term = _re.sub(r'\.\w{2,5}$', '', term).strip()
     else:
@@ -1195,11 +1439,15 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
         for _w in ("帮我", "请帮", "请", "帮", "给我",
                    "下载", "搜索", "查找", "找",
                    "播放", "放一下", "放出来", "看一下", "看看",
-                   "视频", "电影", "影片", "一下", "一部"):
+                 "视频", "电影", "影片", "一下", "一部", "进行", "下"):
             term = term.replace(_w, "")
+        term = re.sub(r"(并且播放|并播放|然后播放)$", "", term)
+        term = term.replace("并且", "").replace("并", "")
         term = term.strip()
     if not term:
         return ""
+    if term in _PLAY_ALIASES:
+        term = _PLAY_ALIASES[term]
     print(f"[Jellyfin] search: {term!r} (from={'reply' if m else 'user_text'})")
 
     # 3. 等扫描写入后搜索（最多 4 次，每次间隔 3 秒）
@@ -1220,6 +1468,24 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
                 break
         except Exception as e:
             print(f"[Jellyfin] search [{i+1}]: {e}")
+
+    # 回退：有些媒体库会把展示名改成中文，按英文文件名搜索不到。
+    # 这时按下载文件名去匹配 Item.Path，更稳定。
+    if (not item_id) and raw_name_stem:
+        try:
+            result = _req(
+                "GET",
+                "/Items?IncludeItemTypes=Movie,Video&Limit=200&Recursive=true&Fields=Path",
+            )
+            for it in result.get("Items", []):
+                p = str(it.get("Path") or "").lower()
+                if raw_name_stem in p:
+                    item_id = it.get("Id")
+                    item_name = it.get("Name") or term
+                    print(f"[Jellyfin] path fallback hit: {item_name} (id={item_id})")
+                    break
+        except Exception as e:
+            print(f"[Jellyfin] path fallback failed: {e}")
 
     if not item_id:
         return "Jellyfin 库已刷新，视频扫描中，稍后可在家庭影院查看。"
@@ -1278,6 +1544,7 @@ def _run_single_http_turn(
     asr_root: Path,
     tts_root: Path,
     forced_text: str | None = None,
+    audio_lock=None,
 ) -> dict:
     user_wav = work_dir / "user_http.wav"
     reply_wav = work_dir / "reply_http.wav"
@@ -1338,24 +1605,41 @@ def _run_single_http_turn(
             print(f"[HTTP] text mode input: {text}")
         else:
             print("[HTTP] listening for one command...")
-            record_speech_until_silence(
-                user_wav,
-                mic_input=args.mic_input,
-                backend=args.record_backend,
-                min_duration=args.speech_min_duration,
-                max_duration=args.speech_duration,
-                tail_window_sec=args.speech_tail_window,
-                silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
-            )
+            if audio_lock is not None:
+                audio_lock.acquire()
+            try:
+                record_speech_until_silence(
+                    user_wav,
+                    mic_input=args.mic_input,
+                    backend=args.record_backend,
+                    min_duration=args.speech_min_duration,
+                    max_duration=args.speech_duration,
+                    tail_window_sec=args.speech_tail_window,
+                    silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
+                )
+            finally:
+                if audio_lock is not None:
+                    audio_lock.release()
             level = wav_level_dbfs(user_wav)
             print(f"[HTTP] speech clip level: {level:.1f} dBFS")
+            print(
+                f"[HTTP][AUDIO] mic={args.mic_input} backend={args.record_backend} "
+                f"{_wav_meta_for_log(user_wav)}"
+            )
 
-            text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
-            normalized = normalize_asr_text(text)
-            if normalized != text:
+            raw_text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
+            print(f"[HTTP][ASR] raw_text={raw_text!r} len={len(raw_text.strip())}")
+            normalized = normalize_asr_text(raw_text)
+            if normalized != raw_text:
                 print(f"[HTTP] normalized: {normalized}")
-                text = normalized
+            text = normalized
+
+        expanded = _expand_short_media_phrase(text)
+        if expanded != text:
+            print(f"[HTTP][ASR] short phrase expanded: {text!r} -> {expanded!r}")
+            text = expanded
         print(f"[HTTP] text: {text}")
+        print(f"[HTTP][ASR] final_text={text!r} len={len(text.strip())}")
 
         if not text:
             return {
@@ -1366,6 +1650,12 @@ def _run_single_http_turn(
             }
 
         if _is_irrelevant_speech(text):
+            reason = _irrelevant_speech_reason(text) or "unknown"
+            hit_keywords = [k for k in _TASK_KEYWORDS if k in text][:3]
+            print(
+                f"[HTTP][ASR] irrelevant skipped reason={reason} "
+                f"text={text!r} hit_task_keywords={hit_keywords}"
+            )
             return {
                 "ok": True,
                 "message": "识别到的是无任务语音，已跳过。",
@@ -1412,6 +1702,160 @@ def _run_single_http_turn(
             gc.collect()
 
 
+def _http_speak_wake_prompt(args, tts_root: Path, work_dir: Path) -> None:
+    prompt = (args.http_wakeword_prompt or "").strip()
+    if not prompt:
+        return
+
+    reply_wav = work_dir / "reply_http_wake.wav"
+    keep_models = bool(getattr(args, "http_keep_models", True))
+    if keep_models:
+        tts = _HTTP_MODEL_CACHE.get("tts")
+        if tts is None:
+            print("[HTTP][WAKE] building TTS engine...")
+            tts = build_tts(tts_root)
+            _HTTP_MODEL_CACHE["tts"] = tts
+        else:
+            print("[HTTP][WAKE] reusing TTS engine")
+    else:
+        print("[HTTP][WAKE] building TTS engine...")
+        tts = build_tts(tts_root)
+
+    try:
+        tts_speak(tts, prompt, reply_wav, play=not args.no_play)
+    finally:
+        if not keep_models:
+            del tts
+            gc.collect()
+
+
+def _run_http_wakeword_loop(
+    args,
+    trigger_lock: threading.Lock,
+    audio_lock: threading.Lock,
+    work_dir: Path,
+    asr_root: Path,
+    tts_root: Path,
+    kws_root: Path,
+    wake_keyword_bin: Path,
+    wake_filler: Path,
+    wake_mlp: Path,
+    wake_keyword_bins: list[Path],
+) -> None:
+    while True:
+        if trigger_lock.locked():
+            time.sleep(0.2)
+            continue
+
+        wake_wav = work_dir / "wake_http.wav"
+        try:
+            if not audio_lock.acquire(blocking=False):
+                time.sleep(0.2)
+                continue
+            try:
+                record_audio_auto_backend(
+                    wake_wav,
+                    duration=args.wake_duration,
+                    mic_input=args.mic_input,
+                    backend=args.record_backend,
+                )
+            finally:
+                audio_lock.release()
+            level = wav_level_dbfs(wake_wav)
+            print(f"[HTTP][WAKE] clip level: {level:.1f} dBFS")
+
+            if args.wake_any_keyword:
+                hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
+                    kws_root,
+                    wake_wav,
+                    wake_keyword_bins,
+                    wake_filler,
+                    wake_mlp,
+                )
+            else:
+                hit, hit_keyword, _raw = detect_wakeup(
+                    kws_root,
+                    wake_wav,
+                    wake_keyword_bin,
+                    wake_filler,
+                    wake_mlp,
+                )
+                matched_bin = wake_keyword_bin
+
+            if (not hit) and (level < args.wake_low_level_dbfs) and (args.wake_boost_db > 0):
+                boosted_wav = work_dir / "wake_http_boost.wav"
+                print(
+                    f"[HTTP][WAKE] low-level clip ({level:.1f} dBFS), retry with +{args.wake_boost_db:.1f} dB"
+                )
+                p = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(wake_wav),
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-af",
+                        f"volume={args.wake_boost_db}dB",
+                        str(boosted_wav),
+                        "-loglevel",
+                        "error",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if p.returncode == 0 and boosted_wav.exists():
+                    if args.wake_any_keyword:
+                        hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
+                            kws_root,
+                            boosted_wav,
+                            wake_keyword_bins,
+                            wake_filler,
+                            wake_mlp,
+                        )
+                    else:
+                        hit, hit_keyword, _raw = detect_wakeup(
+                            kws_root,
+                            boosted_wav,
+                            wake_keyword_bin,
+                            wake_filler,
+                            wake_mlp,
+                        )
+                        matched_bin = wake_keyword_bin
+                boosted_wav.unlink(missing_ok=True)
+
+            if not hit:
+                continue
+
+            print(f"[HTTP][WAKE] detected: {hit_keyword or '(unknown)'} via {matched_bin.name}")
+
+            if not trigger_lock.acquire(blocking=False):
+                print("[HTTP][WAKE] ignored because another request is running")
+                continue
+
+            try:
+                _http_speak_wake_prompt(args, tts_root, work_dir)
+                result = _run_single_http_turn(
+                    args,
+                    work_dir,
+                    asr_root,
+                    tts_root,
+                    forced_text=None,
+                    audio_lock=audio_lock,
+                )
+                print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
+            except Exception as e:  # noqa: BLE001
+                print(f"[HTTP][WAKE] turn failed: {e}")
+            finally:
+                trigger_lock.release()
+        except Exception as e:  # noqa: BLE001
+            print(f"[HTTP][WAKE] loop error: {e}")
+            time.sleep(0.5)
+
+
 def _run_http_server(args) -> None:
     check_cmd_exists("ffmpeg")
     check_cmd_exists("ffplay")
@@ -1423,10 +1867,20 @@ def _run_http_server(args) -> None:
 
     asr_root = Path(args.asr_root)
     tts_root = Path(args.tts_root)
+    kws_root = Path(args.kws_root)
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    wake_keyword_bin = Path(args.wake_keyword_bin)
+    wake_filler = Path(args.wake_filler)
+    wake_mlp = Path(args.wake_mlp)
+    wake_keyword_bins = collect_keyword_bins(kws_root)
+
+    if args.wake_any_keyword and not wake_keyword_bins:
+        raise RuntimeError("No keyword_*.bin found under res_shuffnet_v2")
+
     trigger_lock = threading.Lock()
+    audio_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *values):
@@ -1508,6 +1962,7 @@ def _run_http_server(args) -> None:
                     asr_root,
                     tts_root,
                     forced_text=text or None,
+                    audio_lock=audio_lock,
                 )
                 cost_ms = int((time.monotonic() - req_start) * 1000)
                 print(f"[HTTP] trigger done mode={mode} cost_ms={cost_ms}")
@@ -1522,6 +1977,31 @@ def _run_http_server(args) -> None:
             finally:
                 trigger_lock.release()
 
+    if args.http_wakeword:
+        wake_thread = threading.Thread(
+            target=_run_http_wakeword_loop,
+            args=(
+                args,
+                trigger_lock,
+                audio_lock,
+                work_dir,
+                asr_root,
+                tts_root,
+                kws_root,
+                wake_keyword_bin,
+                wake_filler,
+                wake_mlp,
+                wake_keyword_bins,
+            ),
+            daemon=True,
+            name="http-wakeword-loop",
+        )
+        wake_thread.start()
+        mode_hint = "any built-in keyword" if args.wake_any_keyword else wakeword_hint_from_bin(wake_keyword_bin)
+        print(f"[HTTP][WAKE] enabled, mode={mode_hint}")
+    else:
+        print("[HTTP][WAKE] disabled")
+
     server = ThreadingHTTPServer((args.http_trigger_host, args.http_trigger_port), Handler)
     print(
         f"[HTTP] ready: http://{args.http_trigger_host}:{args.http_trigger_port} "
@@ -1533,6 +2013,7 @@ def _run_http_server(args) -> None:
 def main():
     args = parse_args()
     _setup_file_logging(args.log_file)
+    _ensure_audio_runtime_env()
 
     use_http_mode = args.http_mode or (not args.wake_mode and not os.isatty(0))
     if use_http_mode:
@@ -1736,6 +2217,10 @@ def main():
         if normalized != text:
             print(f"[ASR] normalized: {normalized}")
             text = normalized
+        expanded = _expand_short_media_phrase(text)
+        if expanded != text:
+            print(f"[ASR] short phrase expanded: {text!r} -> {expanded!r}")
+            text = expanded
         print(f"[ASR] text: {text}")
 
         if not text:
