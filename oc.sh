@@ -31,6 +31,8 @@ Usage:
   ./oc.sh tools-media-show
   ./oc.sh tools-immich-setup
   ./oc.sh tools-immich-show
+  ./oc.sh tools-kb-setup
+  ./oc.sh tools-kb-show
   ./oc.sh pair-list
   ./oc.sh pair-approve <request_id>
   ./oc.sh immich-apply       Apply immich-compose.yml to CasaOS
@@ -133,6 +135,44 @@ case "${1:-}" in
     ;;
   tools-immich-show)
     docker_cmd exec openclaw node dist/index.js mcp show immich --json
+    ;;
+  tools-kb-setup)
+    mkdir -p /home/pi/nas_share/tools
+    mkdir -p /home/pi/nas_share/knowledge_base_data
+    cp "$APP_DIR/knowledge_base/kb_mcp.js" /home/pi/nas_share/tools/kb_mcp.js
+
+    if ! docker_cmd ps --format '{{.Names}}' | grep -qx knowledge_base; then
+      if docker_cmd ps -a --format '{{.Names}}' | grep -qx knowledge_base; then
+        docker_cmd start knowledge_base >/dev/null
+      else
+        docker_cmd build -t nas-knowledge-base:local "$APP_DIR/knowledge_base"
+        docker_cmd run -d \
+          --name knowledge_base \
+          --restart unless-stopped \
+          -e NAS_ROOT=/nas_share \
+          -e PORT=8084 \
+          -e SCAN_INTERVAL=60 \
+          -v /home/pi/nas_share:/nas_share:ro \
+          -v /home/pi/nas_share/knowledge_base_data:/data \
+          -p 28084:8084 \
+          nas-knowledge-base:local >/dev/null
+      fi
+    fi
+
+    IMMICH_URL_VAL="$(docker_cmd exec openclaw printenv IMMICH_URL 2>/dev/null || echo 'http://immich-server:2283')"
+    IMMICH_KEY_VAL="$(docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || echo '')"
+
+    docker_cmd exec openclaw node dist/index.js mcp set kb_search \
+      "{\"enabled\":true,\"command\":\"node\",\"args\":[\"/nas_share/tools/kb_mcp.js\"],\"env\":{\"KB_API_URL\":\"http://host.docker.internal:28084\",\"IMMICH_BASE_URL\":\"${IMMICH_URL_VAL}\",\"IMMICH_API_KEY\":\"${IMMICH_KEY_VAL}\"}}"
+    docker_cmd exec openclaw node dist/index.js mcp reload
+    docker_cmd restart openclaw
+    echo "Knowledge base configured."
+    echo "  KB API:   http://host.docker.internal:28084"
+    echo "  Indexed:  /nas_share (excludes tools/ Immich上传/)"
+    echo "  Photos:   Immich CLIP (${IMMICH_URL_VAL})"
+    ;;
+  tools-kb-show)
+    docker_cmd exec openclaw node dist/index.js mcp show kb_search --json
     ;;
   pair-list)
     docker_cmd exec -it openclaw node dist/index.js devices list

@@ -578,6 +578,9 @@ def normalize_asr_text(text: str) -> str:
         "下载特": "下载测试",
         "下载测": "下载测试",
         "下载韩纪录片": "下载海洋纪录片",
+        # 知识库查询常见误识别（住房合同）
+        "住房盒": "住房合同",
+        "住房合盒": "住房合同",
     }
     for wrong, right in replacements.items():
         text = text.replace(wrong, right)
@@ -1094,10 +1097,115 @@ def _fast_local_download_reply_with_args(_args, user_text: str):
     return _fast_local_download_reply(user_text)
 
 
+# KB 快速通道关键词：必须包含"查询意图词"之一
+_KB_INTENT_WORDS = re.compile(
+    r"在哪|哪里|哪个|找|查找|搜索|搜|是什么|有没有|有哪些"
+)
+# 同时包含"对象词"之一才命中
+_KB_OBJECT_WORDS = re.compile(
+    r"文件|文档|合同|报告|表格|表|记录|照片|图片|相册|视频|电影|音乐|资料|方案|说明|计划|协议"
+)
+_KB_API_URL = os.getenv("KB_API_URL", "http://127.0.0.1:28084")
+
+_KB_EXT_SPOKEN_MAP = {
+    ".pdf": "PDF文件",
+    ".doc": "Word文档",
+    ".docx": "Word文档",
+    ".xls": "Excel表格",
+    ".xlsx": "Excel表格",
+    ".txt": "文本文件",
+    ".md": "文档",
+    ".csv": "表格文件",
+    ".jpg": "图片",
+    ".jpeg": "图片",
+    ".png": "图片",
+    ".webp": "图片",
+    ".gif": "图片",
+    ".mp4": "视频",
+    ".mkv": "视频",
+    ".avi": "视频",
+    ".mov": "视频",
+    ".mp3": "音频",
+    ".wav": "音频",
+}
+
+
+def _kb_path_to_spoken(path: str):
+    """把路径转成便于 TTS 播报的口语描述。"""
+    raw = (path or "").strip()
+    if not raw:
+        return "该文件", ""
+
+    parts = [p for p in raw.replace("\\", "/").split("/") if p]
+    if parts and parts[0].lower().replace("-", "_") in {"nas_share", "nasshare", "nas", "share"}:
+        parts = parts[1:]
+    if not parts:
+        return "该文件", ""
+
+    filename = parts[-1].replace("_", "")
+    folders = [p.replace("_", "") for p in parts[:-1]]
+    stem, ext = os.path.splitext(filename)
+    ext_spoken = _KB_EXT_SPOKEN_MAP.get(ext.lower())
+    file_spoken = (f"{stem}{ext_spoken}" if ext_spoken and stem else (ext_spoken or stem or filename)).strip()
+
+    if not folders:
+        return file_spoken or "该文件", ""
+    if len(folders) == 1:
+        return file_spoken or "该文件", f"在{folders[0]}文件夹里"
+    return file_spoken or "该文件", f"在{folders[-2]}的{folders[-1]}文件夹里"
+
+
+def _format_kb_spoken_reply(results):
+    total = len(results)
+    first_path = results[0].get("path", "") if results else ""
+    file_spoken, loc_spoken = _kb_path_to_spoken(first_path)
+
+    if total <= 1:
+        if loc_spoken:
+            return f"找到了，{file_spoken}，{loc_spoken}。"
+        return f"找到了，{file_spoken}。"
+
+    if loc_spoken:
+        return f"找到{total}条，第一个是{file_spoken}，{loc_spoken}。"
+    return f"找到{total}条，第一个是{file_spoken}。"
+
+
+def _fast_local_kb_reply(_args, user_text: str):
+    """命中知识库查询时，直连 KB API 搜索，避免走 agent 长链路。"""
+    if not (_KB_INTENT_WORDS.search(user_text) and _KB_OBJECT_WORDS.search(user_text)):
+        return None
+    # 下载/播放意图优先，本通道不抢
+    if "下载" in user_text or "播放" in user_text or "放一下" in user_text:
+        return None
+
+    import json as _json
+    import urllib.request as _ur
+
+    try:
+        req = _ur.Request(
+            f"{_KB_API_URL}/search",
+            data=_json.dumps({"query": user_text}, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        with _ur.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+    except Exception as e:
+        print(f"[KB] api error: {e}")
+        return None
+
+    results = data.get("results", [])
+    if not results:
+        return f'知识库中未找到与"{user_text}"相关的内容'
+
+    return _format_kb_spoken_reply(results)
+
+
 LOCAL_FAST_CHANNELS = (
     ("classify", _fast_local_classify_reply),
     ("download", _fast_local_download_reply_with_args),
     ("play", _fast_local_play_reply),
+    ("kb", _fast_local_kb_reply),
 )
 
 
@@ -1276,6 +1384,8 @@ _TASK_KEYWORDS = frozenset({
     "照片", "图片", "相册", "文件", "目录", "文件夹",
     "视频", "音乐", "电影", "预告片", "纪录片", "剧集", "电视剧",
     "文档", "报告",
+    # 知识库相关对象词（知识库查询触发需要）
+    "合同", "方案", "协议", "资料", "预算", "表格", "记录", "说明", "计划",
     # NAS 路径/业务词
     "家庭", "手机", "旅行", "家庭相册", "手机相册",
     "nas_share", "NAS",
@@ -1326,7 +1436,6 @@ def _irrelevant_speech_reason(text: str) -> str | None:
 def _sanitize_reply_for_tts(reply: str) -> str:
     reply = re.sub(r"\*+", "", reply)
     reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
-    reply = re.sub(r"[_`]", "", reply)
     reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；""''（）…—\s]", "", reply)
     reply = re.sub(r"\s+", " ", reply).strip()
     return reply
@@ -1825,6 +1934,10 @@ def _run_http_wakeword_loop(
                             wake_mlp,
                         )
                         matched_bin = wake_keyword_bin
+                else:
+                    err = (p.stderr or p.stdout or "ffmpeg boost failed").strip()
+                    print(f"[KWS] boost retry skipped: {err}")
+
                 boosted_wav.unlink(missing_ok=True)
 
             if not hit:
