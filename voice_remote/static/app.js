@@ -98,4 +98,50 @@ textInput.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') triggerText();
 });
 
+// ── 对话历史时间线 ──────────────────────────────────────────────
+const turnsEl = document.getElementById('turns');
+const clearTurnsBtn = document.getElementById('clearTurns');
+let lastTurnTs = Date.now() / 1000 - 3600; // 初始加载最近1小时的记录
+
+const srcLabels = { wake: '🎤 唤醒', button: '🖱 按钮', text: '⌨ 文本' };
+
+function renderNewTurns(turns) {
+  if (!turns || !turns.length) return;
+  turns.forEach(t => {
+    const div = document.createElement('div');
+    div.className = 'turn';
+    const src = srcLabels[t.source] || t.source;
+    const hhmm = new Date(t.ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    div.innerHTML =
+      `<div class="turn-src">${src} · ${hhmm}</div>` +
+      (t.text ? `<div class="turn-txt">🗣 ${t.text}</div>` : '') +
+      (t.reply ? `<div class="turn-rep">💬 ${t.reply}</div>` : '') +
+      `<div class="turn-meta">耗时 ${t.cost_ms} ms</div>`;
+    turnsEl.appendChild(div);
+    if (t.ts > lastTurnTs) lastTurnTs = t.ts;
+  });
+  turnsEl.scrollTop = turnsEl.scrollHeight;
+}
+
+async function fetchTurns() {
+  try {
+    const resp = await fetch(apiUrl('/api/turns?since=' + lastTurnTs), { cache: 'no-store' });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderNewTurns(data.turns);
+  } catch (_) {}
+}
+
+if (clearTurnsBtn) {
+  clearTurnsBtn.addEventListener('click', () => {
+    turnsEl.innerHTML = '';
+    lastTurnTs = Date.now() / 1000;
+  });
+}
+
+setInterval(fetchTurns, 1500);
+fetchTurns();
+
+window.__voiceUiLoaded = true;
+
 window.__voiceUiLoaded = true;

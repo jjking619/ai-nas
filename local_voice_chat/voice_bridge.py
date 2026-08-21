@@ -205,6 +205,32 @@ _HTTP_DIALOG_STATE = {
     "pending_image_filter": None,
 }
 
+_VOICE_TURNS: list = []
+_VOICE_TURNS_LOCK = threading.Lock()
+_TURNS_FILE: Path | None = None
+_TURNS_MAX = 100
+
+
+def _record_voice_turn(source: str, text: str, reply: str, cost_ms: int) -> None:
+    turn = {
+        "id": f"{int(time.time() * 1000):x}",
+        "ts": time.time(),
+        "source": source,
+        "text": text,
+        "reply": reply,
+        "cost_ms": cost_ms,
+    }
+    with _VOICE_TURNS_LOCK:
+        _VOICE_TURNS.append(turn)
+        if len(_VOICE_TURNS) > _TURNS_MAX:
+            del _VOICE_TURNS[:-_TURNS_MAX]
+    if _TURNS_FILE is not None:
+        try:
+            with _TURNS_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(turn, ensure_ascii=False) + "\n")
+        except Exception as e:  # noqa: BLE001
+            print(f"[TURNS] write failed: {e}")
+
 
 class _TeeStream:
     def __init__(self, stream, log_fh):
@@ -1901,7 +1927,9 @@ def _run_single_http_turn(
     tts_root: Path,
     forced_text: str | None = None,
     audio_lock=None,
+    turn_source: str = "button",
 ) -> dict:
+    _turn_start = time.monotonic()
     user_wav = work_dir / "user_http.wav"
     reply_wav = work_dir / "reply_http.wav"
     recognizer = None
@@ -2080,9 +2108,7 @@ def _run_single_http_turn(
                 "reply": "",
             }
 
-        processing_hint = "正在处理，请稍等。"
-        print(f"[HTTP] processing: {processing_hint}")
-        tts_speak(tts, processing_hint, reply_wav, play=not args.no_play)
+        print("[HTTP] processing...")
 
         raw_reply = ask_openclaw(args, text)
         reply = _sanitize_reply_for_tts(raw_reply)
@@ -2105,6 +2131,12 @@ def _run_single_http_turn(
                 print(f"[HTTP][Jellyfin] {jf_hint}")
                 tts_speak(tts, jf_hint, reply_wav, play=not args.no_play)
 
+        _record_voice_turn(
+            source="text" if forced_text else turn_source,
+            text=text,
+            reply=spoken_reply,
+            cost_ms=int((time.monotonic() - _turn_start) * 1000),
+        )
         return {
             "ok": True,
             "message": "文本指令处理完成。" if forced_text else "语音指令处理完成。",
@@ -2199,55 +2231,6 @@ def _run_http_wakeword_loop(
                 )
                 matched_bin = wake_keyword_bin
 
-            if (not hit) and (level < args.wake_low_level_dbfs) and (args.wake_boost_db > 0):
-                boosted_wav = work_dir / "wake_http_boost.wav"
-                print(
-                    f"[HTTP][WAKE] low-level clip ({level:.1f} dBFS), retry with +{args.wake_boost_db:.1f} dB"
-                )
-                p = subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        str(wake_wav),
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "16000",
-                        "-af",
-                        f"volume={args.wake_boost_db}dB",
-                        str(boosted_wav),
-                        "-loglevel",
-                        "error",
-                    ],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                if p.returncode == 0 and boosted_wav.exists():
-                    if args.wake_any_keyword:
-                        hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
-                            kws_root,
-                            boosted_wav,
-                            wake_keyword_bins,
-                            wake_filler,
-                            wake_mlp,
-                        )
-                    else:
-                        hit, hit_keyword, _raw = detect_wakeup(
-                            kws_root,
-                            boosted_wav,
-                            wake_keyword_bin,
-                            wake_filler,
-                            wake_mlp,
-                        )
-                        matched_bin = wake_keyword_bin
-                else:
-                    err = (p.stderr or p.stdout or "ffmpeg boost failed").strip()
-                    print(f"[KWS] boost retry skipped: {err}")
-
-                boosted_wav.unlink(missing_ok=True)
-
             if not hit:
                 continue
 
@@ -2259,6 +2242,7 @@ def _run_http_wakeword_loop(
 
             try:
                 _http_speak_wake_prompt(args, tts_root, work_dir)
+                time.sleep(0.8)  # 提示音结束后留出缓冲，避免开口音节被切
                 result = _run_single_http_turn(
                     args,
                     work_dir,
@@ -2266,6 +2250,7 @@ def _run_http_wakeword_loop(
                     tts_root,
                     forced_text=None,
                     audio_lock=audio_lock,
+                    turn_source="wake",
                 )
                 print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
                 # If a pending dialog state exists (e.g. waiting for filter style),
@@ -2279,6 +2264,7 @@ def _run_http_wakeword_loop(
                         tts_root,
                         forced_text=None,
                         audio_lock=audio_lock,
+                        turn_source="wake",
                     )
                     print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
             except Exception as e:  # noqa: BLE001
@@ -2307,6 +2293,14 @@ def _run_http_server(args) -> None:
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    global _TURNS_FILE
+    _TURNS_FILE = (
+        Path(args.log_file).parent / "voice_turns.jsonl"
+        if args.log_file
+        else work_dir / "voice_turns.jsonl"
+    )
+    print(f"[TURNS] file: {_TURNS_FILE}")
+
     wake_keyword_bin = Path(args.wake_keyword_bin)
     wake_filler = Path(args.wake_filler)
     wake_mlp = Path(args.wake_mlp)
@@ -2334,6 +2328,12 @@ def _run_http_server(args) -> None:
                     "busy": trigger_lock.locked(),
                     "port": args.http_trigger_port,
                 })
+                return
+            if parsed.path == "/api/turns":
+                since = float(parse_qs(parsed.query).get("since", ["0"])[0] or "0")
+                with _VOICE_TURNS_LOCK:
+                    turns = [t for t in _VOICE_TURNS if t["ts"] > since]
+                _json_response(self, HTTPStatus.OK, {"ok": True, "turns": turns})
                 return
             if parsed.path == "/trigger":
                 self._handle_trigger(parsed)

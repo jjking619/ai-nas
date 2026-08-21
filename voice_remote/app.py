@@ -22,6 +22,7 @@ LOG_FILE = os.getenv("LOG_FILE", "/logs/voice_remote.log").strip()
 MAX_TASKS = int(os.getenv("MAX_TASKS", "120"))
 STATIC_DIR = Path(__file__).with_name("static")
 APP_JS_FILE = STATIC_DIR / "app.js"
+TURNS_FILE = Path(os.getenv("TURNS_FILE", "/logs/voice_turns.jsonl"))
 
 _TASKS = {}
 _TASK_ORDER = []
@@ -306,6 +307,15 @@ def _index_html():
       .grid {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 26px; }}
     }}
+    .turns-hdr {{ display: flex; align-items: center; justify-content: space-between; margin-top: 18px; margin-bottom: 8px; }}
+    .turns-hdr h2 {{ margin: 0; font-size: 18px; }}
+    .clear-btn {{ background: none; border: 1px solid rgba(255,255,255,0.2); color: var(--muted); border-radius: 8px; padding: 4px 10px; font-size: 13px; cursor: pointer; }}
+    .turns {{ display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }}
+    .turn {{ background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 10px 14px; font-size: 14px; line-height: 1.65; }}
+    .turn-src {{ color: var(--accent); font-size: 12px; margin-bottom: 4px; }}
+    .turn-txt {{ color: var(--text); }}
+    .turn-rep {{ color: var(--ok); margin-top: 4px; }}
+    .turn-meta {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
   </style>
 </head>
 <body>
@@ -331,8 +341,8 @@ def _index_html():
     </section>
 
     <div id=\"status\" class=\"status\">待机中。请选择语音或文本模式。</div>
-    <div class=\"meta\">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>
-  </main>
+    <div class=\"meta\">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>    <div class="turns-hdr"><h2>对话历史</h2><button class="clear-btn" id="clearTurns">清空</button></div>
+    <div id="turns" class="turns"></div>  </main>
 
   <script>
     window.__voiceUiLoaded = false;
@@ -418,6 +428,9 @@ class Handler(BaseHTTPRequestHandler):
             task_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0].strip()
             self._handle_task_get(task_id)
             return
+        if parsed.path == "/api/turns":
+            self._handle_turns(parsed)
+            return
         if parsed.path == "/api/trigger":
             self._handle_trigger(parsed)
             return
@@ -477,6 +490,27 @@ class Handler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "task not found"})
             return
         _json_response(self, HTTPStatus.OK, {"ok": True, "task": task})
+
+    def _handle_turns(self, parsed):
+        since = float(urllib.parse.parse_qs(parsed.query).get("since", ["0"])[0] or "0")
+        turns = []
+        try:
+            if TURNS_FILE.exists():
+                with TURNS_FILE.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            t = json.loads(line)
+                            if float(t.get("ts", 0)) > since:
+                                turns.append(t)
+                        except Exception:
+                            pass
+        except Exception as e:
+            _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
+            return
+        _json_response(self, HTTPStatus.OK, {"ok": True, "turns": turns})
 
 
 def main():
