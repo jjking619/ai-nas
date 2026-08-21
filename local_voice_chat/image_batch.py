@@ -75,16 +75,8 @@ def _iter_images(root: Path, recursive: bool):
 
 
 def _unique_target_path(dst: Path) -> Path:
-    if not dst.exists():
-        return dst
-    base = dst.stem
-    suffix = dst.suffix
-    i = 2
-    while True:
-        candidate = dst.with_name(f"{base}_{i}{suffix}")
-        if not candidate.exists():
-            return candidate
-        i += 1
+    # 覆盖模式：始终直接使用同名目标路径，每次运行覆盖上一次的产物，
+    return dst
 
 
 def _apply_vintage(img: Image.Image, seed: int) -> Image.Image:

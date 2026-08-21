@@ -211,6 +211,17 @@ _VOICE_TURNS_LOCK = threading.Lock()
 _TURNS_FILE: Path | None = None
 _TURNS_MAX = 100
 
+_BRIDGE_STATE: dict = {"state": "idle", "ts": 0.0, "last_text": ""}
+_BRIDGE_STATE_LOCK = threading.Lock()
+
+
+def _set_bridge_state(state: str, last_text: str = "") -> None:
+    with _BRIDGE_STATE_LOCK:
+        _BRIDGE_STATE["state"] = state
+        _BRIDGE_STATE["ts"] = time.time()
+        if last_text:
+            _BRIDGE_STATE["last_text"] = last_text
+
 
 def _record_voice_turn(source: str, text: str, reply: str, cost_ms: int) -> None:
     turn = {
@@ -891,7 +902,7 @@ def _fast_local_image_filter_reply(_args, user_text: str):
 
 
 # 口语/别名 → 库中媒体名（ASR 常把英文媒体名识别成中文口语）
-PLAY_ALIASES = {
+_PLAY_ALIASES = {
     "兔子": "Big_Buck_Bunny",
     "bunny": "Big_Buck_Bunny",
     "大兔": "Big_Buck_Bunny",
@@ -1183,6 +1194,10 @@ def _fast_local_play_reply(args, user_text: str):
     term = term.replace("并且", "").replace("并", "")
     term = term.strip()
     is_generic = not term   # 泛称"放视频"，未指定具体内容
+    if is_generic:
+        term = "测试视频"
+        is_generic = False
+        print("[Jellyfin] generic play request, fallback term='测试视频'")
 
     import json as _json
     import urllib.parse as _up
@@ -1639,6 +1654,8 @@ _INCOMPLETE_ACTION_WORDS = (
     "播放", "放", "暂停", "查询", "查找", "搜索", "查", "找", "看看",
     "处理", "滤镜", "风格", "调色", "复古", "日系", "胶片",
     "显示", "列出", "打开", "关闭",
+)
+_INCOMPLETE_TARGET_WORDS = (
     # 目标对象
     "照片", "图片", "相册", "文件", "目录", "文件夹",
     "视频", "音乐", "电影", "预告片", "纪录片", "剧集", "电视剧",
@@ -2043,6 +2060,7 @@ def _run_single_http_turn(
                         f"[HTTP] listening for follow-up command... "
                         f"({listen_round}/{_HTTP_INCOMPLETE_MAX_FOLLOWUPS})"
                     )
+                _set_bridge_state("listening")
                 if audio_lock is not None:
                     audio_lock.acquire()
                 try:
@@ -2065,6 +2083,7 @@ def _run_single_http_turn(
                     f"{_wav_meta_for_log(user_wav)}"
                 )
 
+                _set_bridge_state("asr")
                 raw_text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
                 print(f"[HTTP][ASR] raw_text={raw_text!r} len={len(raw_text.strip())}")
                 normalized = normalize_asr_text(raw_text)
@@ -2093,7 +2112,14 @@ def _run_single_http_turn(
                 _HTTP_DIALOG_STATE["pending_image_filter"] = new_pending
                 if pending_reply is not None:
                     print(f"[HTTP][FILTER] pending reply: {pending_reply}")
+                    _set_bridge_state("speaking")
                     tts_speak(tts, pending_reply, reply_wav, play=not args.no_play)
+                    _record_voice_turn(
+                        source=turn_source,
+                        text=text,
+                        reply=pending_reply,
+                        cost_ms=int((time.monotonic() - _turn_start) * 1000),
+                    )
                     return {
                         "ok": True,
                         "message": "已承接上一轮滤镜参数补充。",
@@ -2115,7 +2141,14 @@ def _run_single_http_turn(
                     f"style={filter_req['style']} dry={1 if filter_req['dry'] else 0}"
                 )
                 prompt = _IMAGE_FILTER_TARGET_PROMPT if filter_req["target"] is None else _IMAGE_FILTER_STYLE_PROMPT
+                _set_bridge_state("speaking")
                 tts_speak(tts, prompt, reply_wav, play=not args.no_play)
+                _record_voice_turn(
+                    source=turn_source,
+                    text=text,
+                    reply=prompt,
+                    cost_ms=int((time.monotonic() - _turn_start) * 1000),
+                )
                 return {
                     "ok": True,
                     "message": "等待补充滤镜参数。",
@@ -2156,6 +2189,7 @@ def _run_single_http_turn(
             }
 
         print("[HTTP] processing...")
+        _set_bridge_state("processing", text)
 
         raw_reply = ask_openclaw(args, text)
         reply = _sanitize_reply_for_tts(raw_reply)
@@ -2167,6 +2201,7 @@ def _run_single_http_turn(
             brief_user_len=args.tts_brief_user_len,
         )
         print(f"[HTTP] reply: {spoken_reply}")
+        _set_bridge_state("speaking")
         tts_speak(tts, spoken_reply, reply_wav, play=not args.no_play)
 
         if args.jellyfin_api_key:
@@ -2196,6 +2231,7 @@ def _run_single_http_turn(
         if not keep_models:
             del tts
             gc.collect()
+        _set_bridge_state("idle")
 
 
 def _http_speak_wake_prompt(args, tts_root: Path, work_dir: Path) -> None:
@@ -2282,6 +2318,7 @@ def _run_http_wakeword_loop(
                 continue
 
             print(f"[HTTP][WAKE] detected: {hit_keyword or '(unknown)'} via {matched_bin.name}")
+            _set_bridge_state("awake")
 
             if not trigger_lock.acquire(blocking=False):
                 print("[HTTP][WAKE] ignored because another request is running")
@@ -2361,7 +2398,7 @@ def _run_http_server(args) -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *values):
-            print(f"[HTTP] {self.address_string()} - {fmt % values}")
+            # print(f"[HTTP] {self.address_string()} - {fmt % values}")
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -2381,6 +2418,12 @@ def _run_http_server(args) -> None:
                 with _VOICE_TURNS_LOCK:
                     turns = [t for t in _VOICE_TURNS if t["ts"] > since]
                 _json_response(self, HTTPStatus.OK, {"ok": True, "turns": turns})
+                return
+            if parsed.path == "/api/status":
+                with _BRIDGE_STATE_LOCK:
+                    state_copy = dict(_BRIDGE_STATE)
+                state_copy["busy"] = trigger_lock.locked()
+                _json_response(self, HTTPStatus.OK, {"ok": True, **state_copy})
                 return
             if parsed.path == "/trigger":
                 self._handle_trigger(parsed)

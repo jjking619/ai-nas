@@ -114,6 +114,13 @@ def _call_upstream_healthz():
         return resp.status, raw
 
 
+def _call_upstream_status():
+    req = urllib.request.Request(_upstream_url("/api/status"), method="GET")
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        return resp.status, raw
+
+
 def _new_task(mode: str, text: str):
     task_id = uuid.uuid4().hex[:12]
     now = int(time.time() * 1000)
@@ -292,26 +299,30 @@ def _index_html():
       outline: none;
       font-size: 15px;
     }}
-    .status {{
-      margin-top: 16px;
-      background: rgba(0,0,0,0.22);
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 14px;
-      min-height: 120px;
-      padding: 14px;
-      white-space: pre-wrap;
-      line-height: 1.68;
-    }}
     .meta {{ margin-top: 10px; color: var(--muted); font-size: 13px; }}
     @media (max-width: 760px) {{
       .grid {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 26px; }}
     }}
-    .turns-hdr {{ display: flex; align-items: center; justify-content: space-between; margin-top: 18px; margin-bottom: 8px; }}
+        .turns-wrap {{
+            margin-top: 16px;
+            background: rgba(0,0,0,0.22);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 14px;
+            padding: 12px;
+        }}
+        .turns-hdr {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }}
     .turns-hdr h2 {{ margin: 0; font-size: 18px; }}
     .clear-btn {{ background: none; border: 1px solid rgba(255,255,255,0.2); color: var(--muted); border-radius: 8px; padding: 4px 10px; font-size: 13px; cursor: pointer; }}
     .turns {{ display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }}
     .turn {{ background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 10px 14px; font-size: 14px; line-height: 1.65; }}
+        .turn-live {{
+            border-style: dashed;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: rgba(3,12,19,0.92);
+        }}
     .turn-src {{ color: var(--accent); font-size: 12px; margin-bottom: 4px; }}
     .turn-txt {{ color: var(--text); }}
     .turn-rep {{ color: var(--ok); margin-top: 4px; }}
@@ -340,29 +351,46 @@ def _index_html():
       </article>
     </section>
 
-    <div id=\"status\" class=\"status\">待机中。请选择语音或文本模式。</div>
-    <div class=\"meta\">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>    <div class="turns-hdr"><h2>对话历史</h2><button class="clear-btn" id="clearTurns">清空</button></div>
-    <div id="turns" class="turns"></div>  </main>
+        <div id="status" style="display:none;">待机中。请选择语音或文本模式。</div>
+        <div class="meta">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>
+        <section class="turns-wrap">
+            <div class="turns-hdr"><h2>对话历史</h2><button class="clear-btn" id="clearTurns">清空</button></div>
+            <div id="turns" class="turns"></div>
+        </section>
+    </main>
 
   <script>
     window.__voiceUiLoaded = false;
+        function _reportUiStatus(message) {{
+            if (typeof window.__voiceSetStatus === 'function') {{
+                window.__voiceSetStatus(message);
+                return;
+            }}
+            const turnsEl = document.getElementById('turns');
+            if (!turnsEl) return;
+            let live = document.getElementById('liveStatusTurn');
+            if (!live) {{
+                live = document.createElement('div');
+                live.id = 'liveStatusTurn';
+                live.className = 'turn turn-live';
+                live.innerHTML = '<div class="turn-src">🧾 实时状态</div><div class="turn-txt"></div>';
+                turnsEl.prepend(live);
+            }}
+            const txt = live.querySelector('.turn-txt');
+            if (txt) txt.textContent = message;
+        }}
     window.addEventListener('error', function (event) {{
-      const statusEl = document.getElementById('status');
-      if (!statusEl) return;
       const detail = event && event.message ? '：' + event.message : '';
-      statusEl.textContent = '页面脚本异常' + detail;
+        _reportUiStatus('页面脚本异常' + detail);
     }});
     window.addEventListener('unhandledrejection', function (event) {{
-      const statusEl = document.getElementById('status');
-      if (!statusEl) return;
       const detail = event && event.reason ? '：' + String(event.reason) : '';
-      statusEl.textContent = '页面脚本异常' + detail;
+        _reportUiStatus('页面脚本异常' + detail);
     }});
     window.addEventListener('load', function () {{
       window.setTimeout(function () {{
         if (window.__voiceUiLoaded) return;
-        const statusEl = document.getElementById('status');
-        if (statusEl) statusEl.textContent = '页面脚本异常：脚本未完成加载';
+            _reportUiStatus('页面脚本异常：脚本未完成加载');
       }}, 1200);
     }});
   </script>
@@ -419,6 +447,14 @@ class Handler(BaseHTTPRequestHandler):
                     "proxy_ok": False,
                     "error": str(e),
                 })
+            return
+        if parsed.path == "/api/status":
+            try:
+                code, raw = _call_upstream_status()
+                payload = json.loads(raw) if raw else {}
+                _json_response(self, code, payload)
+            except Exception:  # noqa: BLE001
+                _json_response(self, HTTPStatus.OK, {"ok": True, "state": "idle", "busy": False})
             return
         if parsed.path.startswith("/api/task/"):
             task_id = parsed.path.rsplit("/", 1)[-1].strip()
