@@ -26,6 +26,7 @@ DEFAULT_HOTWORDS = [
     "打开", "复制", "所有", "全部", "播放",
     "下载", "测试", "海洋", "兔子", "预告片",
     "电影", "电视剧", "音乐", "歌曲", "剧集", "家庭影院", "保存",
+	"复古", "日系", "胶片", "滤镜", "风格",
     "合同", "住房合同", "预算", "方案", "协议", "表格", "报告", "记录",
     "租房", "房产",
 ]
@@ -206,15 +207,18 @@ def record_speech_until_silence(
 	tail_window_sec: float,
 	silence_threshold_dbfs: float,
 	chunk_duration: float = 1.2,
-	consecutive_silence_chunks: int = 2,
+	consecutive_silence_chunks: int = 4,
 ) -> None:
 	all_chunks = []
 	total_sec = 0.0
 	silence_count = 0
 	tmp_files = []
+	adaptive_base_threshold = float(silence_threshold_dbfs)
+	dynamic_threshold_dbfs = adaptive_base_threshold
+	speech_peak_dbfs = -99.0
 
-	while total_sec < max_duration:
-		this_dur = min(chunk_duration, max_duration - total_sec)
+	def _record_chunk(this_dur: float, label: str):
+		nonlocal total_sec, speech_peak_dbfs, dynamic_threshold_dbfs
 		chunk_wav = out_wav.parent / f"{out_wav.stem}.chunk.{len(tmp_files)}.wav"
 		tmp_files.append(chunk_wav)
 
@@ -249,16 +253,43 @@ def record_speech_until_silence(
 		tail_n = max(1, int(sr * tail_window_sec))
 		tail = chunk_samples[-tail_n:] if len(chunk_samples) >= tail_n else chunk_samples
 		tail_db = dbfs_from_samples(tail)
-		print(f"[MIC] speech tail level: {tail_db:.1f} dBFS (captured {total_sec:.1f}s)")
+
+		speech_peak_dbfs = max(speech_peak_dbfs, tail_db)
+		if speech_peak_dbfs > -98.0:
+			# 自适应阈值：用已观测到的语音峰值反推静音线。
+			# 语音峰值越高，静音线可适当上抬，减少高噪环境下的“只到 max_duration 才停”。
+			adaptive_from_peak = min(-34.0, speech_peak_dbfs - 10.0)
+			dynamic_threshold_dbfs = max(adaptive_base_threshold, adaptive_from_peak)
+
+		print(
+			f"[MIC] {label} tail level: {tail_db:.1f} dBFS "
+			f"(captured {total_sec:.1f}s, silence<{dynamic_threshold_dbfs:.1f}dBFS)"
+		)
+		return tail_db
+
+	while total_sec < max_duration:
+		this_dur = min(chunk_duration, max_duration - total_sec)
+		tail_db = _record_chunk(this_dur, "speech")
 
 		if total_sec >= min_duration:
-			if tail_db < silence_threshold_dbfs:
+			if tail_db < dynamic_threshold_dbfs:
 				silence_count += 1
 			else:
 				silence_count = 0
 
 			if silence_count >= consecutive_silence_chunks:
-				break
+				remain = max_duration - total_sec
+				if remain <= 0:
+					break
+
+				# 确认帧：避免句中长停顿被误判结束
+				confirm_dur = min(chunk_duration, remain)
+				confirm_tail_db = _record_chunk(confirm_dur, "confirm")
+				if confirm_tail_db < dynamic_threshold_dbfs:
+					print("[MIC] silence confirmed, stop capture.")
+					break
+				print("[MIC] confirm frame has speech, continue listening.")
+				silence_count = 0
 
 	if not all_chunks:
 		write_wav_mono_16k(out_wav, np.zeros((0,), dtype=np.float32))

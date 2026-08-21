@@ -201,6 +201,10 @@ _HTTP_MODEL_CACHE = {
     "recognizers": {},
 }
 
+_HTTP_DIALOG_STATE = {
+    "pending_image_filter": None,
+}
+
 
 class _TeeStream:
     def __init__(self, stream, log_fh):
@@ -512,6 +516,25 @@ def sync_nas_classify_script() -> Path:
         return dst
 
 
+def sync_image_batch_script() -> Path:
+    """同步滤镜批处理脚本到 /nas_share/tools，便于容器挂载可见。"""
+    src = Path(__file__).resolve().parent / "image_batch.py"
+    dst = Path("/home/pi/nas_share/tools/image_batch.py")
+
+    if not src.exists():
+        raise RuntimeError(f"image_batch.py 源文件不存在: {src}")
+
+    try:
+        if not dst.exists() or src.read_bytes() != dst.read_bytes():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+            print(f"[SYNC] image_batch.py 已同步: {src} -> {dst}")
+        return dst
+    except OSError as e:
+        print(f"[WARN] image_batch.py 同步失败（不影响语音主流程）: {e}")
+        return dst
+
+
 def _json_from_mixed_output(raw):
     raw = raw.strip()
     if not raw:
@@ -570,9 +593,18 @@ def normalize_asr_text(text: str) -> str:
         "家庭册": "家庭相册",
         "家庭像册": "家庭相册",
         "家庭象册": "家庭相册",
+        "家相册": "家庭相册",
+        "家像册": "家庭相册",
+        "家象册": "家庭相册",
         "手机册": "手机相册",
         "手机像册": "手机相册",
         "手机象册": "手机相册",
+        "机相册": "手机相册",
+        "机像册": "手机相册",
+        "机象册": "手机相册",
+        "照片夹": "相册",
+        "像片夹": "相册",
+        "像册": "相册",
         "特视频": "测试视频",
         "测视频": "测试视频",
         "下载特": "下载测试",
@@ -588,7 +620,7 @@ def normalize_asr_text(text: str) -> str:
     # 上下文补全：仅当句子属于 NAS 操作语境时，才做"缺字补全"，降低误伤
     is_nas_cmd = any(k in text for k in ("分类", "照片", "相册", "图片", "移动", "整理", "备份"))
     if is_nas_cmd:
-        for base, full in (("家庭", "家庭相册"), ("手机", "手机相册")):
+        for base, full in (("家庭", "家庭相册"), ("家", "家庭相册"), ("手机", "手机相册"), ("机", "手机相册")):
             if base in text and full not in text:
                 for d in ("下面", "里面", "里的", "中的", "内", "下", "里"):
                     pat = f"{base}{d}"
@@ -653,8 +685,184 @@ def _fast_local_classify_reply(args, user_text):
     return f"{target}分类完成：{summary}。"
 
 
+_IMAGE_STYLE_ALIASES = {
+    "复古风格": "vintage",
+    "复古风": "vintage",
+    "复古": "vintage",
+    "vintage": "vintage",
+    "日系风格": "japanese",
+    "日系风": "japanese",
+    "日系": "japanese",
+    "japanese": "japanese",
+    "胶片风格": "film",
+    "胶片风": "film",
+    "胶片": "film",
+    "film": "film",
+}
+
+_IMAGE_STYLE_DIRS = {
+    "vintage": "复古风格",
+    "japanese": "日系风格",
+    "film": "胶片风格",
+}
+
+_IMAGE_FILTER_STYLE_PROMPT = "要哪种风格：复古、日系还是胶片？"
+_IMAGE_FILTER_TARGET_PROMPT = "请说要处理哪个目录，例如旅行或家庭相册。"
+_IMAGE_FILTER_PENDING_MAX_ATTEMPTS = 4
+
+
+def _looks_like_image_filter_request(user_text: str) -> bool:
+    has_filter_intent = any(
+        k in user_text
+        for k in ("滤镜", "风格", "调色", "处理成", "处理", "改成", "变成", "弄成", "加滤镜")
+    )
+    has_photo_object = any(k in user_text for k in ("照片", "图片", "相册", "图像"))
+    return has_filter_intent and has_photo_object
+
+
+def _detect_image_filter_target(user_text: str):
+    roots = ("手机相册", "家庭相册", "旅行", "备份")
+    return next((r for r in roots if r in user_text), None)
+
+
+def _extract_image_filter_request(user_text: str):
+    if not _looks_like_image_filter_request(user_text):
+        return None
+
+    target = _detect_image_filter_target(user_text)
+    style = _detect_image_style(user_text)
+    dry = any(k in user_text for k in ("预览", "先看看", "先别动", "计划", "试运行", "dry-run"))
+    return {
+        "target": target,
+        "style": style,
+        "dry": dry,
+    }
+
+
+def _run_image_batch_reply(target: str, style: str, dry: bool):
+    script = Path(__file__).resolve().parent / "image_batch.py"
+    if not script.exists():
+        return "滤镜脚本不存在，请先同步 image_batch.py。"
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--dir",
+        str(Path("/home/pi/nas_share") / target),
+        "--style",
+        style,
+        "--recursive",
+    ]
+    if dry:
+        cmd.append("--dry-run")
+
+    try:
+        p = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return "滤镜处理超时，请缩小目录范围后重试。"
+    except Exception as e:  # noqa: BLE001
+        return f"滤镜处理失败：{e}"
+
+    output = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+    summary = _parse_image_batch_summary(output)
+    style_dir = summary.get("style") or _IMAGE_STYLE_DIRS.get(style, "风格")
+
+    def _to_int(v, default=0):
+        try:
+            return int(str(v))
+        except Exception:  # noqa: BLE001
+            return default
+
+    total = _to_int(summary.get("total"))
+    planned = _to_int(summary.get("planned"))
+    processed = _to_int(summary.get("processed"))
+    failed = _to_int(summary.get("failed"))
+
+    if p.returncode != 0 and processed <= 0:
+        tail = "；".join([x.strip() for x in output.splitlines()[-3:] if x.strip()])
+        return f"滤镜处理失败：{(tail or '未知错误')[:120]}"
+
+    if dry:
+        return (
+            f"预览完成：{target}共{total}张，计划处理{planned}张，"
+            f"输出到各原目录/{style_dir}/，未写入文件。"
+        )
+
+    if total == 0:
+        return f"{target}目录下未发现可处理图片。"
+    if failed > 0:
+        return f"{target}{style_dir}处理完成：成功{processed}张，失败{failed}张。"
+    return f"{target}{style_dir}处理完成：成功{processed}张，输出到各原目录/{style_dir}/。"
+
+
+def _consume_pending_image_filter(text: str, pending: dict | None):
+    if not pending:
+        return None, pending
+
+    target = pending.get("target")
+    style = pending.get("style")
+    if target is None:
+        target = _detect_image_filter_target(text)
+    if style is None:
+        style = _detect_image_style(text)
+
+    if target is not None and style is not None:
+        return _run_image_batch_reply(target, style, bool(pending.get("dry"))), None
+
+    attempts = int(pending.get("attempts", 0)) + 1
+    if attempts >= _IMAGE_FILTER_PENDING_MAX_ATTEMPTS:
+        return "我还是没听清，请重新说完整指令。", None
+
+    pending["target"] = target
+    pending["style"] = style
+    pending["attempts"] = attempts
+    if target is None:
+        return _IMAGE_FILTER_TARGET_PROMPT, pending
+    return "我没听清风格，请说复古、日系或胶片。", pending
+
+
+def _detect_image_style(user_text: str):
+    for k in sorted(_IMAGE_STYLE_ALIASES.keys(), key=len, reverse=True):
+        if k in user_text:
+            return _IMAGE_STYLE_ALIASES[k]
+    return None
+
+
+def _parse_image_batch_summary(output: str):
+    m = re.search(r"\[SUMMARY\]\s+(.*)", output)
+    if not m:
+        return {}
+    summary = {}
+    for token in m.group(1).split():
+        if "=" not in token:
+            continue
+        k, v = token.split("=", 1)
+        summary[k.strip()] = v.strip()
+    return summary
+
+
+def _fast_local_image_filter_reply(_args, user_text: str):
+    """命中图片风格化指令时，直跑本地脚本，避免走 agent 长链路。"""
+    req = _extract_image_filter_request(user_text)
+    if req is None:
+        return None
+
+    if req["target"] is None:
+        return _IMAGE_FILTER_TARGET_PROMPT
+
+    if req["style"] is None:
+        return _IMAGE_FILTER_STYLE_PROMPT
+    return _run_image_batch_reply(req["target"], req["style"], bool(req["dry"]))
+
+
 # 口语/别名 → 库中媒体名（ASR 常把英文媒体名识别成中文口语）
-_PLAY_ALIASES = {
+PLAY_ALIASES = {
     "兔子": "Big_Buck_Bunny",
     "bunny": "Big_Buck_Bunny",
     "大兔": "Big_Buck_Bunny",
@@ -1202,6 +1410,7 @@ def _fast_local_kb_reply(_args, user_text: str):
 
 
 LOCAL_FAST_CHANNELS = (
+    ("filter", _fast_local_image_filter_reply),
     ("classify", _fast_local_classify_reply),
     ("download", _fast_local_download_reply_with_args),
     ("play", _fast_local_play_reply),
@@ -1258,6 +1467,9 @@ def ask_openclaw(args, user_text):
         "发现重复前缀文件名时，直接自动清理并重命名，不要询问用户确认。\n"
         "脚本归档规则：按内容分类到类别目录，并重命名为 YYYYMMDD_HHMMSS_类别_原文件名.ext；"
         "低置信度会归入“待确认”。只有脚本模式失败时，才回退 nas_files 手动逐个移动。\n"
+        "图片风格化规则：当用户要求复古/日系/胶片滤镜时，优先执行脚本批处理：\n"
+        "  timeout 600 python3 /nas_share/tools/image_batch.py --dir <目录> --style <vintage|japanese|film> --recursive\n"
+        "用户明确说预览时追加 --dry-run；输出目录固定为每张原图所在目录下的“<风格名>/”子目录，禁止覆盖原图。\n"
         f"用户指令：{user_text}"
     )
 
@@ -1352,6 +1564,40 @@ def _expand_short_media_phrase(text: str) -> str:
         return _SHORT_MEDIA_PHRASES[compact]
     return text
 
+
+_HTTP_INCOMPLETE_PROMPT = "我这边听到你还没说完，请继续说。"
+_HTTP_INCOMPLETE_MAX_FOLLOWUPS = 2
+_INCOMPLETE_ENDINGS = (
+    "的", "了", "下", "把", "给", "对", "并", "然后", "进行", "处理", "操作", "一下",
+)
+_INCOMPLETE_ACTION_WORDS = (
+    "分类", "归档", "整理", "移动", "重命名", "删除", "复制", "备份",
+    "下载", "上传", "播放", "暂停", "查询", "查找", "搜索", "打开", "关闭",
+    "处理成", "改成", "变成", "调色", "滤镜",
+)
+_INCOMPLETE_TARGET_WORDS = (
+    "家庭相册", "手机相册", "旅行", "备份", "相册", "照片", "图片", "文件", "目录", "文件夹", "家庭",
+)
+
+
+def _looks_like_incomplete_command(text: str) -> bool:
+    s = re.sub(r"\s+", "", (text or "").strip())
+    s = s.strip("，。！？,.!?；;：:")
+    if not s:
+        return False
+    if len(s) <= 2:
+        return True
+    if s.endswith(_INCOMPLETE_ENDINGS):
+        return True
+    if re.match(r"^(帮我|请|给我)?把.{0,12}$", s):
+        return True
+
+    has_target = any(k in s for k in _INCOMPLETE_TARGET_WORDS)
+    has_action = any(k in s for k in _INCOMPLETE_ACTION_WORDS)
+    if has_target and not has_action:
+        return True
+    return False
+
 # ── 无关语音过滤 ─────────────────────────────────────────────────────────────
 # Level 1: 纯语气词 / 噪音
 _IRRELEVANT_EXACT = frozenset({
@@ -1379,6 +1625,7 @@ _TASK_KEYWORDS = frozenset({
     "分类", "归档", "整理", "移动", "重命名", "删除", "复制", "备份",
     "下载", "上传", "创建", "新建", "同步",
     "播放", "放", "暂停", "查询", "查找", "搜索", "查", "找", "看看",
+    "处理", "滤镜", "风格", "调色", "复古", "日系", "胶片",
     "显示", "列出", "打开", "关闭",
     # 目标对象
     "照片", "图片", "相册", "文件", "目录", "文件夹",
@@ -1709,54 +1956,115 @@ def _run_single_http_turn(
         tts = build_tts(tts_root)
 
     try:
-        if forced_text:
-            text = forced_text.strip()
-            print(f"[HTTP] text mode input: {text}")
-        else:
-            print("[HTTP] listening for one command...")
-            if audio_lock is not None:
-                audio_lock.acquire()
-            try:
-                record_speech_until_silence(
-                    user_wav,
-                    mic_input=args.mic_input,
-                    backend=args.record_backend,
-                    min_duration=args.speech_min_duration,
-                    max_duration=args.speech_duration,
-                    tail_window_sec=args.speech_tail_window,
-                    silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
-                )
-            finally:
+        listen_round = 0
+        text = ""
+        while True:
+            if forced_text:
+                text = forced_text.strip()
+                print(f"[HTTP] text mode input: {text}")
+            else:
+                if listen_round == 0:
+                    print("[HTTP] listening for one command...")
+                else:
+                    print(
+                        f"[HTTP] listening for follow-up command... "
+                        f"({listen_round}/{_HTTP_INCOMPLETE_MAX_FOLLOWUPS})"
+                    )
                 if audio_lock is not None:
-                    audio_lock.release()
-            level = wav_level_dbfs(user_wav)
-            print(f"[HTTP] speech clip level: {level:.1f} dBFS")
-            print(
-                f"[HTTP][AUDIO] mic={args.mic_input} backend={args.record_backend} "
-                f"{_wav_meta_for_log(user_wav)}"
-            )
+                    audio_lock.acquire()
+                try:
+                    record_speech_until_silence(
+                        user_wav,
+                        mic_input=args.mic_input,
+                        backend=args.record_backend,
+                        min_duration=args.speech_min_duration,
+                        max_duration=args.speech_duration,
+                        tail_window_sec=args.speech_tail_window,
+                        silence_threshold_dbfs=args.speech_silence_threshold_dbfs,
+                    )
+                finally:
+                    if audio_lock is not None:
+                        audio_lock.release()
+                level = wav_level_dbfs(user_wav)
+                print(f"[HTTP] speech clip level: {level:.1f} dBFS")
+                print(
+                    f"[HTTP][AUDIO] mic={args.mic_input} backend={args.record_backend} "
+                    f"{_wav_meta_for_log(user_wav)}"
+                )
 
-            raw_text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
-            print(f"[HTTP][ASR] raw_text={raw_text!r} len={len(raw_text.strip())}")
-            normalized = normalize_asr_text(raw_text)
-            if normalized != raw_text:
-                print(f"[HTTP] normalized: {normalized}")
-            text = normalized
+                raw_text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
+                print(f"[HTTP][ASR] raw_text={raw_text!r} len={len(raw_text.strip())}")
+                normalized = normalize_asr_text(raw_text)
+                if normalized != raw_text:
+                    print(f"[HTTP] normalized: {normalized}")
+                text = normalized
 
-        expanded = _expand_short_media_phrase(text)
-        if expanded != text:
-            print(f"[HTTP][ASR] short phrase expanded: {text!r} -> {expanded!r}")
-            text = expanded
-        print(f"[HTTP] text: {text}")
-        print(f"[HTTP][ASR] final_text={text!r} len={len(text.strip())}")
+            expanded = _expand_short_media_phrase(text)
+            if expanded != text:
+                print(f"[HTTP][ASR] short phrase expanded: {text!r} -> {expanded!r}")
+                text = expanded
+            print(f"[HTTP] text: {text}")
+            print(f"[HTTP][ASR] final_text={text!r} len={len(text.strip())}")
 
-        if not text:
-            return {
-                "ok": True,
-                "message": "未识别到有效语音，请重试。",
-                "text": "",
-                "reply": "",
-            }
+            if not text:
+                return {
+                    "ok": True,
+                    "message": "未识别到有效语音，请重试。",
+                    "text": "",
+                    "reply": "",
+                }
+
+            pending_filter = _HTTP_DIALOG_STATE.get("pending_image_filter")
+            if pending_filter is not None:
+                pending_reply, new_pending = _consume_pending_image_filter(text, pending_filter)
+                _HTTP_DIALOG_STATE["pending_image_filter"] = new_pending
+                if pending_reply is not None:
+                    print(f"[HTTP][FILTER] pending reply: {pending_reply}")
+                    tts_speak(tts, pending_reply, reply_wav, play=not args.no_play)
+                    return {
+                        "ok": True,
+                        "message": "已承接上一轮滤镜参数补充。",
+                        "text": text,
+                        "reply": pending_reply,
+                    }
+
+            filter_req = _extract_image_filter_request(text)
+            if filter_req is not None and (filter_req["target"] is None or filter_req["style"] is None):
+                _HTTP_DIALOG_STATE["pending_image_filter"] = {
+                    "target": filter_req["target"],
+                    "style": filter_req["style"],
+                    "dry": bool(filter_req["dry"]),
+                    "attempts": 0,
+                }
+                missing = "target" if filter_req["target"] is None else "style"
+                print(
+                    f"[HTTP][FILTER] pending {missing} target={filter_req['target']} "
+                    f"style={filter_req['style']} dry={1 if filter_req['dry'] else 0}"
+                )
+                prompt = _IMAGE_FILTER_TARGET_PROMPT if filter_req["target"] is None else _IMAGE_FILTER_STYLE_PROMPT
+                tts_speak(tts, prompt, reply_wav, play=not args.no_play)
+                return {
+                    "ok": True,
+                    "message": "等待补充滤镜参数。",
+                    "text": text,
+                    "reply": prompt,
+                }
+
+            if (not forced_text) and _looks_like_incomplete_command(text):
+                if listen_round < _HTTP_INCOMPLETE_MAX_FOLLOWUPS:
+                    listen_round += 1
+                    print(
+                        f"[HTTP][ASR] looks incomplete, continue listening: "
+                        f"text={text!r} round={listen_round}/{_HTTP_INCOMPLETE_MAX_FOLLOWUPS}"
+                    )
+                    tts_speak(tts, _HTTP_INCOMPLETE_PROMPT, reply_wav, play=not args.no_play)
+                    continue
+                print(
+                    f"[HTTP][ASR] looks incomplete but max follow-ups reached, proceed: "
+                    f"text={text!r}"
+                )
+
+            break
 
         if _is_irrelevant_speech(text):
             reason = _irrelevant_speech_reason(text) or "unknown"
@@ -1960,8 +2268,22 @@ def _run_http_wakeword_loop(
                     audio_lock=audio_lock,
                 )
                 print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
+                # If a pending dialog state exists (e.g. waiting for filter style),
+                # keep listening without requiring a new wake word.
+                while _HTTP_DIALOG_STATE.get("pending_image_filter") is not None:
+                    print("[HTTP][WAKE] pending filter, listening for follow-up without re-wake...")
+                    result = _run_single_http_turn(
+                        args,
+                        work_dir,
+                        asr_root,
+                        tts_root,
+                        forced_text=None,
+                        audio_lock=audio_lock,
+                    )
+                    print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
             except Exception as e:  # noqa: BLE001
                 print(f"[HTTP][WAKE] turn failed: {e}")
+                _HTTP_DIALOG_STATE.pop("pending_image_filter", None)
             finally:
                 trigger_lock.release()
         except Exception as e:  # noqa: BLE001
@@ -1977,6 +2299,7 @@ def _run_http_server(args) -> None:
 
     ensure_openclaw_exec_access(args.openclaw_container)
     sync_nas_classify_script()
+    sync_image_batch_script()
 
     asr_root = Path(args.asr_root)
     tts_root = Path(args.tts_root)
@@ -2140,6 +2463,7 @@ def main():
 
     ensure_openclaw_exec_access(args.openclaw_container)
     sync_nas_classify_script()
+    sync_image_batch_script()
 
     kws_root = Path(args.kws_root)
     asr_root = Path(args.asr_root)
@@ -2199,6 +2523,7 @@ def main():
     session_awake = False
     idle_rounds = 0
     pending_reply_detail = ""
+    pending_image_filter = None
 
     while True:
         wake_wav = work_dir / "wake.wav"
@@ -2379,6 +2704,30 @@ def main():
             tts_speak(tts, reply, reply_wav, play=not args.no_play)
             print("[EXIT] done")
             break
+
+        if pending_image_filter is not None:
+            pending_reply, pending_image_filter = _consume_pending_image_filter(text, pending_image_filter)
+            if pending_reply is not None:
+                print(f"[FILTER] pending reply: {pending_reply}")
+                tts_speak(tts, pending_reply, reply_wav, play=not args.no_play)
+                continue
+
+        filter_req = _extract_image_filter_request(text)
+        if filter_req is not None and (filter_req["target"] is None or filter_req["style"] is None):
+            pending_image_filter = {
+                "target": filter_req["target"],
+                "style": filter_req["style"],
+                "dry": bool(filter_req["dry"]),
+                "attempts": 0,
+            }
+            missing = "target" if filter_req["target"] is None else "style"
+            print(
+                f"[FILTER] pending {missing} target={filter_req['target']} "
+                f"style={filter_req['style']} dry={1 if filter_req['dry'] else 0}"
+            )
+            prompt = _IMAGE_FILTER_TARGET_PROMPT if filter_req["target"] is None else _IMAGE_FILTER_STYLE_PROMPT
+            tts_speak(tts, prompt, reply_wav, play=not args.no_play)
+            continue
 
         if _is_irrelevant_speech(text):
             print(f"[ASR] irrelevant speech skipped: {text!r}")
