@@ -212,6 +212,13 @@ def main() -> int:
             _save_image(out, dst, quality=args.quality)
             processed += 1
             print(f"[OK]\t{src}\t->\t{dst}")
+        except PermissionError as e:
+            failed += 1
+            print(f"[ERR]\t{src}\t{e}")
+            print(
+                "[ERR][HINT] 无写入权限：请检查目标目录归属是否为当前用户"
+                "（sudo find /home/pi/nas_share -user <其他用户> -exec chown pi:pi {} +）"
+            )
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"[ERR]\t{src}\t{e}")

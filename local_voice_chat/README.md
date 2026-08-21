@@ -157,3 +157,28 @@ If you want to disable auto-download:
 ```bash
 ./run_local_voice_chat.sh --wake-any-keyword --record-backend alsa
 ```
+
+## 服务模式（HTTP，生产使用）
+
+以 systemd 服务运行（`voice-bridge.service`），默认 HTTP 模式监听 `:28082`：
+
+- 页面 `http://<NAS-IP>:28082/`：点击按钮 → 宿主麦克风录音 → 处理 → 播报
+- 接口 `POST /trigger`：`{"text":"..."}` 文本指令 / 空 body 触发一次语音
+- 页面底部「对话历史」：所有轮次（唤醒/按钮/文本）实时同步显示
+
+```
+对话历史同步原理：每轮结束写一条 JSONL → voice_turns.jsonl（日志目录）
+→ voice_remote 容器（:28083）读取同一文件 → /api/turns → 页面每 1.5s 增量轮询
+```
+
+## 安全防护
+
+- **危险指令二次确认**：含「删除/清空/移除/格式化」等词的指令先拦截，必须再说「确认」才执行，其余话术一律取消
+- **每轮独立会话**：OpenClaw 使用 `voice-turn:<时间戳>` session-key，无跨轮上下文，杜绝「上一轮待确认被下一轮无关语音误触发」
+- **滤镜权限诊断**：批处理遇 `Permission denied` 时明确提示修复目录归属
+
+## 已知问题 / 注意
+
+- **目录归属错乱**（已修复过）：容器进程曾以 `pulse` 用户创建 NAS 目录，导致 `pi` 无法写入（表现为滤镜「失败 N 张」）。若复现：
+  `sudo find /home/pi/nas_share -user pulse -exec chown pi:pi {} +`
+- **唤醒词识别依赖麦克风电平**：建议保持在 -35dBFS 以上（调整 `pactl set-source-volume`），唤醒循环已移除 +6dB 后处理重试
