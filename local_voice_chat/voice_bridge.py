@@ -203,6 +203,7 @@ _HTTP_MODEL_CACHE = {
 
 _HTTP_DIALOG_STATE = {
     "pending_image_filter": None,
+    "pending_danger_confirm": None,  # {"original_text": str}
 }
 
 _VOICE_TURNS: list = []
@@ -1435,6 +1436,21 @@ def _fast_local_kb_reply(_args, user_text: str):
     return _format_kb_spoken_reply(results)
 
 
+# ── 危险指令拦截 ─────────────────────────────────────────────────────────────
+_DANGER_WORDS_RE = re.compile(
+    r'删除|清空|清除|移走|移除|抹去|格式化|覆盖|全部删|批量删|删光|删掉|删了|删除文件|删除照片'
+)
+_DANGER_SAFE_RE = re.compile(r'不要删|不能删|别删|防止删|禁止删')
+_DANGER_CONFIRM_RE = re.compile(r'确认|执行|是的|对的|没错|好的')
+
+
+def _is_dangerous_command(text: str) -> bool:
+    """含破坏性词汇且无负向安全词时判定为危险指令。"""
+    if _DANGER_SAFE_RE.search(text):
+        return False
+    return bool(_DANGER_WORDS_RE.search(text))
+
+
 LOCAL_FAST_CHANNELS = (
     ("filter", _fast_local_image_filter_reply),
     ("classify", _fast_local_classify_reply),
@@ -1461,9 +1477,28 @@ def ask_openclaw(args, user_text):
     if args.openclaw_dry_run:
         return f"[dry-run] 你说的是：{user_text}"
 
+    # ── 危险指令二次确认门 ──
+    pending_danger = _HTTP_DIALOG_STATE.get("pending_danger_confirm")
+    _danger_confirmed = False
+    if pending_danger is not None:
+        _HTTP_DIALOG_STATE["pending_danger_confirm"] = None
+        if _DANGER_CONFIRM_RE.search(user_text):
+            user_text = pending_danger["original_text"]
+            _danger_confirmed = True  # 已确认，跳过二次拦截
+            print(f"[DANGER] user confirmed, executing: {user_text!r}")
+        else:
+            print(f"[DANGER] user cancelled or unrelated: {user_text!r}")
+            return "操作已取消。"
+
     fast_reply = _run_local_fast_channels(args, user_text)
     if fast_reply is not None:
         return fast_reply
+
+    # 即将调用 agent：对危险指令加一道确认拦截（已确认的跳过）
+    if not _danger_confirmed and _is_dangerous_command(user_text):
+        _HTTP_DIALOG_STATE["pending_danger_confirm"] = {"original_text": user_text}
+        print(f"[DANGER] intercepted for confirmation: {user_text!r}")
+        return f"你说的是\"{ user_text[:24] }\"，这是危险操作，请再说\"确认\"来执行，或说\"取消\"放弃。"
 
     bridge_prompt = (
         "你是quectel pi上的语音助手，负责执行用户口头指令。"
@@ -1507,7 +1542,7 @@ def ask_openclaw(args, user_text):
         "dist/index.js",
         "agent",
         "--session-key",
-        args.openclaw_session_key,
+        f"voice-turn:{int(time.time() * 1000)}",  # 每轮独立会话，防止跨轮上下文误确认
         "--message",
         bridge_prompt,
         "--json",
@@ -2094,7 +2129,9 @@ def _run_single_http_turn(
 
             break
 
-        if _is_irrelevant_speech(text):
+        # 危险指令待确认时，"确认/取消"等短词豁免无关语音过滤
+        _skip_irrelevant = _HTTP_DIALOG_STATE.get("pending_danger_confirm") is not None
+        if not _skip_irrelevant and _is_irrelevant_speech(text):
             reason = _irrelevant_speech_reason(text) or "unknown"
             hit_keywords = [k for k in _TASK_KEYWORDS if k in text][:3]
             print(
