@@ -12,7 +12,7 @@ services:
       PORT: "8082"
       UPSTREAM_BASE_URL: http://host.docker.internal:28082
       TRIGGER_TIMEOUT_SEC: "300"
-      APP_TITLE: 语音助手
+      APP_TITLE: 对话助手
       TRIGGER_TOKEN: ""
       LOG_FILE: /logs/voice_remote.log
     extra_hosts:
@@ -63,7 +63,7 @@ x-casaos:
   port_map: "28083"
   store_app_id: voice-assistant
   tagline:
-    en_US: 语音助手
+    en_US: 对话助手
   thumbnail: ""
   title:
-    en_US: 语音助手
+    en_US: 对话助手

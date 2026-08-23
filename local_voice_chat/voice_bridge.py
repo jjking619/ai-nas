@@ -364,7 +364,7 @@ def _http_ui_html(trigger_port: int) -> str:
 <head>
     <meta charset=\"utf-8\">
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-    <title>语音助手</title>
+    <title>对话助手</title>
     <style>
         :root {{
             --bg-1: #08131c;
@@ -1057,6 +1057,7 @@ def _fast_local_download_reply(user_text: str):
 
 
 def _open_jellyfin_in_firefox(jellyfin_url: str, item_id: str | None = None) -> bool:
+    """在 Firefox 中打开（并前置）Jellyfin 条目页，用于建立可控播放会话。"""
     target_url = _jellyfin_target_url(jellyfin_url, item_id=item_id)
     env = _build_firefox_desktop_env()
 
@@ -1121,7 +1122,6 @@ def _focus_firefox_for_jellyfin(
     *,
     open_if_missing: bool = True,
 ) -> bool:
-    target_url = _jellyfin_target_url(jellyfin_url, item_id=item_id)
     env = _build_firefox_desktop_env()
 
     try:
@@ -1144,9 +1144,12 @@ def _focus_firefox_for_jellyfin(
         windows = [w.strip() for w in res.stdout.splitlines() if w.strip()]
         if not windows:
             # 原生 Wayland 的 Firefox 没有 X11 窗口，xdotool search 找不到；
-            # 改用 firefox --new-tab 通过 D-Bus 复用现有实例并前置窗口。
-            print("[Jellyfin] firefox window not found (xdotool), opening via firefox")
-            return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+            # 仅在允许打开时才复用/开启 Jellyfin，避免重复开标签页。
+            if open_if_missing:
+                print("[Jellyfin] firefox window not found (xdotool), opening via firefox")
+                return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+            print("[Jellyfin] firefox window not found (xdotool), skip opening new tab")
+            return False
 
         subprocess.run(
             ["xdotool", "windowactivate", "--sync", windows[-1]],
@@ -1168,15 +1171,11 @@ def _focus_firefox_for_jellyfin(
             print(f"[Jellyfin] firefox focused: {active_title}")
             return True
 
-        subprocess.Popen(
-            ["firefox", "--new-tab", target_url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-        )
-        print(f"[Jellyfin] firefox focused; opened target tab: {target_url}")
-        return True
+        if open_if_missing:
+            print("[Jellyfin] active window is not Jellyfin, ensuring tab")
+            return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
+        print("[Jellyfin] active window is not Jellyfin, skip opening new tab")
+        return False
     except Exception as e:  # noqa: BLE001
         print(f"[Jellyfin] firefox focus failed: {e}")
         if open_if_missing:
@@ -1642,7 +1641,7 @@ def ask_openclaw(args, user_text):
         return f"你说的是\"{ user_text[:24] }\"，这是危险操作，请再说\"确认\"来执行，或说\"取消\"放弃。"
 
     bridge_prompt = (
-        "你是quectel pi上的语音助手，执行用户口头指令，可调用已有工具（文件/NAS/相册等）。"
+        "你是quectel pi上的对话助手，执行用户口头指令，可调用已有工具（文件/NAS/相册等）。"
         "直接执行给结果，回复简短中文，不超过20字，一句说完，纯文字，禁止markdown（**加粗**、-列表、#标题）。\n"
         "【执行规则】\n"
         "1.下载视频/音频：必须调用 download_media 工具，禁止编造结果。关键词（默认保存位置）："
@@ -1794,13 +1793,17 @@ def _looks_like_incomplete_command(text: str) -> bool:
         return True
     if _COMPLETE_QUESTION_RE.search(s):
         return False
+
+    has_target = any(k in s for k in _INCOMPLETE_TARGET_WORDS)
+    has_action = any(k in s for k in _INCOMPLETE_ACTION_WORDS)
+    # 同时含目标词+动作词 = 完整指令，优先放行（如"帮我把家庭相册下的照片进行分类"），
+    # 避免被下面的"把字句正则"或结尾词误判为没说完而追问用户。
+    if has_target and has_action:
+        return False
     if s.endswith(_INCOMPLETE_ENDINGS):
         return True
     if re.match(r"^(帮我|请|给我)?把.{0,12}$", s):
         return True
-
-    has_target = any(k in s for k in _INCOMPLETE_TARGET_WORDS)
-    has_action = any(k in s for k in _INCOMPLETE_ACTION_WORDS)
     if has_target and not has_action:
         return True
     return False
@@ -2915,7 +2918,7 @@ def main():
             tts_speak(tts, reply, reply_wav, play=not args.no_play)
             continue
 
-        if any(k in text for k in ("退出程序", "关闭语音助手")):
+        if any(k in text for k in ("退出程序", "关闭语音助手", "关闭对话助手")):
             reply = "好的，我现在退出。"
             print(f"[TTS] reply: {reply}")
             tts_speak(tts, reply, reply_wav, play=not args.no_play)

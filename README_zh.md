@@ -25,6 +25,8 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh pair-approve <request_id>
 /home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）
 /home/pi/NAS-Demo/oc.sh jellyfin-show     # 查看 Jellyfin 容器状态
+/home/pi/NAS-Demo/oc.sh nas-files-deploy   # 部署 NAS 文件浏览（只读 nas_share）
+/home/pi/NAS-Demo/oc.sh nas-files-show     # 查看文件浏览容器状态
 ```
 
 `pair-approve` 会自动去掉你从页面复制时常见的末尾中文句号 `。`。
@@ -450,6 +452,38 @@ cd /home/pi/NAS-Demo
 2. `Error: 404 Not Found - compose app 'jellyfin' not found`
    → 首次部署要用 `install` 而不是 `apply`（`apply` 只对已安装的 app 生效）。
 
+## 0.4 NAS 文件浏览（FileBrowser）
+
+目标：在 CasaOS 加一个「NAS 文件」磁贴，点击直接进入 `/home/pi/nas_share` 的文件浏览器，
+方便查看、上传、重命名和删除（照片分类、媒体下载等）。
+
+实现文件（最小改动）：
+
+- [filebrowser-compose.yml](filebrowser-compose.yml) — 官方 `filebrowser/filebrowser:latest`（arm64 可用）
+- `oc.sh` 新增 `nas-files-deploy` / `nas-files-show` 两条命令
+
+部署：
+
+```bash
+cd /home/pi/NAS-Demo
+./oc.sh nas-files-deploy
+```
+
+路径映射：
+
+| 宿主机 | 容器内 | 说明 |
+|---|---|---|
+| `/home/pi/nas_share` | `/srv` | 可读写挂载，文件浏览器根目录 |
+| `/DATA/AppData/filebrowser/config` | `/config` | FileBrowser 配置文件（settings.json） |
+| `/DATA/AppData/filebrowser/database` | `/database` | FileBrowser 数据库（filebrowser.db） |
+
+说明：
+
+- 容器以 `uid:gid=1001:1001`（宿主机 `pi`）运行，与 `nas_share` 文件属主一致，保证可读写，新建文件仍归 `pi` 所有。
+- 部署脚本会在数据库初始化后：停止容器 → `config set --auth.method=noauth` 关闭登录（免密）→ 再启动；
+  免登录后按 `admin` 身份自动登录，具备增删改查权限。
+- 点击磁贴直接打开 `http://<CasaOS主机IP>:28085`；图标为内置 SVG data URI，无需外链图片。
+
 ## 1. 在 CasaOS 中导入 Compose
 
 1. 打开 CasaOS。
@@ -602,7 +636,7 @@ journalctl -u voice-bridge -f
 - 连续多轮空识别后自动休眠，再次需要唤醒词。
 - 语音控制词：
   - 说「休眠 / 停止监听 / 待机」：进入待机，重新等待唤醒词
-  - 说「退出程序 / 关闭语音助手」：退出桥接进程
+  - 说「退出程序 / 关闭对话助手」：退出桥接进程（兼容「关闭语音助手」）
 
 ### 6.4 排障记录：systemd 下语音识别失效/唤醒词失灵（2026-08-20）
 

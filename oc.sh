@@ -42,6 +42,8 @@ Usage:
   ./oc.sh jellyfin-show      Show Jellyfin container status
   ./oc.sh voice-assistant-deploy  Install Voice Assistant (CasaOS web app)
   ./oc.sh voice-assistant-show    Show Voice Assistant container status
+  ./oc.sh nas-files-deploy        Install NAS file browser (read-only nas_share)
+  ./oc.sh nas-files-show          Show NAS file browser container status
 EOF
 }
 
@@ -243,6 +245,37 @@ case "${1:-}" in
     ;;
   voice-assistant-show)
     docker_cmd ps -a --filter name=voice_assistant --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    ;;
+  nas-files-deploy)
+    FB_COMPOSE="${APP_DIR}/filebrowser-compose.yml"
+    if [[ ! -f "${FB_COMPOSE}" ]]; then
+      echo "ERROR: ${FB_COMPOSE} not found"
+      exit 1
+    fi
+    # 预先创建 config/database 目录（容器以 uid 1001 运行，目录需可写）
+    mkdir -p /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database
+    chmod 777 /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database
+    casaos-cli app-management install -f "${FB_COMPOSE}"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "NAS file browser installing (asynchronous)..."
+    # 免登录：等数据库初始化后，停止容器 -> 写入 noauth -> 再启动（读写由 uid 1001 与可写挂载保证）
+    for _ in $(seq 1 40); do
+      if [ -f /DATA/AppData/filebrowser/database/filebrowser.db ]; then
+        docker_cmd stop filebrowser >/dev/null 2>&1 || true
+        docker_cmd run --rm --user 1001:1001 --entrypoint /bin/filebrowser \
+          -v /DATA/AppData/filebrowser/database:/database \
+          filebrowser/filebrowser:latest \
+          -d /database/filebrowser.db config set --auth.method=noauth >/dev/null 2>&1 || true
+        docker_cmd start filebrowser >/dev/null 2>&1 || true
+        echo "Auth disabled (no login)."
+        break
+      fi
+      sleep 2
+    done
+    echo "Open http://${ip:-<your-host-ip>}:28085"
+    ;;
+  nas-files-show)
+    docker_cmd ps -a --filter name=filebrowser --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     ;;
   ""|-h|--help|help)
     usage

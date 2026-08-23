@@ -16,7 +16,7 @@ PORT = int(os.getenv("PORT", "8082"))
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "http://host.docker.internal:28082").rstrip("/")
 TRIGGER_TOKEN = os.getenv("TRIGGER_TOKEN", "").strip()
 TRIGGER_TIMEOUT_SEC = int(os.getenv("TRIGGER_TIMEOUT_SEC", "300"))
-APP_TITLE = os.getenv("APP_TITLE", "语音助手").strip() or "语音助手"
+APP_TITLE = os.getenv("APP_TITLE", "对话助手").strip() or "对话助手"
 UI_VERSION = os.getenv("UI_VERSION", str(int(time.time())))
 LOG_FILE = os.getenv("LOG_FILE", "/logs/voice_remote.log").strip()
 MAX_TASKS = int(os.getenv("MAX_TASKS", "120"))
@@ -245,28 +245,29 @@ def _index_html():
     body {{
       margin: 0;
       min-height: 100vh;
+      min-height: 100dvh;
       font-family: "Noto Sans CJK SC", "Source Han Sans SC", "Segoe UI", sans-serif;
       color: var(--text);
       background:
         radial-gradient(circle at top left, rgba(245,158,11,0.2), transparent 36%),
         radial-gradient(circle at bottom right, rgba(14,165,233,0.2), transparent 32%),
         linear-gradient(135deg, var(--bg-1), var(--bg-2));
-      display: grid;
-      place-items: center;
-      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      padding: 0;
     }}
     .app {{
-      width: min(760px, 100%);
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 24px;
-      padding: 26px;
-      box-shadow: 0 18px 60px rgba(0,0,0,0.35);
-      backdrop-filter: blur(12px);
+      flex: 1;
+      width: 100%;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      padding: clamp(20px, 4vw, 52px);
     }}
-    h1 {{ margin: 0 0 8px; font-size: 30px; }}
-    .lead {{ margin: 0 0 18px; color: var(--muted); line-height: 1.7; }}
-    .grid {{ display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }}
+    h1 {{ margin: 0; font-size: clamp(28px, 4vw, 44px); }}
+    .lead {{ margin: 0; color: var(--muted); line-height: 1.7; font-size: clamp(15px, 1.6vw, 18px); }}
+    .grid {{ display: grid; gap: 20px; grid-template-columns: 1fr 1fr; }}
     .card {{
       background: rgba(0,0,0,0.2);
       border: 1px solid rgba(255,255,255,0.1);
@@ -278,9 +279,9 @@ def _index_html():
     .btn {{
       width: 100%;
       border: 0;
-      border-radius: 14px;
-      padding: 13px 14px;
-      font-size: 17px;
+      border-radius: 16px;
+      padding: 18px 16px;
+      font-size: 19px;
       font-weight: 700;
       color: #fff;
       cursor: pointer;
@@ -300,21 +301,23 @@ def _index_html():
       font-size: 15px;
     }}
     .meta {{ margin-top: 10px; color: var(--muted); font-size: 13px; }}
-    @media (max-width: 760px) {{
+    @media (max-width: 880px) {{
       .grid {{ grid-template-columns: 1fr; }}
-      h1 {{ font-size: 26px; }}
     }}
         .turns-wrap {{
-            margin-top: 16px;
+            flex: 1 1 auto;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
             background: rgba(0,0,0,0.22);
             border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 14px;
-            padding: 12px;
+            border-radius: 16px;
+            padding: 18px;
         }}
         .turns-hdr {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }}
     .turns-hdr h2 {{ margin: 0; font-size: 18px; }}
     .clear-btn {{ background: none; border: 1px solid rgba(255,255,255,0.2); color: var(--muted); border-radius: 8px; padding: 4px 10px; font-size: 13px; cursor: pointer; }}
-    .turns {{ display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }}
+    .turns {{ flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }}
     .turn {{ background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 10px 14px; font-size: 14px; line-height: 1.65; }}
         .turn-live {{
             border-style: dashed;

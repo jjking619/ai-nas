@@ -46,27 +46,6 @@ function setBusy(busy) {
   textInput.disabled = busy;
 }
 
-function renderTask(task) {
-  const statusMap = {
-    queued: '已排队，等待执行...',
-    running: '正在处理中，请稍候...',
-    done: '处理完成。',
-    error: '处理失败。'
-  };
-  const lines = [
-    '任务ID：' + task.id,
-    '模式：' + task.mode,
-    '状态：' + (statusMap[task.status] || task.status)
-  ];
-  if (task.cost_ms != null) lines.push('耗时：' + task.cost_ms + ' ms');
-  const result = task.result || {};
-  if (result.message) lines.push('信息：' + result.message);
-  if (result.text) lines.push('内容：' + result.text);
-  if (result.reply) lines.push('回复：' + result.reply);
-  if (task.error) lines.push('错误：' + task.error);
-  setStatusText(lines.join('\n'));
-}
-
 async function pollTask(taskId) {
   for (;;) {
     const resp = await fetch(apiUrl('/api/task/' + encodeURIComponent(taskId)), { cache: 'no-store' });
@@ -76,12 +55,17 @@ async function pollTask(taskId) {
       setBusy(false);
       return;
     }
-    renderTask(data.task);
-    if (data.task.status === 'done' || data.task.status === 'error') {
+    const task = data.task;
+    if (task.status === 'error') {
+      setStatusText('处理失败：' + (task.error || '未知错误'));
       setBusy(false);
       return;
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    if (task.status === 'done') {
+      setBusy(false);
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
   }
 }
 
@@ -183,11 +167,21 @@ const STATE_LABELS = {
   speaking: '🔊 正在播报...',
 };
 
-function _updateVoiceBtnFromBridge(state, busy) {
-  if (_taskBusy) return;
-  const active = (state !== 'idle') || busy;
+let _lastBridgeState = 'idle';
+
+function _applyBridgeState(state, busy) {
+  // 按钮/文本框是否可用统一由桥状态决定；_taskBusy 仅覆盖提交后的短暂空档
+  const active = _taskBusy || busy || (state !== 'idle');
   voiceBtn.disabled = active;
-  voiceBtn.textContent = STATE_LABELS[state] || '开始语音指令';
+  voiceBtn.textContent = STATE_LABELS[state] || (active ? '正在录音...' : '开始语音指令');
+  textBtn.disabled = active;
+  textInput.disabled = active;
+  if (state !== 'idle') {
+    setStatusText(STATE_LABELS[state] || ('对话助手状态：' + state));
+  } else if (_lastBridgeState !== 'idle') {
+    setStatusText('待机中。请选择语音或文本模式。');
+  }
+  _lastBridgeState = state;
 }
 
 async function pollBridgeStatus() {
@@ -196,7 +190,7 @@ async function pollBridgeStatus() {
     const resp = await fetch(apiUrl('/api/status'), { cache: 'no-store' });
     if (!resp.ok) return;
     const data = await resp.json();
-    _updateVoiceBtnFromBridge(data.state || 'idle', !!data.busy);
+    _applyBridgeState(data.state || 'idle', !!data.busy);
   } catch (_) {}
 }
 
