@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,10 @@ EXCLUDE_DIRS = frozenset(["tools", "Immich上传", ".git", "__pycache__"])
 SKIP_EXTS = frozenset([".immich", ".pyc", ".db", ".js", ".sh", ".service", ".bin", ".so"])
 # Extensions whose text content can be read directly
 TEXT_EXTS = frozenset([".txt", ".md", ".csv", ".log"])
+# PDF 内容提取：用系统 pdftotext（poppler-utils），避免引入额外 Python 依赖
+PDF_EXTRACT_TIMEOUT_SEC = int(os.getenv("PDF_EXTRACT_TIMEOUT_SEC", "30"))
+# 入库内容截断长度（trigram 索引按字符计，够覆盖常见问答片段）
+CONTENT_MAX_CHARS = int(os.getenv("CONTENT_MAX_CHARS", "8000"))
 
 _db_lock = threading.Lock()
 
@@ -36,6 +41,10 @@ _db_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
+
+# 索引内容格式版本：变更提取逻辑（如新增 PDF 提取）时递增，触发全量重建
+_CONTENT_SCHEMA_VERSION = 2
+
 
 def open_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -57,7 +66,21 @@ def open_db() -> sqlite3.Connection:
             mtime REAL
         )
     """)
-    db.commit()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL
+        )
+    """)
+    row = db.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+    if (row[0] if row else 0) != _CONTENT_SCHEMA_VERSION:
+        # 清空 meta 强制全量重扫（文件本身不删，仅重建索引内容）
+        db.execute("DELETE FROM meta")
+        db.execute(
+            "INSERT OR REPLACE INTO schema_version(id, version) VALUES (1, ?)",
+            (_CONTENT_SCHEMA_VERSION,),
+        )
+        db.commit()
     return db
 
 
@@ -74,7 +97,22 @@ def _should_skip(rel: Path) -> bool:
 
 def _read_text(fp: Path) -> str:
     try:
-        return fp.read_text(encoding="utf-8", errors="replace")[:8192]
+        return fp.read_text(encoding="utf-8", errors="replace")[:CONTENT_MAX_CHARS]
+    except Exception:
+        return ""
+
+
+def _extract_pdf_text(fp: Path) -> str:
+    """用系统 pdftotext 提取前 20 页文本（stdout 直出，不落盘）。失败返回空串。"""
+    try:
+        p = subprocess.run(
+            ["pdftotext", "-enc", "UTF-8", "-l", "20", str(fp), "-"],
+            capture_output=True,
+            timeout=PDF_EXTRACT_TIMEOUT_SEC,
+        )
+        if p.returncode != 0:
+            return ""
+        return p.stdout.decode("utf-8", errors="replace")[:CONTENT_MAX_CHARS]
     except Exception:
         return ""
 
@@ -83,6 +121,8 @@ def _extract_content(fp: Path) -> str:
     ext = fp.suffix.lower()
     if ext in TEXT_EXTS:
         return _read_text(fp)
+    if ext == ".pdf":
+        return _extract_pdf_text(fp)
     return ""
 
 
@@ -152,9 +192,59 @@ def _scan_loop(db: sqlite3.Connection):
 
 _FTS_UNSAFE = re.compile(r'["\*\(\)\[\]\{\}:^~]')
 
+# 中文/ASCII 连续片段，用于 content LIKE 兜底（unicode61 不切中文词）
+_CJK_RUN = re.compile(r"[一-鿿]{2,}")
+_ASCII_WORD = re.compile(r"[A-Za-z0-9]{2,}")
+# 常见虚词/疑问词，用于把连续中文切成内容词片段
+_STOP_SPLIT = re.compile(
+    r"我的|你的|他的|她的|里的|的是|是在|在哪|哪里|哪儿|哪个|是什么|什么|怎么|为什么|如何|多少|几|谁|"
+    r"的|了|里|在|是|有|和|与|或|吗|呢|吧|啊|请|帮|帮我|给|到|去|来|这|那|就|都|也|还|又|再|才|把|被|让|对|从|向|于|以|等|中|之|其|该|本|每|各|某"
+)
+
 
 def _sanitize_fts(q: str) -> str:
     return _FTS_UNSAFE.sub(" ", q).strip()
+
+
+def _query_fragments(q: str) -> list:
+    frags = []
+    for run in _CJK_RUN.findall(q):
+        frags += [p for p in _STOP_SPLIT.split(run) if len(p) >= 2]
+    frags += _ASCII_WORD.findall(q)
+    seen = set()
+    out = []
+    for f in frags:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out[:4]
+
+
+def _manual_snippet(content: str, frag: str, width: int = 90) -> str:
+    """截取包含 frag 的句子（按行/句号切），比固定窗口更适合播报。"""
+    if not content:
+        return ""
+    lines = content.split("\n")
+    for i, line in enumerate(lines):
+        if frag not in line:
+            continue
+        combined = line
+        # 行太短（如标题行"第四条 租金及支付方式"）则拼接后续行，保证信息完整
+        while len(combined.strip()) < 16 and i + 1 < len(lines):
+            i += 1
+            combined += " " + lines[i]
+        rel = combined.find(frag)
+        for sep in ("。", "；", ";"):
+            ls = combined.rfind(sep, 0, rel)
+            le = combined.find(sep, rel + len(frag))
+            if le - ls <= width:
+                combined = combined[ls + 1: le if le >= 0 else None]
+                break
+        snip = " ".join(combined.split()).strip()
+        if len(snip) > width:
+            snip = snip[:width] + "..."
+        return snip
+    return ""
 
 
 def search(db: sqlite3.Connection, query: str, limit: int = MAX_RESULTS) -> list[dict]:
@@ -199,6 +289,39 @@ def search(db: sqlite3.Connection, query: str, limit: int = MAX_RESULTS) -> list
                     })
             except Exception:
                 pass
+
+        # 中文兜底：unicode61 不切中文词，FTS 对中文基本无效（且默认 AND 语义），
+        # 用查询中的内容词片段做 name/content LIKE，并手工截取 snippet
+        if not results:
+            frags = _query_fragments(query)
+            if frags:
+                try:
+                    conds = " OR ".join("(name LIKE ? OR content LIKE ?)" for _ in frags)
+                    params = []
+                    for f in frags:
+                        params += [f"%{f}%", f"%{f}%"]
+                    params += [limit]
+                    rows = db.execute(
+                        f"SELECT path, name, ext, category, content "
+                        f"FROM files WHERE {conds} LIMIT ?",
+                        params,
+                    ).fetchall()
+                    for path, name, ext, category, content in rows:
+                        snip = ""
+                        # 靠后的内容词通常是问题焦点（如"租金"），优先用它截 snippet
+                        for f in reversed(frags):
+                            snip = _manual_snippet(content, f)
+                            if snip:
+                                break
+                        results.append({
+                            "path": f"/nas_share/{path}",
+                            "name": name,
+                            "ext": ext,
+                            "category": category,
+                            "snippet": snip,
+                        })
+                except Exception:
+                    pass
 
     return results
 

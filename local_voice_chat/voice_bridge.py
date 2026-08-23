@@ -91,8 +91,8 @@ def parse_args():
         default=6.0,
         help="低电平重试时的增益(dB)，设为0可关闭",
     )
-    parser.add_argument("--record-backend", choices=["auto", "pulse", "alsa"], default="auto")
-    parser.add_argument("--mic-input", default="default")
+    parser.add_argument("--record-backend", choices=["auto", "pulse", "alsa"], default="alsa")
+    parser.add_argument("--mic-input", default="plughw:0,0")
 
     parser.add_argument("--speech-duration", type=float, default=15.0)
     parser.add_argument("--speech-min-duration", type=float, default=1.5)
@@ -245,20 +245,48 @@ def _record_voice_turn(source: str, text: str, reply: str, cost_ms: int) -> None
 
 
 class _TeeStream:
-    def __init__(self, stream, log_fh):
+    """按文件名每次写入时追加打开，日志轮转（rename）后自动写到新文件。"""
+
+    def __init__(self, stream, log_path):
         self._stream = stream
-        self._log_fh = log_fh
+        self._log_path = log_path
+        self._write_count = 0
 
     def write(self, data):
         self._stream.write(data)
-        self._log_fh.write(data)
+        try:
+            with self._log_path.open("a", encoding="utf-8") as fh:
+                fh.write(data)
+        except Exception:
+            pass
+        self._write_count += 1
+        if self._write_count % 200 == 0:
+            _maybe_rotate_log(str(self._log_path))
 
     def flush(self):
         self._stream.flush()
-        self._log_fh.flush()
 
     def isatty(self):
         return self._stream.isatty()
+
+
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+_LOG_BACKUPS = 3
+
+
+def _maybe_rotate_log(log_file: str) -> None:
+    """简单轮转：超过 5MB 时 .log -> .log.1（最多保留 3 份），无需外部 logrotate。"""
+    try:
+        p = Path(log_file)
+        if not p.exists() or p.stat().st_size < _LOG_MAX_BYTES:
+            return
+        for i in range(_LOG_BACKUPS - 1, 0, -1):
+            src = Path(f"{p}.{i}")
+            if src.exists():
+                src.replace(Path(f"{p}.{i + 1}"))
+        p.replace(Path(f"{p}.1"))
+    except Exception:
+        pass
 
 
 def _setup_file_logging(log_file: str) -> None:
@@ -267,9 +295,9 @@ def _setup_file_logging(log_file: str) -> None:
     try:
         path = Path(log_file)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fh = path.open("a", encoding="utf-8", buffering=1)
-        sys.stdout = _TeeStream(sys.stdout, fh)
-        sys.stderr = _TeeStream(sys.stderr, fh)
+        _maybe_rotate_log(log_file)
+        sys.stdout = _TeeStream(sys.stdout, path)
+        sys.stderr = _TeeStream(sys.stderr, path)
         print(f"[LOG] file logging enabled: {path}")
     except Exception as e:  # noqa: BLE001
         print(f"[LOG] file logging setup failed: {e}")
@@ -1078,6 +1106,12 @@ def _build_firefox_desktop_env() -> dict[str, str]:
                 env["XAUTHORITY"] = xauth_path
                 break
 
+    # Wayland 会话下 Firefox 以原生 Wayland 窗口运行，xdotool（仅 X11）看不到它。
+    # 补齐后，`firefox --new-tab` 才能通过 D-Bus 复用已运行实例并前置窗口。
+    if runtime_dir:
+        env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
+
     return env
 
 
@@ -1109,11 +1143,10 @@ def _focus_firefox_for_jellyfin(
         )
         windows = [w.strip() for w in res.stdout.splitlines() if w.strip()]
         if not windows:
-            if open_if_missing:
-                print("[Jellyfin] firefox window not found, opening new tab")
-                return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
-            print("[Jellyfin] firefox window not found, skip opening new tab")
-            return False
+            # 原生 Wayland 的 Firefox 没有 X11 窗口，xdotool search 找不到；
+            # 改用 firefox --new-tab 通过 D-Bus 复用现有实例并前置窗口。
+            print("[Jellyfin] firefox window not found (xdotool), opening via firefox")
+            return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
 
         subprocess.run(
             ["xdotool", "windowactivate", "--sync", windows[-1]],
@@ -1351,7 +1384,7 @@ def _fast_local_download_reply_with_args(_args, user_text: str):
 
 # KB 快速通道关键词：必须包含"查询意图词"之一
 _KB_INTENT_WORDS = re.compile(
-    r"在哪|哪里|哪个|找|查找|搜索|搜|是什么|有没有|有哪些"
+    r"在哪|哪里|哪个|找|查找|搜索|搜|是什么|有没有|有哪些|多少|内容|写着|写了"
 )
 # 同时包含"对象词"之一才命中
 _KB_OBJECT_WORDS = re.compile(
@@ -1407,10 +1440,31 @@ def _kb_path_to_spoken(path: str):
     return file_spoken or "该文件", f"在{folders[-2]}的{folders[-1]}文件夹里"
 
 
+def _kb_snippet_to_spoken(snippet: str, max_chars: int = 60) -> str:
+    """把 KB snippet 清理成适合 TTS 的口语片段。"""
+    s = (snippet or "").replace("→", "").replace("←", "").replace("...", "，")
+    s = re.sub(r"\s+", " ", s).strip(" ，。；、")
+    if not s:
+        return ""
+    if len(s) > max_chars:
+        s = s[:max_chars]
+    s = re.sub(r"[(（][^()（）]*$", "", s)  # 去掉截断后不完整的括号
+    return s.strip(" ，。；、")
+
+
 def _format_kb_spoken_reply(results):
     total = len(results)
-    first_path = results[0].get("path", "") if results else ""
+    first = results[0] if results else {}
+    first_path = first.get("path", "")
     file_spoken, loc_spoken = _kb_path_to_spoken(first_path)
+    content_spoken = _kb_snippet_to_spoken(first.get("snippet", ""))
+
+    if content_spoken:
+        # 命中内容时优先回答内容，再补位置（loc_spoken 形如"在xx文件夹里"）
+        head = f"文档里写着：{content_spoken}。"
+        if loc_spoken:
+            head += f"它{loc_spoken}。"
+        return head
 
     if total <= 1:
         if loc_spoken:
@@ -1453,6 +1507,75 @@ def _fast_local_kb_reply(_args, user_text: str):
     return _format_kb_spoken_reply(results)
 
 
+# ── Immich 语义相册搜索快通道 ─────────────────────────────────────────────────
+_IMMICH_API_URL = os.getenv("IMMICH_API_URL", "http://127.0.0.1:2283").rstrip("/")
+_IMMICH_API_KEY = os.getenv("IMMICH_API_KEY", "HmPpUh8KFg6ZP6JTZ3s3jxGutth7q4VzjSAyosW6w")
+
+_IMMICH_INTENT_RE = re.compile(r"找|搜|查找|搜索|有哪些")
+_IMMICH_OBJECT_RE = re.compile(r"照片|图片|相册")
+# 位置/管理类意图不走语义搜索
+_IMMICH_EXCLUDE_RE = re.compile(
+    r"在哪|哪里|哪个|位置|文件夹|分类|归档|整理|下载|播放|删除|移动|滤镜|处理|备份"
+)
+_IMMICH_STRIP_RE = re.compile(
+    r"帮我|请|找|查找|搜索|搜|所有|全部|有的|有|照片|图片|相册|包含|带|的|里|中"
+)
+
+
+def _immich_item_to_spoken(item: dict, idx: int) -> str:
+    """把 Immich 结果项转成口语描述：中文文件名读名字，否则读所在分类目录。"""
+    stem = os.path.splitext(item.get("originalFileName", "") or "")[0]
+    stem = re.sub(r"\[[^\]]*\]", "", stem)  # 去掉 [id]
+    stem = re.sub(r"^\d{8}_\d{6}_", "", stem)  # 去掉归档时间戳前缀
+    stem = re.sub(r"^\S+?_(?=[一-鿿])", "", stem)  # 去掉归档类别前缀（如 风景_）
+    stem = re.sub(r"[_\-. ]+", "", stem).strip()
+    if len(re.findall(r"[一-鿿]", stem)) >= 2:
+        return stem[:10]
+    path = item.get("originalPath", "") or ""
+    for p in reversed([x for x in path.split("/") if x][:-1]):
+        if re.search(r"[一-鿿]", p):
+            return f"{p}里的第{idx}张"
+    return f"第{idx}张"
+
+
+def _fast_local_immich_reply(_args, user_text: str):
+    """语义找照片：直连 Immich smart search，秒回，不经 agent 长链路。"""
+    if not (_IMMICH_INTENT_RE.search(user_text) and _IMMICH_OBJECT_RE.search(user_text)):
+        return None
+    if _IMMICH_EXCLUDE_RE.search(user_text):
+        return None
+    semantic = _IMMICH_STRIP_RE.sub("", user_text)
+    semantic = semantic.strip("，。！？,.!?；;：: ")
+    if len(semantic) < 2:
+        return None
+
+    import json as _json
+    import urllib.request as _ur
+
+    try:
+        req = _ur.Request(
+            f"{_IMMICH_API_URL}/api/search/smart",
+            data=_json.dumps({"query": semantic, "size": 5}, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "x-api-key": _IMMICH_API_KEY,
+            },
+        )
+        with _ur.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+    except Exception as e:
+        print(f"[Immich] api error: {e}")
+        return None
+
+    items = (data.get("assets") or {}).get("items") or []
+    items = [it for it in items if (it.get("type") or "").upper() == "IMAGE"]
+    if not items:
+        return f"相册里没有找到和{semantic}相关的照片。"
+    names = [_immich_item_to_spoken(it, i + 1) for i, it in enumerate(items[:3])]
+    return f"找到{len(items)}张和{semantic}相关的照片，比如：{'、'.join(names)}。"
+
+
 # ── 危险指令拦截 ─────────────────────────────────────────────────────────────
 _DANGER_WORDS_RE = re.compile(
     r'删除|清空|清除|移走|移除|抹去|格式化|覆盖|全部删|批量删|删光|删掉|删了|删除文件|删除照片'
@@ -1473,6 +1596,7 @@ LOCAL_FAST_CHANNELS = (
     ("classify", _fast_local_classify_reply),
     ("download", _fast_local_download_reply_with_args),
     ("play", _fast_local_play_reply),
+    ("immich", _fast_local_immich_reply),
     ("kb", _fast_local_kb_reply),
 )
 
@@ -1518,36 +1642,21 @@ def ask_openclaw(args, user_text):
         return f"你说的是\"{ user_text[:24] }\"，这是危险操作，请再说\"确认\"来执行，或说\"取消\"放弃。"
 
     bridge_prompt = (
-        "你是quectel pi上的语音助手，负责执行用户口头指令。"
-        "可调用你已有工具（如文件/NAS/相册等）来完成任务。"
-        "请直接执行并给结果，回复用简短中文，不要自我介绍，不超过20字。"
-        "严禁使用markdown格式（如**加粗**、-列表、#标题），只输出纯文字。\n"
-        "当用户要求下载电影/预告片/视频/音频到NAS时，必须调用 download_media 工具执行，禁止编造下载结果。\n"
-        "【download_media 工具用法】\n"
-        "  1. 用户说关键词时（如'下载海洋'、'下载预告片'、'下载兔子'、'下载样本'），使用 keyword 参数\n"
-        "  2. 预定义关键词及含义：\n"
-        "     - '海洋'/'大海' → 海洋纪录片 (23MB，保存到 视频)\n"
-        "     - '预告片'/sintel → Sintel电影预告片 (4MB，保存到 电影)\n"
-        "     - '兔子'/bunny → Big Buck Bunny短片 (0.8MB，保存到 电影)\n"
-        "     - '样本'/'测试' → 通用视频样本 (10MB，保存到 视频)\n"
-        "  3. 用户明确说URL时，使用 url 参数\n"
-        "  4. 用户说搜索某部影视作品，用 query 参数（会用yt-dlp搜索，如'流浪地球'）\n"
-        "  5. 用户没指定目标文件夹时，关键词会自动用默认位置；用户明确指定则覆盖\n"
-        "  6. 下载完成后默认通知文案为'下载已完成'\n"
-        "用户要求播放库中视频时，先尝试在Jellyfin播放；如无法播放，回复'请在Jellyfin打开'并给出可播放列表，禁止直接说无法播放。\n"
-        "操作NAS文件时，必须通过 nas_files 工具（如 list_directory/move_file/create_directory）执行，禁止猜测或编造路径。\n"
-        "NAS根目录(/nas_share)下的可用目录名（语音识别可能有误，请按此白名单对齐）：\n"
-        "  备份、家庭相册、工作文档、手机相册、旅行\n"
-        "照片分类归档规则：当用户要求按内容分类/归档/整理时，禁止仅凭文件名猜测。"
-        "优先用 exec 工具一次性执行脚本自动归档（识别+重命名+移动）：\n"
-        "  timeout 120 python3 /nas_share/tools/nas_classify.py --dir <目录> --recursive --archive\n"
-        "默认直接执行归档；只有用户明确说“预览/先别动”才允许 dry-run。\n"
-        "发现重复前缀文件名时，直接自动清理并重命名，不要询问用户确认。\n"
-        "脚本归档规则：按内容分类到类别目录，并重命名为 YYYYMMDD_HHMMSS_类别_原文件名.ext；"
-        "低置信度会归入“待确认”。只有脚本模式失败时，才回退 nas_files 手动逐个移动。\n"
-        "图片风格化规则：当用户要求复古/日系/胶片滤镜时，优先执行脚本批处理：\n"
-        "  timeout 600 python3 /nas_share/tools/image_batch.py --dir <目录> --style <vintage|japanese|film> --recursive\n"
-        "用户明确说预览时追加 --dry-run；输出目录固定为每张原图所在目录下的“<风格名>/”子目录，禁止覆盖原图。\n"
+        "你是quectel pi上的语音助手，执行用户口头指令，可调用已有工具（文件/NAS/相册等）。"
+        "直接执行给结果，回复简短中文，不超过20字，一句说完，纯文字，禁止markdown（**加粗**、-列表、#标题）。\n"
+        "【执行规则】\n"
+        "1.下载视频/音频：必须调用 download_media 工具，禁止编造结果。关键词（默认保存位置）："
+        "海洋/大海→海洋纪录片(视频)、预告片/sintel→Sintel预告片(电影)、兔子/bunny→Big Buck Bunny(电影)、"
+        "样本/测试→通用样本(视频)；用户给URL用url参数，说搜索影视名用query参数(yt-dlp)。\n"
+        "2.播放库中视频：先尝试Jellyfin播放；无法播放则回复'请在Jellyfin打开'并列出可播放列表，禁止直接说无法播放。\n"
+        "3.操作NAS文件：必须用 nas_files 工具(list_directory/move_file/create_directory)，禁止猜测或编造路径。"
+        "根目录(/nas_share)可用目录：备份、家庭相册、工作文档、手机相册、旅行。\n"
+        "4.照片按内容分类/归档/整理：禁止仅凭文件名猜测，优先 exec 脚本一次性归档："
+        "timeout 120 python3 /nas_share/tools/nas_classify.py --dir <目录> --recursive --archive。"
+        "默认直接执行，只有用户说'预览/先别动'才干跑；重复前缀文件名自动清理重命名无需询问；脚本失败才回退 nas_files。\n"
+        "5.图片复古/日系/胶片滤镜：优先 exec 脚本批处理："
+        "timeout 600 python3 /nas_share/tools/image_batch.py --dir <目录> --style <vintage|japanese|film> --recursive。"
+        "用户说预览加 --dry-run；输出到<风格名>/子目录，禁止覆盖原图。\n"
         f"用户指令：{user_text}"
     )
 
@@ -1560,6 +1669,7 @@ def ask_openclaw(args, user_text):
         "agent",
         "--session-key",
         f"voice-turn:{int(time.time() * 1000)}",  # 每轮独立会话，防止跨轮上下文误确认
+        "--thinking", "minimal",  # 降低推理深度，减少首响应延迟
         "--message",
         bridge_prompt,
         "--json",
@@ -1600,6 +1710,7 @@ _IMPORTANT_REPLY_HINTS = (
     "无法",
     "删除",
     "覆盖",
+    "文档里写着",  # KB 内容问答的答案不可被短指令压缩截断
 )
 
 _SHORT_CMD_HINTS = (
@@ -1667,6 +1778,12 @@ _INCOMPLETE_TARGET_WORDS = (
     "nas_share", "NAS",
 )
 
+# 疑问句本身即完整意图（如"我的住房合同在哪"、"有哪些文档"），
+# 与 KB 快速通道的意图词保持一致，不应判为"没说完"而追问用户
+_COMPLETE_QUESTION_RE = re.compile(
+    r"在哪|哪里|哪儿|哪个|是谁|是什么|什么意思|有没有|有哪些|有多少|多少|怎么办|怎么样|(吗|呢|什么)$"
+)
+
 
 def _looks_like_incomplete_command(text: str) -> bool:
     s = re.sub(r"\s+", "", (text or "").strip())
@@ -1675,6 +1792,8 @@ def _looks_like_incomplete_command(text: str) -> bool:
         return False
     if len(s) <= 2:
         return True
+    if _COMPLETE_QUESTION_RE.search(s):
+        return False
     if s.endswith(_INCOMPLETE_ENDINGS):
         return True
     if re.match(r"^(帮我|请|给我)?把.{0,12}$", s):
@@ -2061,6 +2180,7 @@ def _run_single_http_turn(
                         f"({listen_round}/{_HTTP_INCOMPLETE_MAX_FOLLOWUPS})"
                     )
                 _set_bridge_state("listening")
+                _t_mic = time.monotonic()
                 if audio_lock is not None:
                     audio_lock.acquire()
                 try:
@@ -2082,10 +2202,13 @@ def _run_single_http_turn(
                     f"[HTTP][AUDIO] mic={args.mic_input} backend={args.record_backend} "
                     f"{_wav_meta_for_log(user_wav)}"
                 )
+                print(f"[HTTP][PHASE] record cost={int((time.monotonic() - _t_mic) * 1000)}ms")
 
                 _set_bridge_state("asr")
+                _t_asr = time.monotonic()
                 raw_text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
                 print(f"[HTTP][ASR] raw_text={raw_text!r} len={len(raw_text.strip())}")
+                print(f"[HTTP][PHASE] asr cost={int((time.monotonic() - _t_asr) * 1000)}ms")
                 normalized = normalize_asr_text(raw_text)
                 if normalized != raw_text:
                     print(f"[HTTP] normalized: {normalized}")
@@ -2191,7 +2314,9 @@ def _run_single_http_turn(
         print("[HTTP] processing...")
         _set_bridge_state("processing", text)
 
+        _t_agent = time.monotonic()
         raw_reply = ask_openclaw(args, text)
+        print(f"[HTTP][PHASE] agent cost={int((time.monotonic() - _t_agent) * 1000)}ms")
         reply = _sanitize_reply_for_tts(raw_reply)
         spoken_reply, _tail = _adaptive_tts_reply(
             text,
@@ -2202,7 +2327,9 @@ def _run_single_http_turn(
         )
         print(f"[HTTP] reply: {spoken_reply}")
         _set_bridge_state("speaking")
+        _t_tts = time.monotonic()
         tts_speak(tts, spoken_reply, reply_wav, play=not args.no_play)
+        print(f"[HTTP][PHASE] tts cost={int((time.monotonic() - _t_tts) * 1000)}ms")
 
         if args.jellyfin_api_key:
             jf_hint = _jellyfin_play_after_download(
@@ -2398,7 +2525,7 @@ def _run_http_server(args) -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *values):
-            # print(f"[HTTP] {self.address_string()} - {fmt % values}")
+            pass  # print(f"[HTTP] {self.address_string()} - {fmt % values}")
 
         def do_GET(self):
             parsed = urlparse(self.path)

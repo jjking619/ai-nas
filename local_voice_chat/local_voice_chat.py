@@ -565,7 +565,7 @@ def build_tts(tts_root: Path):
 	)
 	model_cfg = sherpa_onnx.OfflineTtsModelConfig(
 		matcha=matcha,
-		num_threads=max(1, (os.cpu_count() or 2) // 2),
+		num_threads=4,  # 本机实测: 4线程455ms最优；8线程1282ms反而更慢(线程调度/缓存竞争)
 		provider="cpu",
 	)
 

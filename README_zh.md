@@ -771,3 +771,33 @@ https://你的CasaOS主机IP:24190/#token=casaos
 sudo docker exec -it -e TERM=xterm-256color openclaw node dist/index.js config --section model --section gateway
 ```
 
+## 8. 麦克风配置（默认外接 USB 麦克风）
+
+语音桥默认已改为使用 USB 麦克风：`voice_bridge.py` 中 `--record-backend` 默认 `alsa`、`--mic-input` 默认 `plughw:0,0`，手动运行与 systemd 服务均默认生效。
+
+查看设备：
+
+```bash
+cat /proc/asound/cards      # card 0 = USB 麦克风，card 1 = 板载 qcm6490
+```
+
+测试 USB 录音：
+
+```bash
+ffmpeg -y -f alsa -i plughw:0,0 -ac 1 -ar 16000 -t 3 /tmp/mic.wav
+ffmpeg -i /tmp/mic.wav -af volumedetect -f null /dev/null 2>&1 | grep mean_volume
+```
+
+### 切回板载麦克风（无 USB 时）
+
+把 `--mic-input` 改为板载设备（`plughw:1,1` 主麦克风 / `plughw:1,2` VA 通道）：
+
+```bash
+./run_local_voice_chat.sh --record-backend alsa --mic-input plughw:1,1
+# 或改 /etc/systemd/system/voice-bridge.service 的 ExecStart 后：
+sudo systemctl daemon-reload && sudo systemctl restart voice-bridge
+```
+
+> 注意：本机板载 codec 麦克风通路默认未使能，直接录制会报
+> `ALSA read error: Invalid argument`，需先 `amixer -c 1 scontrols` 查看并在 mixer/UCM 中使能 DMIC/TX 通路。
+
