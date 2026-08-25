@@ -36,6 +36,9 @@ services:
       context: ./media_downloader
     container_name: media_downloader
     restart: unless-stopped
+    networks:
+      - default
+      - immich-net
     environment:
       DOWNLOAD_ROOT: /downloads
       PORT: 8081

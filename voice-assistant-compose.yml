@@ -9,14 +9,15 @@ services:
       - /app/app.py
     environment:
       LISTEN_HOST: 0.0.0.0
-      PORT: "8082"
-      UPSTREAM_BASE_URL: http://host.docker.internal:28082
+      PORT: "28083"
+      UPSTREAM_BASE_URL: http://127.0.0.1:28082
       TRIGGER_TIMEOUT_SEC: "300"
       APP_TITLE: 对话助手
       TRIGGER_TOKEN: ""
       LOG_FILE: /logs/voice_remote.log
-    extra_hosts:
-      - host.docker.internal:host-gateway
+    # 宿主机 docker 桥网关路由损坏，容器无法访问 host.docker.internal，
+    # 改用 host 网络直连 127.0.0.1:28082；对外端口保持 28083 不变。
+    network_mode: host
     volumes:
       - type: bind
         source: /home/pi/NAS-Demo/voice_remote/app.py
@@ -29,11 +30,6 @@ services:
       - type: bind
         source: /home/pi/NAS-Demo/logs
         target: /logs
-    ports:
-      - mode: ingress
-        target: 8082
-        published: "28083"
-        protocol: tcp
     x-casaos:
       envs:
         - container: UPSTREAM_BASE_URL

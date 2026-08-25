@@ -107,8 +107,15 @@ case "${1:-}" in
           nas-media-downloader:local >/dev/null
       fi
     fi
+    # 让 openclaw 能按容器名直接访问下载服务（host.docker.internal 在本机不可达）
+    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
+          --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' media_downloader'; then
+        docker_cmd network connect big-bear-immich_big_bear_immich_network media_downloader
+      fi
+    fi
 
-    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://host.docker.internal:28081/download","DOWNLOAD_ROOT_LABEL":"/home/pi/nas_share/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成"}}'
+    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://media_downloader:8081/download","DOWNLOAD_ROOT_LABEL":"/home/pi/nas_share/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成"}}'
     docker_cmd exec openclaw node dist/index.js mcp reload
     docker_cmd restart openclaw
     echo "Media download tool configured."
@@ -161,15 +168,23 @@ case "${1:-}" in
       fi
     fi
 
+    # 让 openclaw 能按容器名直接访问 KB 服务（host.docker.internal 在本机不可达）
+    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
+          --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' knowledge_base'; then
+        docker_cmd network connect big-bear-immich_big_bear_immich_network knowledge_base
+      fi
+    fi
+
     IMMICH_URL_VAL="$(docker_cmd exec openclaw printenv IMMICH_URL 2>/dev/null || echo 'http://immich-server:2283')"
     IMMICH_KEY_VAL="$(docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || echo '')"
 
     docker_cmd exec openclaw node dist/index.js mcp set kb_search \
-      "{\"enabled\":true,\"command\":\"node\",\"args\":[\"/nas_share/tools/kb_mcp.js\"],\"env\":{\"KB_API_URL\":\"http://host.docker.internal:28084\",\"IMMICH_BASE_URL\":\"${IMMICH_URL_VAL}\",\"IMMICH_API_KEY\":\"${IMMICH_KEY_VAL}\"}}"
+      "{\"enabled\":true,\"command\":\"node\",\"args\":[\"/nas_share/tools/kb_mcp.js\"],\"env\":{\"KB_API_URL\":\"http://knowledge_base:8084\",\"IMMICH_BASE_URL\":\"${IMMICH_URL_VAL}\",\"IMMICH_API_KEY\":\"${IMMICH_KEY_VAL}\"}}"
     docker_cmd exec openclaw node dist/index.js mcp reload
     docker_cmd restart openclaw
     echo "Knowledge base configured."
-    echo "  KB API:   http://host.docker.internal:28084"
+    echo "  KB API:   http://knowledge_base:8084"
     echo "  Indexed:  /nas_share (excludes tools/ Immich上传/)"
     echo "  Photos:   Immich CLIP (${IMMICH_URL_VAL})"
     ;;

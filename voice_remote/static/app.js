@@ -119,6 +119,8 @@ const srcLabels = { wake: '🎤 唤醒', button: '🖱 按钮', text: '⌨ 文�
 
 function renderNewTurns(turns) {
   if (!turns || !turns.length) return;
+  // 「实时状态」固定在顶部；新历史按「最新在前」插到它下面
+  const live = (_liveTurnEl && _liveTurnEl.isConnected) ? _liveTurnEl : null;
   turns.forEach(t => {
     const div = document.createElement('div');
     div.className = 'turn';
@@ -129,10 +131,14 @@ function renderNewTurns(turns) {
       (t.text ? `<div class="turn-txt">🗣 ${t.text}</div>` : '') +
       (t.reply ? `<div class="turn-rep">💬 ${t.reply}</div>` : '') +
       `<div class="turn-meta">耗时 ${t.cost_ms} ms</div>`;
-    turnsEl.appendChild(div);
+    if (live) {
+      turnsEl.insertBefore(div, live.nextSibling);
+    } else {
+      turnsEl.prepend(div);
+    }
     if (t.ts > lastTurnTs) lastTurnTs = t.ts;
   });
-  turnsEl.scrollTop = turnsEl.scrollHeight;
+  turnsEl.scrollTop = 0;
 }
 
 async function fetchTurns() {
@@ -185,7 +191,6 @@ function _applyBridgeState(state, busy) {
 }
 
 async function pollBridgeStatus() {
-  if (document.hidden) return;
   try {
     const resp = await fetch(apiUrl('/api/status'), { cache: 'no-store' });
     if (!resp.ok) return;
@@ -194,7 +199,9 @@ async function pollBridgeStatus() {
   } catch (_) {}
 }
 
-setInterval(pollBridgeStatus, 1500);
+// 唤醒对话由 voice_bridge 后台直接处理，网页只能靠轮询桥状态来同步按钮，
+// 因此用更短间隔并去掉 document.hidden 拦截，保证唤醒时按钮也能及时反映状态。
+setInterval(pollBridgeStatus, 800);
 pollBridgeStatus();
 
 document.addEventListener('visibilitychange', () => {

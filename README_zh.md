@@ -21,6 +21,8 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh tools-nas-show
 /home/pi/NAS-Demo/oc.sh tools-media-setup
 /home/pi/NAS-Demo/oc.sh tools-media-show
+/home/pi/NAS-Demo/oc.sh tools-kb-setup     # 配置知识库搜索（kb_search MCP）
+/home/pi/NAS-Demo/oc.sh tools-kb-show       # 查看知识库搜索 MCP 配置
 /home/pi/NAS-Demo/oc.sh pair-list
 /home/pi/NAS-Demo/oc.sh pair-approve <request_id>
 /home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）
@@ -286,6 +288,77 @@ timeout 120 python3 /nas_share/tools/nas_classify.py --dir /nas_share/家庭相�
 - 原超时指令“帮我手机相册下的照片分类”现在秒级返回：`手机相册分类完成：风景3张，美食1张，植物1张。`
 - “预览”类指令走 `--dry-run`，不实际移动文件。
 - “今天天气怎么样”“把照片移到家庭相册”等不命中关键词，仍交给 agent，不受影响。
+
+### 0.1.6 知识库搜索（kb_search MCP）
+
+目标：通过语音/文本对 NAS 上的文档、照片做检索（文档走 SQLite FTS5，照片走 Immich CLIP）。
+
+架构（最小改动）：
+- 后端：`knowledge_base` 容器（[knowledge_base/api_server.py](knowledge_base/api_server.py)），容器内监听 `8084`，宿主机映射 `28084`。
+- 前端：`kb_mcp.js`（同步到 `/home/pi/nas_share/tools/kb_mcp.js`）作为 OpenClaw 的 stdio MCP 桥，暴露 `kb_search` 工具。
+- 数据：DB 文件 `/home/pi/nas_share/knowledge_base_data/kb.db`（容器挂载 `/data`）。
+
+启用：
+
+```bash
+cd /home/pi/NAS-Demo
+./oc.sh tools-kb-setup
+```
+
+#### 0.1.6.1 知识库“连不上”的根因与修复（2026-08-25 实测）
+
+现象：语音问“合同在哪”等知识库问题，agent 报搜索失败或超时。
+
+根因：宿主机 iptables 防火墙（filter 表）**INPUT 链默认策略为 DROP**，只放行端口白名单
+（tcp 22 / 3389 / 5900 / 18789 / 80 / 24192 / 24190）。容器访问宿主进程端口时目标为宿主自身 IP，
+数据包进入 INPUT 链被静默丢弃；`host.docker.internal:28084`（即 `172.17.0.1:28084`）不在白名单，故超时。
+openclaw 的 `kb_search` MCP 原本用该地址连 KB，自然失败。
+
+排查证据（iptables 实测，非“路由损坏”）：
+- 容器 → 宿主 `172.17.0.1:22` / `:24190` **通**（在白名单）；→ `:28082 / :8096 / :28081` 全部超时（不在白名单）。
+- 局域网访问映射端口正常：走 `PREROUTING DNAT → FORWARD`（Docker ACCEPT），**不经 INPUT**；
+  只有“容器 → 宿主进程端口”进 INPUT，被默认 DROP 拦下。
+- nat 表 MASQUERADE/DNAT 完整正常，FORWARD 默认 DROP 是 Docker 标准行为，均非故障。
+
+修复（与 `download_media` / `immich` 同套路：共享网络 + 容器名）：
+1. `knowledge_base` 以容器方式运行，并接入 `big-bear-immich` 共享网络（`oc.sh tools-kb-setup` 已固化该步骤）。
+2. [kb_mcp.js](knowledge_base/kb_mcp.js) 与 MCP 环境的 `KB_API_URL` 改为 `http://knowledge_base:8084`（默认值与注释同步更新）。
+3. 停用并禁用旧的宿主机 `knowledge-base.service`（原先独占 28084；数据目录不变，无感切换）。
+
+验证：
+
+```bash
+sudo docker exec openclaw node -e "fetch('http://knowledge_base:8084/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:'测试'})}).then(r=>r.json()).then(d=>console.log('results:',d.results.length)).catch(e=>console.error(e))"
+```
+
+> **通用教训（2026-08-25，iptables 实测修正）**：本机宿主机 **iptables INPUT 链默认 DROP + 端口白名单**，
+> 任何容器访问宿主进程端口（28080 系列、8096 等未放行端口）都会被静默丢弃，表现与“网络不通”完全一样。
+> 排查时务必先做端口矩阵（对比 22/24190 是否通）并查看 iptables，避免误判为路由损坏。
+> 容器需要访问宿主或其他容器服务时，优先用「共享网络 + 容器名」或 `network_mode: host`；
+> 确需容器直连宿主进程端口时，需在 INPUT 链放行对应端口/网段。
+
+### 0.1.7 图片风格滤镜幂等化（2026-08-25）
+
+目标：同一风格重复转换时跳过已生成的产物，避免对同一批照片重复处理、重复生成。
+
+实现文件：[local_voice_chat/image_batch.py](local_voice_chat/image_batch.py)（唯一维护源；
+`voice_bridge.py` 启动时会自动同步到 `/home/pi/nas_share/tools/image_batch.py`）。
+
+改动要点：
+- 输出仍为「原目录/`复古风格` 或 `日系风格` 或 `胶片风格`/」子目录，不覆盖原图。
+- 处理前先判断目标风格文件是否已存在且不早于原图（按 `mtime` 比较）：
+  - 已存在且未过期 → 跳过（计数 `skipped`，打印 `[SKIP]`）；
+  - 原图新增或更新 → 才重新生成（打印 `[OK]`）。
+  这样重复执行是幂等的，只有真正变化的原图才会被重新处理。
+- `voice_bridge.py` 的播报同步支持「跳过 N 张」：重跑时不再返回误导性的「成功 0 张」，
+  而是「已是最新，跳过 N 张，无需重复处理」或「成功 X 张，跳过 N 张」。
+
+使用：
+
+```bash
+python3 local_voice_chat/image_batch.py --dir /home/pi/nas_share/家庭相册 --style vintage --recursive
+python3 local_voice_chat/image_batch.py --dir /home/pi/nas_share/家庭相册 --style 复古 --recursive --dry-run
+```
 
 ## 0.2 CasaOS 跳转层（点击图标直接打开 OpenClaw）
 
@@ -674,6 +747,61 @@ sudo ss -lntp | grep -E "24190|18790|18789"
 
 ```bash
 curl -k -I --max-time 5 https://127.0.0.1:24190/healthz
+```
+
+### 6.5 网页端对话助手（CasaOS App，端口 28083）
+
+目标：在 CasaOS 加一个「对话助手」磁贴，网页端通过按钮/文本触发语音桥（`voice_bridge`），并实时显示唤醒对话状态。
+
+实现文件（最小改动）：
+- [voice-assistant-compose.yml](voice-assistant-compose.yml) — CasaOS 应用定义
+- `voice_remote/` — 网页前端（`static/app.js`）+ 后端代理（`app.py`）
+
+部署：
+
+```bash
+cd /home/pi/NAS-Demo
+./oc.sh voice-assistant-deploy
+# 打开 http://<CasaOS主机IP>:28083
+```
+
+#### 6.5.1 唤醒对话时网页端不显示实时状态（2026-08-25 实测）
+
+现象：按钮对话正常，但语音唤醒对话时网页端「实时状态」不更新、按钮状态不同步。
+
+根因：唤醒对话由 `voice_bridge` 后台直接处理（不走 `voice_remote` 任务队列），网页只能靠轮询 `/api/status` 同步（`app.js` 已实现 800ms 轮询）。但 `voice_assistant` 容器（bridge 网络）访问 `host.docker.internal:28082` 超时——根因是宿主机 iptables INPUT 链默认 DROP，`28082` 不在端口白名单（见 0.1.6.1 排查证据），[app.py](voice_remote/app.py) 代理失败后兜底返回 `state: idle`，网页永远收不到真实状态（按钮触发同样受影响）。
+
+修复（[voice-assistant-compose.yml](voice-assistant-compose.yml)）：
+- `network_mode: host`：容器直连宿主机网络，`UPSTREAM_BASE_URL` 改 `http://127.0.0.1:28082`。
+- 容器监听端口改为 `28083`（对外访问不变），移除失效的 `ports` / `extra_hosts` 映射。
+
+> 注：经 iptables 实测确认根因是防火墙白名单而非路由（见 0.1.6.1）。`network_mode: host` 方案
+> 已能完整规避 INPUT 白名单限制，**继续沿用，不改动宿主机防火墙**。
+
+重建（CasaOS 异步）并验证：
+
+```bash
+casaos-cli app-management apply voice-assistant -f /home/pi/NAS-Demo/voice-assistant-compose.yml
+curl -s http://127.0.0.1:28083/api/healthz   # 返回 proxy_ok: true 即桥接正常
+```
+
+### 6.6 日志压缩（--verbose 开关，2026-08-25）
+
+现象：`logs/voice_bridge.log` 体积高速增长，绝大部分是唤醒循环**每一轮约 4 秒打印一次**的音量读数
+（`[HTTP][WAKE] clip level: -xx dBFS`），属于正常运行不需要的心跳日志。
+
+修复：`voice_bridge.py` 新增 `--verbose` 开关（默认关闭），唤醒循环里的高频音量日志
+（`clip level` / `low-level clip retry` / `boosted wake clip level`）仅在启用时打印；
+唤醒命中、turn 结果、错误、状态变化等事件日志不受影响。
+
+说明：
+- 日志文件：`/home/pi/NAS-Demo/logs/voice_bridge.log`（由 `--log-file` 指定），自动轮转
+  （单文件超 5MB 转 `.log.1`~`.log.3`，最多 4 份，约 20MB 上限）。
+- 默认关闭后日志只在有事件时增长；需排查录音/音量问题时给服务加 `--verbose` 即可恢复全量日志。
+- 服务端启用方式：在 `voice-bridge.service` 的 `ExecStart` 末尾追加 `--verbose`，再执行：
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart voice-bridge
 ```
 
 ## 6. 清理旧的错误容器（如果之前装过商店版）

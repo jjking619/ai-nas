@@ -2,7 +2,7 @@
 /**
  * NAS Knowledge Base MCP bridge
  *
- * - 文档/文件查询  → KB API  (http://host.docker.internal:28084/search)
+ * - 文档/文件查询  → KB API  (http://knowledge_base:8084/search)
  * - 照片语义查询  → Immich smart search (http://immich-server:2283)
  *
  * 协议：换行分隔 JSON（openclaw SDK 1.29.0 stdio 格式）
@@ -11,7 +11,7 @@
 
 "use strict";
 
-const KB_API_URL      = process.env.KB_API_URL      || "http://host.docker.internal:28084";
+const KB_API_URL      = process.env.KB_API_URL      || "http://knowledge_base:8084";
 const IMMICH_BASE_URL = process.env.IMMICH_BASE_URL  || "http://immich-server:2283";
 const IMMICH_API_KEY  = process.env.IMMICH_API_KEY   || "";
 const TIMEOUT_MS      = 15_000;

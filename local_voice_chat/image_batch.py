@@ -74,11 +74,6 @@ def _iter_images(root: Path, recursive: bool):
         yield p
 
 
-def _unique_target_path(dst: Path) -> Path:
-    # 覆盖模式：始终直接使用同名目标路径，每次运行覆盖上一次的产物，
-    return dst
-
-
 def _apply_vintage(img: Image.Image, seed: int) -> Image.Image:
     arr = np.asarray(img).astype(np.float32)
     arr = arr * np.array([1.06, 0.97, 0.86], dtype=np.float32)
@@ -189,11 +184,16 @@ def main() -> int:
     for src in _iter_images(root, args.recursive):
         total += 1
         dst = src.parent / style_dir / src.name
-        dst = _unique_target_path(dst)
         planned += 1
 
         if args.dry_run:
             print(f"[PLAN]\t{src}\t->\t{dst}")
+            continue
+
+        # 跳过已生成且未过期的产物，避免同一风格重复处理
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+            skipped += 1
+            print(f"[SKIP]\t{src}\t->\t{dst}")
             continue
 
         try:
@@ -214,9 +214,6 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"[ERR]\t{src}\t{e}")
-
-    if total == 0:
-        skipped = 1
 
     print(
         "[SUMMARY]"

@@ -118,7 +118,7 @@ def parse_args():
     parser.add_argument("--openclaw-timeout", type=int, default=300)
     parser.add_argument("--openclaw-dry-run", action="store_true")
 
-    parser.add_argument("--jellyfin-url", default="http://10.55.84.133:8096",
+    parser.add_argument("--jellyfin-url", default="http://127.0.0.1:8096",
                         help="Jellyfin 服务地址")
     parser.add_argument("--jellyfin-api-key", default="",
                         help="Jellyfin API Key（管理后台→控制台→API 密钥→新增密钥）")
@@ -192,6 +192,11 @@ def parse_args():
         default="/home/pi/NAS-Demo/logs/voice_bridge.log",
         help="Local log file path",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="打印高频调试日志（唤醒循环音量等），默认关闭以压缩日志",
+    )
 
     return parser.parse_args()
 
@@ -204,6 +209,7 @@ _HTTP_MODEL_CACHE = {
 _HTTP_DIALOG_STATE = {
     "pending_image_filter": None,
     "pending_danger_confirm": None,  # {"original_text": str}
+    "pending_question": 0,  # 助手追问澄清后，唤醒通道需免唤醒继续收听答案的次数
 }
 
 _VOICE_TURNS: list = []
@@ -849,6 +855,7 @@ def _run_image_batch_reply(target: str, style: str, dry: bool):
     planned = _to_int(summary.get("planned"))
     processed = _to_int(summary.get("processed"))
     failed = _to_int(summary.get("failed"))
+    skipped = _to_int(summary.get("skipped"))
 
     if p.returncode != 0 and processed <= 0:
         tail = "；".join([x.strip() for x in output.splitlines()[-3:] if x.strip()])
@@ -864,9 +871,14 @@ def _run_image_batch_reply(target: str, style: str, dry: bool):
 
     if total == 0:
         return f"{target}目录下未发现可处理图片。"
+    if processed == 0 and skipped > 0:
+        return f"{target}{style_dir}已是最新，跳过{skipped}张，无需重复处理。"
+    reply = f"{target}{style_dir}处理完成：成功{processed}张"
+    if skipped > 0:
+        reply += f"，跳过{skipped}张"
     if failed > 0:
-        return f"{target}{style_dir}处理完成：成功{processed}张，失败{failed}张。"
-    return f"{target}{style_dir}处理完成：成功{processed}张，输出到各原目录/{style_dir}/。"
+        reply += f"，失败{failed}张"
+    return reply + f"，输出到各原目录/{style_dir}/。"
 
 
 def _consume_pending_image_filter(text: str, pending: dict | None):
@@ -981,7 +993,7 @@ _DOWNLOAD_MEDIA_LIBRARY = {
 }
 
 
-def _fast_local_download_reply(user_text: str):
+def _fast_local_download_reply(args, user_text: str):
     """命中下载指令时，直连 media_downloader API，避免走 agent 长链路。"""
     short_dl = bool(re.search(r"(^|帮我|给我|请)下(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny)", user_text))
     if ("下载" not in user_text) and (not short_dl):
@@ -1041,7 +1053,7 @@ def _fast_local_download_reply(user_text: str):
             data = _json.loads(raw) if raw else {}
             if not (200 <= resp.status < 300) or not data.get("ok"):
                 print(f"[DL] local download not ok status={resp.status} body={raw[:240]}")
-                return None
+                return _download_failed_play_test_video(args)
 
         files = data.get("files") if isinstance(data.get("files"), list) else []
         safe_subdir = str(data.get("safe_subdir") or target_subdir)
@@ -1052,8 +1064,8 @@ def _fast_local_download_reply(user_text: str):
         print(f"[DL] local download success key={matched_key or '(query)'}")
         return f"下载已完成，已保存到{safe_subdir}。"
     except Exception as e:  # noqa: BLE001
-        print(f"[DL] local download failed, fallback to agent: {e}")
-        return None
+        print(f"[DL] local download failed, default to test video: {e}")
+        return _download_failed_play_test_video(args)
 
 
 def _open_jellyfin_in_firefox(jellyfin_url: str, item_id: str | None = None) -> bool:
@@ -1377,8 +1389,24 @@ def _fast_local_play_reply(args, user_text: str):
         return f"播放失败，请在 Jellyfin 手动播放：{item_name}"
 
 
-def _fast_local_download_reply_with_args(_args, user_text: str):
-    return _fast_local_download_reply(user_text)
+def _download_failed_play_test_video(args):
+    """下载失败时的默认兜底：直接播放 Jellyfin 库中已有的测试视频。
+
+    返回兜底回复文本；优先走播放通道，播放不可用时回退为文字提示。
+    """
+    if getattr(args, "jellyfin_api_key", None):
+        try:
+            play_reply = _fast_local_play_reply(args, "播放测试视频")
+            if play_reply:
+                print(f"[DL] download failed, default to playing test video: {play_reply}")
+                return play_reply
+        except Exception as e:  # noqa: BLE001
+            print(f"[DL] play test video on download fail error: {e}")
+    return "下载暂时不可用，测试视频已存在，可在 Jellyfin 打开观看。"
+
+
+def _fast_local_download_reply_with_args(args, user_text: str):
+    return _fast_local_download_reply(args, user_text)
 
 
 # KB 快速通道关键词：必须包含"查询意图词"之一
@@ -1755,6 +1783,8 @@ def _expand_short_media_phrase(text: str) -> str:
 
 _HTTP_INCOMPLETE_PROMPT = "我这边听到你还没说完，请继续说。"
 _HTTP_INCOMPLETE_MAX_FOLLOWUPS = 2
+# 助手的澄清问句（如"想下载哪个视频？"）后，唤醒通道免唤醒继续收听的次数上限
+_HTTP_QUESTION_MAX_FOLLOWUPS = 2
 _INCOMPLETE_ENDINGS = (
     "的", "了", "下", "把", "给", "对", "并", "然后", "进行", "处理", "操作", "一下",
 )
@@ -1807,6 +1837,26 @@ def _looks_like_incomplete_command(text: str) -> bool:
     if has_target and not has_action:
         return True
     return False
+
+
+# 助手回复若是澄清问句（需要用户补充信息），唤醒通道应免唤醒继续收听答案。
+# 限定：以疑问结尾 + 含疑问词，避免把"好的，正在处理"这类陈述误判为问句。
+_QUESTION_ENDINGS = ("？", "?", "吗", "呢")
+_QUESTION_WORDS = (
+    "哪个", "什么", "怎么", "哪里", "哪儿", "哪些", "哪部", "哪种",
+    "还是", "是否", "能不能", "要不要", "需要吗", "多少", "几位", "哪位",
+    "需要", "帮你", "帮我",
+)
+
+
+def _reply_is_clarifying_question(reply: str) -> bool:
+    s = (reply or "").strip()
+    if not s or len(s) > 24:
+        return False
+    if not s.endswith(_QUESTION_ENDINGS):
+        return False
+    return any(w in s for w in _QUESTION_WORDS)
+
 
 # ── 无关语音过滤 ─────────────────────────────────────────────────────────────
 # Level 1: 纯语气词 / 噪音
@@ -1891,6 +1941,7 @@ def _irrelevant_speech_reason(text: str) -> str | None:
 
 
 def _sanitize_reply_for_tts(reply: str) -> str:
+    reply = re.sub(r"/nas_share/?", "", reply)  # 共享目录路径前缀不播报
     reply = re.sub(r"\*+", "", reply)
     reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
     reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；""''（）…—\s]", "", reply)
@@ -2349,6 +2400,12 @@ def _run_single_http_turn(
             reply=spoken_reply,
             cost_ms=int((time.monotonic() - _turn_start) * 1000),
         )
+        # 唤醒通道：助手若反问了澄清（如"想下载哪个视频？"），
+        # 记录待回答次数，供唤醒循环免唤醒继续收听用户答案。
+        if turn_source == "wake":
+            _HTTP_DIALOG_STATE["pending_question"] = (
+                _HTTP_QUESTION_MAX_FOLLOWUPS if _reply_is_clarifying_question(spoken_reply) else 0
+            )
         return {
             "ok": True,
             "message": "文本指令处理完成。" if forced_text else "语音指令处理完成。",
@@ -2424,7 +2481,8 @@ def _run_http_wakeword_loop(
             finally:
                 audio_lock.release()
             level = wav_level_dbfs(wake_wav)
-            print(f"[HTTP][WAKE] clip level: {level:.1f} dBFS")
+            if args.verbose:
+                print(f"[HTTP][WAKE] clip level: {level:.1f} dBFS")
 
             if args.wake_any_keyword:
                 hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
@@ -2452,6 +2510,7 @@ def _run_http_wakeword_loop(
 
             if not trigger_lock.acquire(blocking=False):
                 print("[HTTP][WAKE] ignored because another request is running")
+                _set_bridge_state("idle")  # 未抢到锁时复位，避免按钮卡在“已唤醒”
                 continue
 
             try:
@@ -2467,10 +2526,18 @@ def _run_http_wakeword_loop(
                     turn_source="wake",
                 )
                 print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
-                # If a pending dialog state exists (e.g. waiting for filter style),
-                # keep listening without requiring a new wake word.
-                while _HTTP_DIALOG_STATE.get("pending_image_filter") is not None:
-                    print("[HTTP][WAKE] pending filter, listening for follow-up without re-wake...")
+                # If a pending dialog state exists (e.g. waiting for filter style,
+                # or the assistant just asked a clarifying question), keep listening
+                # without requiring a new wake word.
+                while (
+                    _HTTP_DIALOG_STATE.get("pending_image_filter") is not None
+                    or _HTTP_DIALOG_STATE.get("pending_question", 0) > 0
+                ):
+                    if _HTTP_DIALOG_STATE.get("pending_question", 0) > 0:
+                        _HTTP_DIALOG_STATE["pending_question"] -= 1
+                        print("[HTTP][WAKE] pending question, listening for answer without re-wake...")
+                    else:
+                        print("[HTTP][WAKE] pending filter, listening for follow-up without re-wake...")
                     result = _run_single_http_turn(
                         args,
                         work_dir,
@@ -2484,10 +2551,13 @@ def _run_http_wakeword_loop(
             except Exception as e:  # noqa: BLE001
                 print(f"[HTTP][WAKE] turn failed: {e}")
                 _HTTP_DIALOG_STATE.pop("pending_image_filter", None)
+                _HTTP_DIALOG_STATE["pending_question"] = 0
+                _set_bridge_state("idle")  # 异常时复位，避免按钮卡在“已唤醒”
             finally:
                 trigger_lock.release()
         except Exception as e:  # noqa: BLE001
             print(f"[HTTP][WAKE] loop error: {e}")
+            _set_bridge_state("idle")  # 兜底复位，覆盖 acquire/录检测阶段抛异常的路径
             time.sleep(0.5)
 
 
@@ -2763,7 +2833,8 @@ def main():
                 backend=args.record_backend,
             )
             level = wav_level_dbfs(wake_wav)
-            print(f"[MIC] wake clip level: {level:.1f} dBFS")
+            if args.verbose:
+                print(f"[MIC] wake clip level: {level:.1f} dBFS")
             if level < -45:
                 print("[MIC] warning: volume is low, move closer or raise gain")
 
@@ -2788,9 +2859,10 @@ def main():
             # 低音量下首次未命中：做一次增益重试，降低漏唤醒
             if (not hit) and (level < args.wake_low_level_dbfs) and (args.wake_boost_db > 0):
                 boosted_wav = work_dir / "wake_boost.wav"
-                print(
-                    f"[KWS] low-level clip ({level:.1f} dBFS), retry with +{args.wake_boost_db:.1f} dB"
-                )
+                if args.verbose:
+                    print(
+                        f"[KWS] low-level clip ({level:.1f} dBFS), retry with +{args.wake_boost_db:.1f} dB"
+                    )
                 p = subprocess.run(
                     [
                         "ffmpeg",
@@ -2813,7 +2885,8 @@ def main():
                 )
                 if p.returncode == 0 and boosted_wav.exists():
                     boosted_level = wav_level_dbfs(boosted_wav)
-                    print(f"[MIC] boosted wake clip level: {boosted_level:.1f} dBFS")
+                    if args.verbose:
+                        print(f"[MIC] boosted wake clip level: {boosted_level:.1f} dBFS")
                     if args.wake_any_keyword:
                         hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
                             kws_root,
