@@ -23,6 +23,7 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh tools-media-show
 /home/pi/NAS-Demo/oc.sh tools-kb-setup     # 配置知识库搜索（kb_search MCP）
 /home/pi/NAS-Demo/oc.sh tools-kb-show       # 查看知识库搜索 MCP 配置
+/home/pi/NAS-Demo/oc.sh tools-sync          # 统一同步源码→运行副本（改完代码后执行）
 /home/pi/NAS-Demo/oc.sh pair-list
 /home/pi/NAS-Demo/oc.sh pair-approve <request_id>
 /home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）
@@ -35,6 +36,12 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 
 `tools-nas-setup` 会注册一个 MCP 文件工具服务器（`nas_files`），
 并把文件操作范围限制到容器内的 `/nas_share`（对应宿主机 `/home/pi/nas_share`）。
+
+> **代码维护约定（唯一源码原则）**：
+> 所有运行脚本的唯一源码在 `NAS-Demo/`（git 仓库），`/home/pi/nas_share/tools/`
+> 只是容器可见的运行副本，**不进 git、不要手动改**。
+> 修改代码后执行 `./oc.sh tools-sync` 统一同步（并自动清理遗留副本），
+> 其中 `download_media_mcp.js` / `kb_mcp.js` 有变更时还会重启 openclaw 使 MCP 配置生效。
 
 ## 0.1 文件工作流自动化（最小改动）
 
@@ -931,6 +938,26 @@ https://你的CasaOS主机IP:24190/#token=casaos
 
 ```bash
 sudo docker exec -it -e TERM=xterm-256color openclaw node dist/index.js config --section model --section gateway
+```
+
+8. 现象：仓库文件被异常清成 0 字节（含 `voice_remote/static/app.js` 等源码、`.git/objects` 里的 git 对象），
+   表现：网页报「页面脚本异常：脚本未完成加载」，`git` 命令报 `bad object HEAD` / `对象文件 ... 为空`。
+
+含义：机器经历了一次**异常掉电**（不是正常 `reboot` 关机流程）。根分区是 btrfs，掉电瞬间文件
+inode 元数据已落盘、但 data extent 还没 flush，重启后表现为「文件还在、大小/时间正常、内容全是 0」。
+
+排查：journald 的启动记录（`journalctl --list-boots`）在故障点出现日志断层，之后大量时间戳跳回
+`1970-01-01`（RTC 时钟丢失），是最直接的掉电证据。
+
+处理：
+1. 数据文件用 git 恢复（`git checkout HEAD -- <文件>`）；git 对象则从干净 clone 复制 pack 后删除损坏的 0 字节松散对象。
+2. 确认供电稳定（插座/线缆/电压），避免再次异常掉电。
+3. 可选，做一次 btrfs 只读一致性自检：
+
+```bash
+sudo btrfs device stats /          # 看 write_io_errs / corruption_errs 是否非零
+sudo btrfs scrub start /           # 启动一次数据一致性扫描
+sudo btrfs scrub status /
 ```
 
 ## 8. 麦克风配置（默认外接 USB 麦克风）

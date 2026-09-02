@@ -33,6 +33,7 @@ Usage:
   ./oc.sh tools-immich-show
   ./oc.sh tools-kb-setup
   ./oc.sh tools-kb-show
+  ./oc.sh tools-sync         Sync NAS-Demo sources -> nas_share/tools (runtime copy)
   ./oc.sh pair-list
   ./oc.sh pair-approve <request_id>
   ./oc.sh immich-apply       Apply immich-compose.yml to CasaOS
@@ -109,9 +110,9 @@ case "${1:-}" in
     fi
     # 让 openclaw 能按容器名直接访问下载服务（host.docker.internal 在本机不可达）
     if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
-      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
+      if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' media_downloader'; then
-        docker_cmd network connect big-bear-immich_big_bear_immich_network media_downloader
+        docker_cmd network connect big-bear-immich_big_bear-immich_network media_downloader
       fi
     fi
 
@@ -169,10 +170,10 @@ case "${1:-}" in
     fi
 
     # 让 openclaw 能按容器名直接访问 KB 服务（host.docker.internal 在本机不可达）
-    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
-      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
+    if docker_cmd network inspect big-bear-immich_big_bear-immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' knowledge_base'; then
-        docker_cmd network connect big-bear-immich_big_bear_immich_network knowledge_base
+        docker_cmd network connect big-bear-immich_big_bear-immich_network knowledge_base
       fi
     fi
 
@@ -190,6 +191,53 @@ case "${1:-}" in
     ;;
   tools-kb-show)
     docker_cmd exec openclaw node dist/index.js mcp show kb_search --json
+    ;;
+  tools-sync)
+    # 统一同步：NAS-Demo（git 唯一源码）→ nas_share/tools（容器运行副本）
+    # 并清理遗留副本；MCP 脚本有变更时重启 openclaw 使配置生效。
+    mkdir -p /home/pi/nas_share/tools
+
+    synced=0
+    changed=0
+    for entry in \
+      "local_voice_chat/download_media_mcp.js" \
+      "local_voice_chat/image_batch.py" \
+      "local_voice_chat/nas_classify.py" \
+      "knowledge_base/kb_mcp.js"; do
+      src="$APP_DIR/$entry"
+      dst="/home/pi/nas_share/tools/$(basename "$entry")"
+      if [[ ! -f "$src" ]]; then
+        echo "SKIP  $entry (源不存在)"
+        continue
+      fi
+      if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+        echo "SAME  $entry"
+        continue
+      fi
+      cp "$src" "$dst"
+      echo "SYNC  $entry -> $dst"
+      synced=$((synced + 1))
+      case "$entry" in
+        *download_media_mcp.js|*kb_mcp.js) changed=1 ;;
+      esac
+    done
+
+    # 清理遗留副本（实际运行在 NAS-Demo，nas_share/tools 内无人使用）
+    for legacy in hotwords.txt voice_bridge.py; do
+      if [[ -f "/home/pi/nas_share/tools/$legacy" ]]; then
+        rm -f "/home/pi/nas_share/tools/$legacy"
+        echo "RM    $legacy (遗留副本，已清理)"
+      fi
+    done
+
+    if [[ "$changed" -eq 1 ]]; then
+      docker_cmd exec openclaw node dist/index.js mcp reload || true
+      docker_cmd restart openclaw
+      echo "MCP 脚本有变更，已重启 openclaw"
+    else
+      echo "MCP 脚本无变更，无需重启 openclaw"
+    fi
+    echo "tools-sync done: $synced file(s) synced"
     ;;
   pair-list)
     docker_cmd exec -it openclaw node dist/index.js devices list
