@@ -1,0 +1,31 @@
+from .local_voice_chat import (
+    asr_transcribe,
+    build_asr_recognizer,
+    build_tts,
+    check_cmd_exists,
+    collect_keyword_bins,
+    detect_wakeup,
+    detect_wakeup_any,
+    ensure_sensevoice_model,
+    record_audio_auto_backend,
+    record_speech_until_silence,
+    tts_speak,
+    wakeword_hint_from_bin,
+    wav_level_dbfs,
+)
+
+__all__ = [
+    "asr_transcribe",
+    "build_asr_recognizer",
+    "build_tts",
+    "check_cmd_exists",
+    "collect_keyword_bins",
+    "detect_wakeup",
+    "detect_wakeup_any",
+    "ensure_sensevoice_model",
+    "record_audio_auto_backend",
+    "record_speech_until_silence",
+    "tts_speak",
+    "wakeword_hint_from_bin",
+    "wav_level_dbfs",
+]

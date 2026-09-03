@@ -20,15 +20,15 @@ services:
     network_mode: host
     volumes:
       - type: bind
-        source: /home/pi/NAS-Demo/voice_remote/app.py
+        source: ${APP_DIR:-/home/pi/NAS-Demo}/voice_remote/app.py
         target: /app/app.py
         read_only: true
       - type: bind
-        source: /home/pi/NAS-Demo/voice_remote/static
+        source: ${APP_DIR:-/home/pi/NAS-Demo}/voice_remote/static
         target: /app/static
         read_only: true
       - type: bind
-        source: /home/pi/NAS-Demo/logs
+        source: ${APP_DIR:-/home/pi/NAS-Demo}/logs
         target: /logs
     x-casaos:
       envs:

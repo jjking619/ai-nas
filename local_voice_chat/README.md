@@ -35,7 +35,7 @@ Speech capture is now dynamic:
 ## Quick start
 
 ```bash
-cd /home/pi/NAS-Demo/local_voice_chat
+cd ~/NAS-Demo/local_voice_chat
 chmod +x run_local_voice_chat.sh
 ./run_local_voice_chat.sh
 ```
@@ -43,7 +43,7 @@ chmod +x run_local_voice_chat.sh
 ## OpenClaw bridge mode
 
 ```bash
-cd /home/pi/NAS-Demo/local_voice_chat
+cd ~/NAS-Demo/local_voice_chat
 python3 voice_bridge.py
 ```
 
@@ -52,17 +52,18 @@ Default wake word in bridge mode is 小远同学 (`keyword_xiaoyuantongxue.bin`)
 Install as systemd service:
 
 ```bash
-chmod +x /home/pi/NAS-Demo/local_voice_chat/install_voice_bridge_service.sh
-/home/pi/NAS-Demo/local_voice_chat/install_voice_bridge_service.sh
+chmod +x install_voice_bridge_service.sh
+./install_voice_bridge_service.sh
 ```
 
 If OpenClaw call fails with docker permission/sudo password error:
 
 ```bash
-sudo usermod -aG docker pi
+sudo usermod -aG docker "$(id -un)"
 # newgrp may fail with "setgid failed" in current session; use passwordless sudoers instead (works immediately):
-echo 'pi ALL=(ALL) NOPASSWD: /usr/bin/docker' | sudo tee /etc/sudoers.d/pi-docker
-sudo chmod 440 /etc/sudoers.d/pi-docker
+USER_NAME="$(id -un)"
+echo "${USER_NAME} ALL=(ALL) NOPASSWD: /usr/bin/docker" | sudo tee "/etc/sudoers.d/${USER_NAME}-docker"
+sudo chmod 440 "/etc/sudoers.d/${USER_NAME}-docker"
 sudo -n docker ps
 
 sudo systemctl restart voice-bridge
@@ -88,13 +89,13 @@ Use existing sample files to verify the full chain once:
 ./run_local_voice_chat.sh \
 	--once \
 	--no-play \
-	--wake-audio-file /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/audio/xiaochuang.wav \
-	--speech-audio-file /home/pi/voice/asr_cpu_1.19/test/resources/audios/1.wav
+	--wake-audio-file ${HOME}/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/audio/xiaochuang.wav \
+	--speech-audio-file ${HOME}/voice/asr_cpu_1.19/test/resources/audios/1.wav
 ```
 
 ## First run note
 
-If `/home/pi/voice/asr_cpu_1.19/model/model.int8.onnx` (or `model.onnx`) is missing,
+If `${HOME}/voice/asr_cpu_1.19/model/model.int8.onnx` (or `model.onnx`) is missing,
 this script will auto-download SenseVoice int8 model from sherpa-onnx release.
 
 If you want to disable auto-download:
@@ -113,7 +114,7 @@ If you want to disable auto-download:
 ./run_local_voice_chat.sh --once --wake-audio-file /path/to/wake.wav --speech-audio-file /path/to/speech.wav
 
 # Switch wake word model
-./run_local_voice_chat.sh --wake-keyword-bin /home/pi/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_yunlingyunling.bin
+./run_local_voice_chat.sh --wake-keyword-bin ${HOME}/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_yunlingyunling.bin
 
 # Try any built-in wake word model
 ./run_local_voice_chat.sh --wake-any-keyword
@@ -179,6 +180,6 @@ If you want to disable auto-download:
 
 ## 已知问题 / 注意
 
-- **目录归属错乱**（已修复过）：容器进程曾以 `pulse` 用户创建 NAS 目录，导致 `pi` 无法写入（表现为滤镜「失败 N 张」）。若复现：
-  `sudo find /home/pi/nas_share -user pulse -exec chown pi:pi {} +`
+- **目录归属错乱**（已修复过）：容器进程曾以 `pulse` 用户创建 NAS 目录，导致当前登录用户无法写入（表现为滤镜「失败 N 张」）。若复现：
+	`sudo find "${HOME}/nas_share" -user pulse -exec chown "$(id -un)":"$(id -gn)" {} +`
 - **唤醒词识别依赖麦克风电平**：建议保持在 -35dBFS 以上（调整 `pactl set-source-volume`），唤醒循环已移除 +6dB 后处理重试

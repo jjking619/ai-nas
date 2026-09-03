@@ -30,6 +30,48 @@ from local_voice_chat import (
 )
 
 
+def load_runtime_env(env_file: str | Path | None = None) -> dict[str, str]:
+    """Load repo-level .env values without overriding already-exported process env.
+
+    This keeps the project portable across shell, systemd, and tests while still
+    treating explicit process environment variables as authoritative.
+    """
+    candidates = []
+    if env_file is not None:
+        candidates.append(Path(env_file))
+    repo_root = Path(__file__).resolve().parent.parent
+    candidates.extend([
+        repo_root / ".env",
+        Path.cwd() / ".env",
+        Path.home() / ".env",
+    ])
+
+    path = next((p for p in candidates if p and p.exists()), None)
+    if path is None:
+        return {}
+
+    values: dict[str, str] = {}
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if not key:
+                continue
+            final_value = os.environ.get(key, value)
+            values[key] = final_value
+            os.environ[key] = final_value
+    except OSError:
+        return {}
+    return values
+
+
+load_runtime_env()
+
+
 def _resolve_sdk_root(folder_name: str) -> Path:
     env_base = os.getenv("VOICE_SDK_BASE")
     candidates = []
@@ -564,6 +606,16 @@ def ensure_openclaw_exec_access(container_name: str) -> None:
         )
 
 
+def sync_runtime_scripts() -> None:
+    """Single maintenance entry for runtime copies used by containers.
+
+    Keep the logic here centralized so both the HTTP mode and the interactive mode
+    follow the same sync behavior instead of each reproducing the same steps.
+    """
+    sync_nas_classify_script()
+    sync_image_batch_script()
+
+
 def sync_nas_classify_script() -> Path:
     """同步 NAS-Demo 下的唯一源文件到容器内运行位置。
 
@@ -1032,7 +1084,7 @@ def _fast_local_download_reply(args, user_text: str):
     import json as _json
     import urllib.request as _ur
 
-    api_url = (os.getenv("DOWNLOAD_API_URL", "http://127.0.0.1:28081/download") or "").strip()
+    api_url = (os.getenv("DOWNLOAD_API_URL") or "http://127.0.0.1:28081/download").strip()
     payload = {
         "url": matched.get("url", "") if matched else "",
         "query": "" if matched else term,
@@ -1417,7 +1469,7 @@ _KB_INTENT_WORDS = re.compile(
 _KB_OBJECT_WORDS = re.compile(
     r"文件|文档|合同|报告|表格|表|记录|照片|图片|相册|视频|电影|音乐|资料|方案|说明|计划|协议"
 )
-_KB_API_URL = os.getenv("KB_API_URL", "http://127.0.0.1:28084")
+_KB_API_URL = os.getenv("KB_API_URL") or "http://127.0.0.1:28084"
 
 _KB_EXT_SPOKEN_MAP = {
     ".pdf": "PDF文件",
@@ -1536,7 +1588,7 @@ def _fast_local_kb_reply(_args, user_text: str):
 
 # ── Immich 语义相册搜索快通道 ─────────────────────────────────────────────────
 _IMMICH_API_URL = os.getenv("IMMICH_API_URL", "http://127.0.0.1:2283").rstrip("/")
-_IMMICH_API_KEY = os.getenv("IMMICH_API_KEY", "HmPpUh8KFg6ZP6JTZ3s3jxGutth7q4VzjSAyosW6w")
+_IMMICH_API_KEY = os.getenv("IMMICH_API_KEY") or ""
 
 _IMMICH_INTENT_RE = re.compile(r"找|搜|查找|搜索|有哪些")
 _IMMICH_OBJECT_RE = re.compile(r"照片|图片|相册")
@@ -2568,8 +2620,7 @@ def _run_http_server(args) -> None:
     check_cmd_exists("docker")
 
     ensure_openclaw_exec_access(args.openclaw_container)
-    sync_nas_classify_script()
-    sync_image_batch_script()
+    sync_runtime_scripts()
 
     asr_root = Path(args.asr_root)
     tts_root = Path(args.tts_root)
@@ -2752,8 +2803,7 @@ def main():
     check_cmd_exists("docker")
 
     ensure_openclaw_exec_access(args.openclaw_container)
-    sync_nas_classify_script()
-    sync_image_batch_script()
+    sync_runtime_scripts()
 
     kws_root = Path(args.kws_root)
     asr_root = Path(args.asr_root)

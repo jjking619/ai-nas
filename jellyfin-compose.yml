@@ -18,7 +18,7 @@ services:
         bind:
           create_host_path: true
       - type: bind
-        source: /home/pi/nas_share/downloads
+        source: ${NAS_ROOT:-/home/pi/nas_share}/downloads
         target: /media
         read_only: true
         bind:

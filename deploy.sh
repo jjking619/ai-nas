@@ -11,6 +11,10 @@ BOOTSTRAP_CONFIG="$APP_DIR/openclaw.bootstrap.json"
 DATA_DIR="/DATA/AppData/openclaw"
 TARGET_CONFIG="$DATA_DIR/openclaw.json"
 
+# NAS 共享目录（用户名无关：默认当前用户主目录/nas_share）
+NAS_ROOT="${NAS_ROOT:-$HOME/nas_share}"
+export NAS_ROOT
+
 if [[ "${EUID}" -eq 0 ]]; then
   DOCKER_CMD=(docker)
 else
@@ -94,7 +98,7 @@ else
     -p 24190:18789 \
     -p 18790:18790 \
     -v /DATA/AppData/openclaw:/home/node/.openclaw \
-    -v /home/pi/nas_share:/nas_share \
+    -v "$NAS_ROOT":/nas_share \
     openclaw/openclaw:latest \
     /bin/bash -lc 'node dist/index.js gateway --bind lan --allow-unconfigured --port 18789'
 fi

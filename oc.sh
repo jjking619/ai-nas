@@ -7,6 +7,16 @@ if [[ ! -f "$APP_DIR/deploy.sh" && -f "/home/pi/NAS-Demo/deploy.sh" ]]; then
   APP_DIR="/home/pi/NAS-Demo"
 fi
 
+if [[ -f "$APP_DIR/.env" ]]; then
+  set -a
+  source "$APP_DIR/.env"
+  set +a
+fi
+
+# NAS 共享目录：可从 .env / 环境变量覆盖，默认当前用户主目录（用户名无关）
+NAS_ROOT="${NAS_ROOT:-$HOME/nas_share}"
+export NAS_ROOT
+
 docker_cmd() {
   if [[ "${EUID}" -eq 0 ]]; then
     docker "$@"
@@ -57,8 +67,7 @@ case "${1:-}" in
     "$APP_DIR/deploy.sh"
     ;;
   reset)
-    "$APP_DIR/reset-config.sh"
-    docker_cmd restart openclaw
+    bash "$APP_DIR/install.sh" reset
     ;;
   status)
     docker_cmd ps -a | grep -i openclaw || true
@@ -87,9 +96,9 @@ case "${1:-}" in
     docker_cmd exec openclaw node dist/index.js mcp show nas_files --json
     ;;
   tools-media-setup)
-    mkdir -p /home/pi/nas_share/downloads/家庭影院
-    mkdir -p /home/pi/nas_share/tools
-    cp "$APP_DIR/local_voice_chat/download_media_mcp.js" /home/pi/nas_share/tools/download_media_mcp.js
+    mkdir -p $NAS_ROOT/downloads/家庭影院
+    mkdir -p $NAS_ROOT/tools
+    cp "$APP_DIR/local_voice_chat/download_media_mcp.js" $NAS_ROOT/tools/download_media_mcp.js
 
     if ! docker_cmd ps --format '{{.Names}}' | grep -qx media_downloader; then
       if docker_cmd ps -a --format '{{.Names}}' | grep -qx media_downloader; then
@@ -103,24 +112,24 @@ case "${1:-}" in
           -e PORT=8081 \
           -e YTDLP_TIMEOUT_SEC=1800 \
           -e DOWNLOAD_TTS_TEXT="下载已完成" \
-          -v /home/pi/nas_share/downloads:/downloads \
+          -v $NAS_ROOT/downloads:/downloads \
           -p 28081:8081 \
           nas-media-downloader:local >/dev/null
       fi
     fi
     # 让 openclaw 能按容器名直接访问下载服务（host.docker.internal 在本机不可达）
-    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
+    if docker_cmd network inspect big-bear-immich_big_bear-immich_network >/dev/null 2>&1; then
       if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' media_downloader'; then
         docker_cmd network connect big-bear-immich_big_bear-immich_network media_downloader
       fi
     fi
 
-    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://media_downloader:8081/download","DOWNLOAD_ROOT_LABEL":"/home/pi/nas_share/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成"}}'
+    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://media_downloader:8081/download","DOWNLOAD_ROOT_LABEL":"'"$NAS_ROOT"'/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成"}}'
     docker_cmd exec openclaw node dist/index.js mcp reload
     docker_cmd restart openclaw
     echo "Media download tool configured."
-    echo "Download root: /home/pi/nas_share/downloads"
+    echo "Download root: $NAS_ROOT/downloads"
     ;;
   tools-media-show)
     docker_cmd exec openclaw node dist/index.js mcp show download_media --json
@@ -147,9 +156,9 @@ case "${1:-}" in
     docker_cmd exec openclaw node dist/index.js mcp show immich --json
     ;;
   tools-kb-setup)
-    mkdir -p /home/pi/nas_share/tools
-    mkdir -p /home/pi/nas_share/knowledge_base_data
-    cp "$APP_DIR/knowledge_base/kb_mcp.js" /home/pi/nas_share/tools/kb_mcp.js
+    mkdir -p $NAS_ROOT/tools
+    mkdir -p $NAS_ROOT/knowledge_base_data
+    cp "$APP_DIR/knowledge_base/kb_mcp.js" $NAS_ROOT/tools/kb_mcp.js
 
     if ! docker_cmd ps --format '{{.Names}}' | grep -qx knowledge_base; then
       if docker_cmd ps -a --format '{{.Names}}' | grep -qx knowledge_base; then
@@ -162,8 +171,8 @@ case "${1:-}" in
           -e NAS_ROOT=/nas_share \
           -e PORT=8084 \
           -e SCAN_INTERVAL=60 \
-          -v /home/pi/nas_share:/nas_share:ro \
-          -v /home/pi/nas_share/knowledge_base_data:/data \
+          -v $NAS_ROOT:/nas_share:ro \
+          -v $NAS_ROOT/knowledge_base_data:/data \
           -p 28084:8084 \
           nas-knowledge-base:local >/dev/null
       fi
@@ -195,7 +204,7 @@ case "${1:-}" in
   tools-sync)
     # 统一同步：NAS-Demo（git 唯一源码）→ nas_share/tools（容器运行副本）
     # 并清理遗留副本；MCP 脚本有变更时重启 openclaw 使配置生效。
-    mkdir -p /home/pi/nas_share/tools
+    mkdir -p $NAS_ROOT/tools
 
     synced=0
     changed=0
@@ -205,7 +214,7 @@ case "${1:-}" in
       "local_voice_chat/nas_classify.py" \
       "knowledge_base/kb_mcp.js"; do
       src="$APP_DIR/$entry"
-      dst="/home/pi/nas_share/tools/$(basename "$entry")"
+      dst="$NAS_ROOT/tools/$(basename "$entry")"
       if [[ ! -f "$src" ]]; then
         echo "SKIP  $entry (源不存在)"
         continue
@@ -224,8 +233,8 @@ case "${1:-}" in
 
     # 清理遗留副本（实际运行在 NAS-Demo，nas_share/tools 内无人使用）
     for legacy in hotwords.txt voice_bridge.py; do
-      if [[ -f "/home/pi/nas_share/tools/$legacy" ]]; then
-        rm -f "/home/pi/nas_share/tools/$legacy"
+      if [[ -f "$NAS_ROOT/tools/$legacy" ]]; then
+        rm -f "$NAS_ROOT/tools/$legacy"
         echo "RM    $legacy (遗留副本，已清理)"
       fi
     done
