@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
 APP_DIR="$SCRIPT_DIR"
-if [[ ! -f "$APP_DIR/deploy.sh" && -f "/home/pi/NAS-Demo/deploy.sh" ]]; then
-  APP_DIR="/home/pi/NAS-Demo"
+if [[ ! -f "$APP_DIR/deploy.sh" && -f "$HOME/NAS-Demo/deploy.sh" ]]; then
+  APP_DIR="$HOME/NAS-Demo"
 fi
 
 if [[ -f "$APP_DIR/.env" ]]; then
@@ -34,6 +34,7 @@ Usage:
   ./oc.sh logs [N]
   ./oc.sh health
   ./oc.sh url
+  ./oc.sh casaos-url
   ./oc.sh model
   ./oc.sh tools-nas-setup
   ./oc.sh tools-nas-show
@@ -46,6 +47,7 @@ Usage:
   ./oc.sh tools-sync         Sync NAS-Demo sources -> nas_share/tools (runtime copy)
   ./oc.sh pair-list
   ./oc.sh pair-approve <request_id>
+  ./oc.sh openclaw-app-deploy  Install OpenClaw launcher (CasaOS web app)
   ./oc.sh immich-apply       Apply immich-compose.yml to CasaOS
   ./oc.sh immich-show        Show current CasaOS Immich config
   ./oc.sh immich-sync-jobs   Trigger Immich ML jobs (faceDetection + smartSearch)
@@ -62,6 +64,86 @@ clean_request_id() {
   printf '%s' "$1" | tr -d '[:space:]' | sed 's/[。．，,；;：:]$//'
 }
 
+has_casaos_cli() {
+  command -v casaos-cli >/dev/null 2>&1
+}
+
+casaos_app_exists() {
+  local appid="$1"
+  casaos-cli app-management show local "$appid" --yaml >/dev/null 2>&1
+}
+
+first_existing_casaos_appid() {
+  local id
+  for id in "$@"; do
+    if casaos_app_exists "$id"; then
+      echo "$id"
+      return 0
+    fi
+  done
+  return 1
+}
+
+remove_containers_if_exist() {
+  local name
+  for name in "$@"; do
+    docker_cmd rm -f "$name" >/dev/null 2>&1 || true
+  done
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+render_template_file() {
+  local src="$1"
+  local dst app_dir_escaped nas_root_escaped nas_puid nas_pgid
+  dst="$(mktemp "/tmp/$(basename "$src").XXXXXX")"
+  app_dir_escaped="$(escape_sed_replacement "$APP_DIR")"
+  nas_root_escaped="$(escape_sed_replacement "$NAS_ROOT")"
+  nas_puid="${NAS_PUID:-$(id -u)}"
+  nas_pgid="${NAS_PGID:-$(id -g)}"
+
+  sed \
+    -e "s#__APP_DIR__#${app_dir_escaped}#g" \
+    -e "s#__NAS_ROOT__#${nas_root_escaped}#g" \
+    -e "s#__NAS_PUID__#${nas_puid}#g" \
+    -e "s#__NAS_PGID__#${nas_pgid}#g" \
+    "$src" > "$dst"
+
+  printf '%s\n' "$dst"
+}
+
+host_primary_ip() {
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  echo "$ip"
+}
+
+detect_casaos_scheme() {
+  if curl -k -I --max-time 3 https://127.0.0.1:443 >/dev/null 2>&1; then
+    echo "https"
+  elif curl -I --max-time 3 http://127.0.0.1:80 >/dev/null 2>&1; then
+    echo "http"
+  else
+    echo ""
+  fi
+}
+
+openclaw_base_url() {
+  local ip host scheme
+  ip="$(host_primary_ip)"
+  host="${ip:-<your-host-ip>}"
+  scheme="http"
+  if curl -k -I --max-time 3 https://127.0.0.1:24190/healthz >/dev/null 2>&1; then
+    scheme="https"
+  fi
+  echo "${scheme}://${host}:24190"
+}
+
 case "${1:-}" in
   deploy)
     "$APP_DIR/deploy.sh"
@@ -76,11 +158,25 @@ case "${1:-}" in
     docker_cmd logs --tail "${2:-120}" openclaw
     ;;
   health)
-    curl -k -I --max-time 5 https://127.0.0.1:24190/healthz
+    if curl -k -I --max-time 5 https://127.0.0.1:24190/healthz >/dev/null 2>&1; then
+      curl -k -I --max-time 5 https://127.0.0.1:24190/healthz
+    else
+      curl -I --max-time 5 http://127.0.0.1:24190/healthz
+    fi
     ;;
   url)
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo "https://${ip:-<your-host-ip>}:24190/#token=casaos"
+    echo "$(openclaw_base_url)/#token=${OPENCLAW_GATEWAY_TOKEN:-casaos}"
+    ;;
+  casaos-url)
+    ip="$(host_primary_ip)"
+    casaos_scheme="$(detect_casaos_scheme)"
+    if [[ -n "$casaos_scheme" ]]; then
+      echo "${casaos_scheme}://${ip:-<your-host-ip>}"
+    else
+      echo "WARN: 未检测到 CasaOS Web 服务（127.0.0.1:80/443）。" >&2
+      echo "WARN: 可先执行安装/修复命令: curl -fsSL https://get.casaos.io | sudo bash" >&2
+      echo "http://${ip:-<your-host-ip>}"
+    fi
     ;;
   model)
     docker_cmd exec -it -e TERM=xterm-256color openclaw node dist/index.js config --section model
@@ -96,9 +192,9 @@ case "${1:-}" in
     docker_cmd exec openclaw node dist/index.js mcp show nas_files --json
     ;;
   tools-media-setup)
-    mkdir -p $NAS_ROOT/downloads/家庭影院
-    mkdir -p $NAS_ROOT/tools
-    cp "$APP_DIR/local_voice_chat/download_media_mcp.js" $NAS_ROOT/tools/download_media_mcp.js
+    mkdir -p "$NAS_ROOT/downloads/Movies" "$NAS_ROOT/downloads/TV Shows"
+    mkdir -p "$NAS_ROOT/tools"
+    cp "$APP_DIR/local_voice_chat/download_media_mcp.js" "$NAS_ROOT/tools/download_media_mcp.js"
 
     if ! docker_cmd ps --format '{{.Names}}' | grep -qx media_downloader; then
       if docker_cmd ps -a --format '{{.Names}}' | grep -qx media_downloader; then
@@ -260,16 +356,85 @@ case "${1:-}" in
     req="$(clean_request_id "$2")"
     docker_cmd exec -it openclaw node dist/index.js devices approve "$req"
     ;;
+  openclaw-app-deploy)
+    OPENCLAW_APP_COMPOSE="${APP_DIR}/openclaw-compose.yml"
+    if [[ ! -f "${OPENCLAW_APP_COMPOSE}" && -f "${APP_DIR}/openclaw-app-compose.yml" ]]; then
+      OPENCLAW_APP_COMPOSE="${APP_DIR}/openclaw-app-compose.yml"
+    fi
+    if [[ ! -f "${OPENCLAW_APP_COMPOSE}" ]]; then
+      echo "ERROR: ${OPENCLAW_APP_COMPOSE} not found"
+      exit 1
+    fi
+    portal_token="${OPENCLAW_GATEWAY_TOKEN:-casaos}"
+    portal_token_escaped="$(printf '%s' "$portal_token" | sed 's/[\/&]/\\&/g')"
+    if [[ "${EUID}" -eq 0 ]]; then
+      mkdir -p /DATA/AppData/openclaw-portal
+      sed "s/__OPENCLAW_TOKEN__/${portal_token_escaped}/g" "${APP_DIR}/redirect/index.html" > /DATA/AppData/openclaw-portal/index.html
+    else
+      sudo mkdir -p /DATA/AppData/openclaw-portal
+      sed "s/__OPENCLAW_TOKEN__/${portal_token_escaped}/g" "${APP_DIR}/redirect/index.html" | sudo tee /DATA/AppData/openclaw-portal/index.html >/dev/null
+    fi
+    if has_casaos_cli; then
+      existing_appid="$(first_existing_casaos_appid openclaw-app org.local.openclaw.portal openclaw openclaw-portal || true)"
+      if [[ -n "$existing_appid" ]]; then
+        if casaos-cli app-management apply "$existing_appid" -f "${OPENCLAW_APP_COMPOSE}"; then
+          msg="updated in CasaOS"
+        else
+          echo "WARN: apply failed, reinstall OpenClaw launcher app..."
+          casaos-cli app-management uninstall "$existing_appid" --no-remove-config || true
+          remove_containers_if_exist openclaw_portal
+          casaos-cli app-management install -f "${OPENCLAW_APP_COMPOSE}"
+          msg="reinstalled in CasaOS"
+        fi
+      else
+        if casaos-cli app-management install -f "${OPENCLAW_APP_COMPOSE}"; then
+          msg="installed to CasaOS"
+        else
+          echo "WARN: install failed, retry after removing old openclaw_portal container..."
+          remove_containers_if_exist openclaw_portal
+          casaos-cli app-management install -f "${OPENCLAW_APP_COMPOSE}"
+          msg="installed to CasaOS (after migration)"
+        fi
+      fi
+    else
+      echo "WARN: casaos-cli not found, fallback to docker compose"
+      docker_cmd compose -f "${OPENCLAW_APP_COMPOSE}" up -d
+      msg="deployed by docker compose"
+    fi
+    ip="$(host_primary_ip)"
+    echo "OpenClaw launcher ${msg}. Open http://${ip:-<your-host-ip>}:28086"
+    ;;
   immich-apply)
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
     IMMICH_COMPOSE="${SCRIPT_DIR}/immich-compose.yml"
+    IMMICH_COMPOSE_RENDERED="$(render_template_file "${IMMICH_COMPOSE}")"
     if [[ ! -f "${IMMICH_COMPOSE}" ]]; then
       echo "ERROR: ${IMMICH_COMPOSE} not found"
       exit 1
     fi
-    echo "Applying ${IMMICH_COMPOSE} to CasaOS..."
-    casaos-cli app-management apply big-bear-immich -f "${IMMICH_COMPOSE}"
-    echo "Done. CasaOS Immich config updated (changes applied asynchronously)."
+    if has_casaos_cli; then
+      existing_appid="$(first_existing_casaos_appid big-bear-immich com.bigbeartechworld.immich || true)"
+      if [[ -n "$existing_appid" ]]; then
+        echo "Applying ${IMMICH_COMPOSE} to CasaOS (${existing_appid})..."
+        casaos-cli app-management apply "$existing_appid" -f "${IMMICH_COMPOSE_RENDERED}"
+        echo "Done. CasaOS Immich config updated (changes applied asynchronously)."
+      else
+        echo "Installing Immich app to CasaOS..."
+        if casaos-cli app-management install -f "${IMMICH_COMPOSE_RENDERED}"; then
+          echo "Done. CasaOS Immich installed (asynchronous)."
+        else
+          echo "WARN: install failed, retry after migrating existing immich containers..."
+          remove_containers_if_exist immich-server immich-machine-learning immich-postgres immich-redis
+          casaos-cli app-management install -f "${IMMICH_COMPOSE_RENDERED}"
+          echo "Done. CasaOS Immich installed (after migration)."
+        fi
+      fi
+    else
+      echo "WARN: casaos-cli not found, fallback to docker compose"
+      docker_cmd compose -f "${IMMICH_COMPOSE_RENDERED}" up -d
+      echo "Immich deployed by docker compose."
+    fi
+    rm -f "${IMMICH_COMPOSE_RENDERED}"
     ;;
   immich-show)
     casaos-cli app-management show local big-bear-immich --yaml 2>&1
@@ -293,13 +458,34 @@ case "${1:-}" in
     ;;
   jellyfin-deploy)
     JELLYFIN_COMPOSE="${APP_DIR}/jellyfin-compose.yml"
+    JELLYFIN_COMPOSE_RENDERED="$(render_template_file "${JELLYFIN_COMPOSE}")"
     if [[ ! -f "${JELLYFIN_COMPOSE}" ]]; then
       echo "ERROR: ${JELLYFIN_COMPOSE} not found"
       exit 1
     fi
-    casaos-cli app-management install -f "${JELLYFIN_COMPOSE}"
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo "Jellyfin installed to CasaOS (asynchronous). Open http://${ip:-<your-host-ip>}:8096"
+    if has_casaos_cli; then
+      existing_appid="$(first_existing_casaos_appid jellyfin org.jellyfin.server || true)"
+      if [[ -n "$existing_appid" ]]; then
+        casaos-cli app-management apply "$existing_appid" -f "${JELLYFIN_COMPOSE_RENDERED}"
+        msg="updated in CasaOS (asynchronous)"
+      else
+        if casaos-cli app-management install -f "${JELLYFIN_COMPOSE_RENDERED}"; then
+          msg="installed to CasaOS (asynchronous)"
+        else
+          echo "WARN: install failed, retry after migrating existing jellyfin container..."
+          remove_containers_if_exist jellyfin
+          casaos-cli app-management install -f "${JELLYFIN_COMPOSE_RENDERED}"
+          msg="installed to CasaOS (after migration)"
+        fi
+      fi
+    else
+      echo "WARN: casaos-cli not found, fallback to docker compose"
+      docker_cmd compose -f "${JELLYFIN_COMPOSE_RENDERED}" up -d
+      msg="deployed by docker compose"
+    fi
+    rm -f "${JELLYFIN_COMPOSE_RENDERED}"
+    ip="$(host_primary_ip)"
+    echo "Jellyfin ${msg}. Open http://${ip:-<your-host-ip>}:8096"
     echo "First run: 建库时选 /media 下的子目录，建议关闭 Admin > Playback > Transcoding"
     ;;
   jellyfin-show)
@@ -311,15 +497,45 @@ case "${1:-}" in
       echo "ERROR: ${VOICE_COMPOSE} not found"
       exit 1
     fi
-    casaos-cli app-management install -f "${VOICE_COMPOSE}"
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo "Voice Assistant installed to CasaOS (asynchronous). Open http://${ip:-<your-host-ip>}:28083"
+    VOICE_COMPOSE_RENDERED="$(render_template_file "${VOICE_COMPOSE}")"
+    if has_casaos_cli; then
+      existing_appid="$(first_existing_casaos_appid voice-assistant org.local.voice.assistant || true)"
+      if [[ -n "$existing_appid" ]]; then
+        if casaos-cli app-management apply "$existing_appid" -f "${VOICE_COMPOSE_RENDERED}"; then
+          msg="updated in CasaOS (asynchronous)"
+        else
+          echo "WARN: apply failed, retry after migrating existing voice_assistant container..."
+          remove_containers_if_exist voice_assistant
+          casaos-cli app-management apply "$existing_appid" -f "${VOICE_COMPOSE_RENDERED}" || \
+            casaos-cli app-management install -f "${VOICE_COMPOSE_RENDERED}"
+          msg="updated in CasaOS (after migration)"
+        fi
+      else
+        if casaos-cli app-management install -f "${VOICE_COMPOSE_RENDERED}"; then
+          msg="installed to CasaOS (asynchronous)"
+        else
+          echo "WARN: install failed, retry after migrating existing voice_assistant container..."
+          remove_containers_if_exist voice_assistant
+          casaos-cli app-management install -f "${VOICE_COMPOSE_RENDERED}"
+          msg="installed to CasaOS (after migration)"
+        fi
+      fi
+    else
+      echo "WARN: casaos-cli not found, fallback to docker compose"
+      docker_cmd compose -f "${VOICE_COMPOSE_RENDERED}" up -d
+      msg="deployed by docker compose"
+    fi
+    rm -f "${VOICE_COMPOSE_RENDERED}"
+    ip="$(host_primary_ip)"
+    echo "Voice Assistant ${msg}. Open http://${ip:-<your-host-ip>}:28083"
     ;;
   voice-assistant-show)
     docker_cmd ps -a --filter name=voice_assistant --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     ;;
   nas-files-deploy)
     FB_COMPOSE="${APP_DIR}/filebrowser-compose.yml"
+    FB_COMPOSE_RENDERED="$(render_template_file "${FB_COMPOSE}")"
+    fb_msg=""
     if [[ ! -f "${FB_COMPOSE}" ]]; then
       echo "ERROR: ${FB_COMPOSE} not found"
       exit 1
@@ -327,9 +543,55 @@ case "${1:-}" in
     # 预先创建 config/database 目录（容器以 uid 1001 运行，目录需可写）
     mkdir -p /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database
     chmod 777 /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database
-    casaos-cli app-management install -f "${FB_COMPOSE}"
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo "NAS file browser installing (asynchronous)..."
+    if has_casaos_cli; then
+      existing_appid="$(first_existing_casaos_appid nas-filebrowser org.local.nas.filebrowser || true)"
+      if [[ -n "$existing_appid" ]]; then
+        if casaos-cli app-management apply "$existing_appid" -f "${FB_COMPOSE_RENDERED}"; then
+          fb_msg="updated in CasaOS (asynchronous)"
+        else
+          echo "WARN: apply failed, retry after migrating existing filebrowser container..."
+          remove_containers_if_exist filebrowser
+          casaos-cli app-management apply "$existing_appid" -f "${FB_COMPOSE_RENDERED}" || \
+            casaos-cli app-management install -f "${FB_COMPOSE_RENDERED}"
+          fb_msg="updated in CasaOS (after migration)"
+        fi
+      else
+        if casaos-cli app-management install -f "${FB_COMPOSE_RENDERED}"; then
+          fb_msg="installing via CasaOS (asynchronous)"
+        else
+          echo "WARN: install failed, retry after migrating existing filebrowser container..."
+          remove_containers_if_exist filebrowser
+          casaos-cli app-management install -f "${FB_COMPOSE_RENDERED}"
+          fb_msg="installed to CasaOS (after migration)"
+        fi
+      fi
+
+      # CasaOS occasionally stores /srv source as /tmp/casaos-compose-app-*/... (invalid after temp cleanup).
+      # If detected, force uninstall+install to self-heal.
+      for _ in $(seq 1 20); do
+        srv_source="$(docker_cmd inspect filebrowser --format '{{range .Mounts}}{{if eq .Destination "/srv"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+        if [[ -n "$srv_source" ]]; then
+          break
+        fi
+        sleep 1
+      done
+      if [[ "$srv_source" == /tmp/casaos-compose-app-* ]]; then
+        echo "WARN: detected invalid /srv mount ($srv_source), reinstalling nas-filebrowser..."
+        fb_appid="$(first_existing_casaos_appid nas-filebrowser org.local.nas.filebrowser || true)"
+        if [[ -n "$fb_appid" ]]; then
+          casaos-cli app-management uninstall "$fb_appid" --no-remove-config || true
+        fi
+        remove_containers_if_exist filebrowser
+        casaos-cli app-management install -f "${FB_COMPOSE_RENDERED}"
+        fb_msg="reinstalled in CasaOS (mount self-healed)"
+      fi
+    else
+      echo "WARN: casaos-cli not found, fallback to docker compose"
+      docker_cmd compose -f "${FB_COMPOSE_RENDERED}" up -d
+      fb_msg="deployed by docker compose"
+    fi
+    rm -f "${FB_COMPOSE_RENDERED}"
+    ip="$(host_primary_ip)"
     # 免登录：等数据库初始化后，停止容器 -> 写入 noauth -> 再启动（读写由 uid 1001 与可写挂载保证）
     for _ in $(seq 1 40); do
       if [ -f /DATA/AppData/filebrowser/database/filebrowser.db ]; then
@@ -344,6 +606,7 @@ case "${1:-}" in
       fi
       sleep 2
     done
+    [[ -n "$fb_msg" ]] && echo "NAS file browser ${fb_msg}."
     echo "Open http://${ip:-<your-host-ip>}:28085"
     ;;
   nas-files-show)

@@ -8,6 +8,9 @@ set -euo pipefail
 # 其余步骤自动完成，并尽量复用项目现有脚本，保持简洁。
 # =============================================================================
 
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export PATH
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
 APP_DIR="$SCRIPT_DIR"
 ENV_FILE="$APP_DIR/.env"
@@ -24,10 +27,16 @@ ARG_FIREWALL_ONLY=0
 # NAS-Demo 需要放行的 TCP 端口（INPUT 链，宿主机/局域网访问）。
 # 可用环境变量 FIREWALL_PORTS 覆盖，例如:
 #   FIREWALL_PORTS="22 80 24190" bash install.sh
-FIREWALL_PORTS="${FIREWALL_PORTS:-80 2283 8096 28081 28082 28083 28084 28085 24190 24192}"
+FIREWALL_PORTS="${FIREWALL_PORTS:-80 2283 8096 28081 28082 28083 28084 28085 28086 24190 24192}"
 
 # 代码仓库地址（仅在“从任意位置运行、目录里还没有 NAS-Demo 代码”时用于自动 clone）
 INSTALL_REPO="${INSTALL_REPO:-https://github.com/jjking619/ai-nas.git}"
+
+# OpenClaw 挂载目录（宿主机）
+OPENCLAW_DATA_DIR="/DATA/AppData/openclaw"
+
+# CasaOS 安装脚本地址（CasaOS 会自动安装 docker）
+CASAOS_INSTALL_SCRIPT_URL="${CASAOS_INSTALL_SCRIPT_URL:-https://get.casaos.io}"
 
 usage() {
   cat <<'EOF'
@@ -47,23 +56,72 @@ usage() {
 EOF
 }
 
-for arg in "$@"; do
-  case "$arg" in
-    --api-key=*) API_KEY_ARG="${arg#*=}" ;;
-    --model-base-url=*) BASE_URL_ARG="${arg#*=}" ;;
-    --model-id=*) MODEL_ID_ARG="${arg#*=}" ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --api-key=*)
+      API_KEY_ARG="${1#*=}"
+      if [[ -z "$API_KEY_ARG" && $# -ge 2 && "$2" != -* ]]; then
+        API_KEY_ARG="$2"
+        shift
+      fi
+      ;;
+    --api-key)
+      [[ $# -ge 2 ]] || { echo "参数 --api-key 缺少值" >&2; exit 1; }
+      [[ "$2" != -* ]] || { echo "参数 --api-key 缺少值" >&2; exit 1; }
+      API_KEY_ARG="$2"
+      shift
+      ;;
+    --model-base-url=*)
+      BASE_URL_ARG="${1#*=}"
+      if [[ -z "$BASE_URL_ARG" && $# -ge 2 && "$2" != -* ]]; then
+        BASE_URL_ARG="$2"
+        shift
+      fi
+      ;;
+    --model-base-url)
+      [[ $# -ge 2 ]] || { echo "参数 --model-base-url 缺少值" >&2; exit 1; }
+      [[ "$2" != -* ]] || { echo "参数 --model-base-url 缺少值" >&2; exit 1; }
+      BASE_URL_ARG="$2"
+      shift
+      ;;
+    --model-id=*)
+      MODEL_ID_ARG="${1#*=}"
+      if [[ -z "$MODEL_ID_ARG" && $# -ge 2 && "$2" != -* ]]; then
+        MODEL_ID_ARG="$2"
+        shift
+      fi
+      ;;
+    --model-id)
+      [[ $# -ge 2 ]] || { echo "参数 --model-id 缺少值" >&2; exit 1; }
+      [[ "$2" != -* ]] || { echo "参数 --model-id 缺少值" >&2; exit 1; }
+      MODEL_ID_ARG="$2"
+      shift
+      ;;
     --check) CHECK_ONLY=1 ;;
     --skip-firewall) SKIP_FIREWALL=1 ;;
-    --repo=*) INSTALL_REPO="${arg#*=}" ;;
+    --repo=*)
+      INSTALL_REPO="${1#*=}"
+      if [[ -z "$INSTALL_REPO" && $# -ge 2 && "$2" != -* ]]; then
+        INSTALL_REPO="$2"
+        shift
+      fi
+      ;;
+    --repo)
+      [[ $# -ge 2 ]] || { echo "参数 --repo 缺少值" >&2; exit 1; }
+      [[ "$2" != -* ]] || { echo "参数 --repo 缺少值" >&2; exit 1; }
+      INSTALL_REPO="$2"
+      shift
+      ;;
     reset) RESET=1 ;;
     firewall) RESET=0; CHECK_ONLY=0; ARG_FIREWALL_ONLY=1 ;;
     -h|--help|help) usage; exit 0 ;;
     *)
-      echo "未知参数: $arg" >&2
+      echo "未知参数: $1" >&2
       usage
       exit 1
       ;;
   esac
+  shift
 done
 
 log() { echo "[install] $*"; }
@@ -82,13 +140,137 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
 }
 
+ensure_wget_for_casaos() {
+  if command -v wget >/dev/null 2>&1 && wget --help 2>&1 | grep -q -- '--show-progress'; then
+    return 0
+  fi
+
+  warn "检测到 wget 不支持 --show-progress（常见于 BusyBox），尝试安装 GNU wget..."
+  if [[ "${EUID}" -eq 0 ]]; then
+    apt install wget -y || apt-get install wget -y || die "安装 GNU wget 失败，请手动执行: sudo apt install wget -y"
+  else
+    sudo apt install wget -y || sudo apt-get install wget -y || die "安装 GNU wget 失败，请手动执行: sudo apt install wget -y"
+  fi
+
+  command -v wget >/dev/null 2>&1 || die "安装后仍未找到 wget，请检查 PATH"
+  wget --help 2>&1 | grep -q -- '--show-progress' || die "当前 wget 仍不支持 --show-progress，请确认 /usr/bin/wget 为 GNU 版本"
+}
+
+install_casaos() {
+  log "开始安装 CasaOS（该过程会提示输入 sudo 密码）..."
+
+  # CasaOS 安装脚本内部会调用 wget --show-progress；BusyBox wget 会失败。
+  ensure_wget_for_casaos
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    if curl -fsSL "$CASAOS_INSTALL_SCRIPT_URL" | bash; then
+      return 0
+    fi
+    warn "curl 安装 CasaOS 失败，尝试安装 wget 后重试..."
+    wget -qO- "$CASAOS_INSTALL_SCRIPT_URL" | bash
+  else
+    if curl -fsSL "$CASAOS_INSTALL_SCRIPT_URL" | sudo bash; then
+      return 0
+    fi
+    warn "curl 安装 CasaOS 失败，尝试安装 wget 后重试..."
+    wget -qO- "$CASAOS_INSTALL_SCRIPT_URL" | sudo bash
+  fi
+}
+
+ensure_docker_via_casaos() {
+  if command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "未检测到 docker，推荐按 CasaOS 路线安装（会自动安装 docker）"
+  if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    die "缺少命令: docker。请先执行: curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+  fi
+
+  if [[ ! -t 0 ]]; then
+    die "缺少命令: docker。当前是非交互环境，请先执行: curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+  fi
+
+  local ans
+  read -r -p "是否现在安装 CasaOS（推荐）？[Y/n]: " ans
+  if [[ -n "$ans" && ! "$ans" =~ ^[Yy]$ ]]; then
+    die "已取消。你可手动执行: curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+  fi
+
+  install_casaos
+
+  command -v docker >/dev/null 2>&1 || die "CasaOS 安装后仍未检测到 docker，请重新登录后重试"
+}
+
+detect_casaos_scheme() {
+  if curl -k -I --max-time 3 https://127.0.0.1:443 >/dev/null 2>&1; then
+    echo "https"
+  elif curl -I --max-time 3 http://127.0.0.1:80 >/dev/null 2>&1; then
+    echo "http"
+  else
+    echo ""
+  fi
+}
+
+ensure_casaos_web_if_missing() {
+  if [[ -n "$(detect_casaos_scheme)" ]]; then
+    return 0
+  fi
+
+  warn "未检测到 CasaOS 管理入口（127.0.0.1:80/443）"
+
+  if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    warn "可执行安装命令: curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    warn "当前是非交互环境，已跳过自动安装 CasaOS；可手动执行: curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+    return 0
+  fi
+
+  local ans
+  read -r -p "是否现在安装 CasaOS 管理服务？[Y/n]: " ans
+  if [[ -n "$ans" && ! "$ans" =~ ^[Yy]$ ]]; then
+    warn "已跳过 CasaOS 安装；后续可手动执行: curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+    return 0
+  fi
+
+  install_casaos
+
+  if [[ -z "$(detect_casaos_scheme)" ]]; then
+    warn "CasaOS 安装后仍未检测到 80/443 监听，可稍后检查: systemctl status casaos"
+  fi
+}
+
 container_exists() {
   docker_cmd ps -a --format '{{.Names}}' | grep -qx "$1"
 }
 
+casaos_app_exists_any() {
+  local id
+  for id in "$@"; do
+    if casaos-cli app-management show local "$id" --yaml >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cleanup_legacy_nas_demo_app() {
+  if ! casaos-cli app-management show local nas-demo --yaml >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! casaos-cli app-management show local nas-demo --yaml 2>/dev/null | grep -q '^x-casaos:'; then
+    warn "检测到 legacy 应用 nas-demo，尝试清理以避免 CasaOS 首页出现不可点击条目..."
+    casaos-cli app-management uninstall nas-demo --no-remove-config || warn "清理 legacy nas-demo 失败，可稍后手动处理"
+  fi
+}
+
 env_get() {
   local key="$1"
-  grep -E "^[[:space:]]*${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  grep -E "^[[:space:]]*${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
 }
 
 env_set() {
@@ -117,7 +299,8 @@ check_env() {
   require_cmd curl
   require_cmd openssl
   require_cmd python3
-  require_cmd docker
+  ensure_docker_via_casaos
+  ensure_casaos_web_if_missing
   if ! docker_cmd ps >/dev/null 2>&1; then
     die "docker 无法访问，请确认当前用户有 sudo docker 权限"
   fi
@@ -125,6 +308,61 @@ check_env() {
     chmod +x "$APP_DIR/oc.sh" || true
   fi
   log "环境检查通过"
+}
+
+ensure_openclaw_data_permissions() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    mkdir -p "$OPENCLAW_DATA_DIR"
+    chown -R 1000:1000 "$OPENCLAW_DATA_DIR"
+    chmod 775 "$OPENCLAW_DATA_DIR" || true
+  else
+    sudo mkdir -p "$OPENCLAW_DATA_DIR"
+    sudo chown -R 1000:1000 "$OPENCLAW_DATA_DIR"
+    sudo chmod 775 "$OPENCLAW_DATA_DIR" || true
+  fi
+}
+
+ensure_runtime_paths_permissions() {
+  local nas_root nas_uid nas_gid
+  nas_root="$(env_get NAS_ROOT)"
+  nas_uid="$(env_get NAS_PUID)"
+  nas_gid="$(env_get NAS_PGID)"
+  nas_root="${nas_root:-$HOME/nas_share}"
+  nas_uid="${nas_uid:-$(id -u)}"
+  nas_gid="${nas_gid:-$(id -g)}"
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    mkdir -p "$nas_root" "$nas_root/downloads/Movies" "$nas_root/downloads/TV Shows" "$nas_root/tools" "$nas_root/knowledge_base_data"
+    mkdir -p /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database
+    chown "$nas_uid:$nas_gid" "$nas_root" "$nas_root/downloads" "$nas_root/downloads/Movies" "$nas_root/downloads/TV Shows" "$nas_root/tools" "$nas_root/knowledge_base_data" || true
+    chown -R "$nas_uid:$nas_gid" /DATA/AppData/filebrowser || true
+    chmod 775 "$nas_root" "$nas_root/downloads" "$nas_root/downloads/Movies" "$nas_root/downloads/TV Shows" "$nas_root/tools" "$nas_root/knowledge_base_data" || true
+    chmod 775 /DATA/AppData/filebrowser /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database || true
+  else
+    sudo mkdir -p "$nas_root" "$nas_root/downloads/Movies" "$nas_root/downloads/TV Shows" "$nas_root/tools" "$nas_root/knowledge_base_data"
+    sudo mkdir -p /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database
+    sudo chown "$nas_uid:$nas_gid" "$nas_root" "$nas_root/downloads" "$nas_root/downloads/Movies" "$nas_root/downloads/TV Shows" "$nas_root/tools" "$nas_root/knowledge_base_data" || true
+    sudo chown -R "$nas_uid:$nas_gid" /DATA/AppData/filebrowser || true
+    sudo chmod 775 "$nas_root" "$nas_root/downloads" "$nas_root/downloads/Movies" "$nas_root/downloads/TV Shows" "$nas_root/tools" "$nas_root/knowledge_base_data" || true
+    sudo chmod 775 /DATA/AppData/filebrowser /DATA/AppData/filebrowser/config /DATA/AppData/filebrowser/database || true
+  fi
+}
+
+detect_openclaw_scheme() {
+  if curl -k -I --max-time 3 https://127.0.0.1:24190/healthz >/dev/null 2>&1; then
+    echo "https"
+  else
+    echo "http"
+  fi
+}
+
+get_primary_ip() {
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  echo "$ip"
 }
 
 prepare_env() {
@@ -210,6 +448,26 @@ wait_openclaw() {
   die "OpenClaw 长时间未就绪，请执行: ./oc.sh logs"
 }
 
+start_pairing_auto_approve_window() {
+  local token
+  token="$(env_get OPENCLAW_GATEWAY_TOKEN)"
+  token="${token:-casaos}"
+
+  # 安装后开启短时自动批准窗口，覆盖首次打开 Control UI 产生的 pending 请求。
+  (
+    for _ in $(seq 1 300); do
+      if docker_cmd exec openclaw node dist/index.js devices approve --latest --json \
+        --url ws://127.0.0.1:18789 --token "$token" >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 2
+    done
+    exit 0
+  ) >/dev/null 2>&1 &
+
+  log "已开启 10 分钟自动配对批准窗口（首次打开 Control UI 将自动通过）"
+}
+
 sync_immich_key_to_env_if_exists() {
   local key_line
   key_line="$(grep -E '^IMMICH_API_KEY=' /DATA/AppData/openclaw/.env 2>/dev/null | tail -1 || true)"
@@ -220,17 +478,47 @@ sync_immich_key_to_env_if_exists() {
 
 deploy_all() {
   log "开始执行一键安装流程..."
+  local has_casaos_cli=0
+
+  if command -v casaos-cli >/dev/null 2>&1; then
+    has_casaos_cli=1
+  fi
+
+  ensure_openclaw_data_permissions
+  ensure_runtime_paths_permissions
 
   # 1) 优先走 compose，全流程仍由 install.sh 统一调度
   if docker_cmd compose version >/dev/null 2>&1; then
-    if container_exists openclaw; then
-      warn "检测到已存在 openclaw，跳过重建 openclaw，尝试拉起其余核心服务"
-      docker_cmd compose up -d --build \
-        media_downloader knowledge_base immich-postgres immich-redis \
-        immich-server immich-machine-learning jellyfin || warn "compose 拉起其余服务失败，可稍后重试"
+    if [[ "$has_casaos_cli" -eq 1 ]]; then
+      log "检测到 casaos-cli，采用 CasaOS 应用模式部署（OpenClaw/Immich/Jellyfin）"
+      cleanup_legacy_nas_demo_app || true
+      FORCE_PLAIN_DOCKER=1 bash "$APP_DIR/deploy.sh" || warn "openclaw 部署失败，可稍后重试"
+      bash "$APP_DIR/oc.sh" openclaw-app-deploy || warn "openclaw-app-deploy 失败"
+      bash "$APP_DIR/oc.sh" immich-apply || warn "immich-apply 失败"
+      bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 失败"
+
+      if ! casaos_app_exists_any openclaw-app org.local.openclaw.portal openclaw openclaw-portal; then
+        warn "OpenClaw 入口未注册成功，重试一次..."
+        bash "$APP_DIR/oc.sh" openclaw-app-deploy || warn "openclaw-app-deploy 重试失败"
+      fi
+      if ! casaos_app_exists_any big-bear-immich com.bigbeartechworld.immich; then
+        warn "Immich 应用未注册成功，重试一次..."
+        bash "$APP_DIR/oc.sh" immich-apply || warn "immich-apply 重试失败"
+      fi
+      if ! casaos_app_exists_any jellyfin org.jellyfin.server; then
+        warn "Jellyfin 应用未注册成功，重试一次..."
+        bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 重试失败"
+      fi
     else
-      log "检测到 docker compose，执行全家桶部署"
-      docker_cmd compose up -d --build
+      if container_exists openclaw; then
+        warn "检测到已存在 openclaw，跳过重建 openclaw，尝试拉起其余核心服务"
+        docker_cmd compose up -d --build \
+          media_downloader knowledge_base immich-postgres immich-redis \
+          immich-server immich-machine-learning jellyfin || warn "compose 拉起其余服务失败，可稍后重试"
+      else
+        log "检测到 docker compose，执行全家桶部署"
+        docker_cmd compose up -d --build
+      fi
     fi
   else
     # 2) compose 不可用时，走精简兜底路径（仅依赖现有 oc.sh 和初始化脚本）
@@ -264,7 +552,7 @@ deploy_all() {
 EOF
 )
 
-  docker_cmd exec openclaw node dist/index.js config set models.providers.custom "$provider_json" --strict-json --merge
+  docker_cmd exec openclaw node dist/index.js config set models.providers.custom "$provider_json" --strict-json
   docker_cmd exec openclaw node dist/index.js config set agents.defaults.model.primary "custom/${model_id}"
   docker_cmd exec openclaw node dist/index.js config set gateway.controlUi.allowedOrigins '["*"]' --strict-json || true
 
@@ -282,28 +570,65 @@ EOF
   fi
 
   # CasaOS 附加组件（失败不阻断主流程）
-  # jellyfin 在 compose 模式下通常已存在，避免重复安装冲突
-  if ! container_exists jellyfin; then
-    bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 失败"
-  fi
-  if ! container_exists filebrowser; then
+  if [[ "$has_casaos_cli" -eq 1 ]]; then
     bash "$APP_DIR/oc.sh" nas-files-deploy || warn "nas-files-deploy 失败"
-  fi
-  if ! container_exists voice_assistant; then
     bash "$APP_DIR/oc.sh" voice-assistant-deploy || warn "voice-assistant-deploy 失败"
+  else
+    if ! container_exists jellyfin; then
+      bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 失败"
+    fi
+    if ! container_exists filebrowser; then
+      bash "$APP_DIR/oc.sh" nas-files-deploy || warn "nas-files-deploy 失败"
+    fi
+    if ! container_exists voice_assistant; then
+      bash "$APP_DIR/oc.sh" voice-assistant-deploy || warn "voice-assistant-deploy 失败"
+    fi
   fi
 
   docker_cmd restart openclaw >/dev/null 2>&1 || true
 }
 
 summary() {
-  local ip token
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  local ip token scheme casaos_scheme casaos_url openclaw_url
+  ip="$(get_primary_ip)"
   token="$(env_get OPENCLAW_GATEWAY_TOKEN)"
+  scheme="$(detect_openclaw_scheme)"
+  casaos_scheme="$(detect_casaos_scheme)"
+  casaos_url=""
+  if [[ -n "$casaos_scheme" ]]; then
+    casaos_url="${casaos_scheme}://${ip:-<IP>}"
+  fi
+  openclaw_url="${scheme}://${ip:-<IP>}:24190/#token=${token:-casaos}"
   echo
   echo "============================================================"
   echo "安装完成"
-  echo "OpenClaw : https://${ip:-<IP>}:24190/#token=${token:-casaos}"
+  echo
+  echo "下一步（推荐顺序）："
+  if [[ -n "$casaos_url" ]]; then
+    echo "1) 先打开 CasaOS 管理入口"
+    echo "   ${casaos_url}"
+    echo "2) 在 CasaOS 中确认/配置其它应用（Immich / Jellyfin / 文件浏览 / 对话助手）"
+    echo "3) 再打开 OpenClaw 控制台"
+  else
+    echo "1) 先安装/修复 CasaOS 管理服务"
+    echo "   curl -fsSL ${CASAOS_INSTALL_SCRIPT_URL} | sudo bash"
+    echo "2) 安装完成后执行: bash ./oc.sh casaos-url"
+    echo "3) 再打开 OpenClaw 控制台"
+  fi
+  echo "   ${openclaw_url}"
+  echo
+  if [[ -z "$casaos_url" ]]; then
+    echo "提示: 当前未检测到 CasaOS Web 服务（80/443），上面的 CasaOS URL 可能无法访问。"
+    echo
+  fi
+
+  echo "服务地址（按需使用）："
+  if [[ -n "$casaos_url" ]]; then
+    echo "CasaOS   : ${casaos_url}"
+  else
+    echo "CasaOS   : (未检测到 80/443 监听，请先安装/启动 CasaOS)"
+  fi
+  echo "OpenClaw : ${openclaw_url}"
   echo "Immich   : http://${ip:-<IP>}:2283"
   echo "Jellyfin : http://${ip:-<IP>}:8096"
   echo "文件浏览 : http://${ip:-<IP>}:28085"
@@ -438,6 +763,7 @@ main() {
     log "已按 --skip-firewall 跳过防火墙放行"
   fi
   deploy_all
+  start_pairing_auto_approve_window
   summary
 }
 

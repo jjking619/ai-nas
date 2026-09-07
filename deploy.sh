@@ -3,17 +3,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
 APP_DIR="$SCRIPT_DIR"
-if [[ ! -f "$APP_DIR/docker-compose.yml" && -f "/home/pi/NAS-Demo/docker-compose.yml" ]]; then
-  APP_DIR="/home/pi/NAS-Demo"
+if [[ ! -f "$APP_DIR/docker-compose.yml" && -f "$HOME/NAS-Demo/docker-compose.yml" ]]; then
+  APP_DIR="$HOME/NAS-Demo"
 fi
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 BOOTSTRAP_CONFIG="$APP_DIR/openclaw.bootstrap.json"
 DATA_DIR="/DATA/AppData/openclaw"
 TARGET_CONFIG="$DATA_DIR/openclaw.json"
+ENV_FILE="$APP_DIR/.env"
 
 # NAS 共享目录（用户名无关：默认当前用户主目录/nas_share）
 NAS_ROOT="${NAS_ROOT:-$HOME/nas_share}"
 export NAS_ROOT
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
+OPENCLAW_MODEL_ID="${OPENCLAW_MODEL_ID:-deepseek-chat}"
+OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-casaos}"
+export OPENCLAW_MODEL_ID OPENCLAW_GATEWAY_TOKEN
+
+if [[ -z "${OPENCLAW_MODEL_BASE_URL:-}" || -z "${OPENCLAW_MODEL_API_KEY:-}" ]]; then
+  echo "WARN: OPENCLAW_MODEL_BASE_URL / OPENCLAW_MODEL_API_KEY 未完整配置，OpenClaw 可能无法调用模型。"
+  echo "WARN: 请先检查 $ENV_FILE 或重新执行: bash install.sh"
+fi
 
 if [[ "${EUID}" -eq 0 ]]; then
   DOCKER_CMD=(docker)
@@ -29,6 +45,7 @@ fi
 
 HAS_DOCKER_COMPOSE="false"
 HAS_DOCKER_COMPOSE_LEGACY="false"
+FORCE_PLAIN_DOCKER="${FORCE_PLAIN_DOCKER:-0}"
 
 if [[ ! -f "$COMPOSE_FILE" ]]; then
   echo "Compose file not found: $COMPOSE_FILE"
@@ -40,10 +57,12 @@ if [[ ! -f "$BOOTSTRAP_CONFIG" ]]; then
   exit 1
 fi
 
-if "${DOCKER_CMD[@]}" compose version >/dev/null 2>&1; then
-  HAS_DOCKER_COMPOSE="true"
-elif command -v docker-compose >/dev/null 2>&1; then
-  HAS_DOCKER_COMPOSE_LEGACY="true"
+if [[ "$FORCE_PLAIN_DOCKER" != "1" ]]; then
+  if "${DOCKER_CMD[@]}" compose version >/dev/null 2>&1; then
+    HAS_DOCKER_COMPOSE="true"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    HAS_DOCKER_COMPOSE_LEGACY="true"
+  fi
 fi
 
 echo "[1/4] Stop and remove broken CasaOS OpenClaw container if exists"
@@ -91,8 +110,11 @@ else
     -e HOME=/home/node \
     -e OPENCLAW_HOME=/home/node \
     -e TERM=xterm-256color \
-    -e OPENCLAW_GATEWAY_TOKEN=casaos \
+    -e OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
     -e TZ=Asia/Shanghai \
+    -e OPENCLAW_MODEL_BASE_URL="${OPENCLAW_MODEL_BASE_URL:-}" \
+    -e OPENCLAW_MODEL_API_KEY="${OPENCLAW_MODEL_API_KEY:-}" \
+    -e OPENCLAW_MODEL_ID="${OPENCLAW_MODEL_ID}" \
     -e IMMICH_URL="${IMMICH_URL_VAL:-http://10.55.84.133:2283}" \
     -e IMMICH_API_KEY="${IMMICH_API_KEY_VAL:-}" \
     -p 24190:18789 \

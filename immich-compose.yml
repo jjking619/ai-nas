@@ -121,12 +121,12 @@ services:
               bind:
                 create_host_path: true
             - type: bind
-              source: /home/pi/nas_share/Immich上传
+              source: __NAS_ROOT__/Immich上传
               target: /usr/src/app/upload/library
               bind:
                 create_host_path: true
             - type: bind
-              source: /home/pi/nas_share
+              source: __NAS_ROOT__
               target: /nas_share
               bind:
                 create_host_path: true

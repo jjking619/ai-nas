@@ -20,15 +20,15 @@ services:
     network_mode: host
     volumes:
       - type: bind
-        source: ${APP_DIR:-/home/pi/NAS-Demo}/voice_remote/app.py
+        source: __APP_DIR__/voice_remote/app.py
         target: /app/app.py
         read_only: true
       - type: bind
-        source: ${APP_DIR:-/home/pi/NAS-Demo}/voice_remote/static
+        source: __APP_DIR__/voice_remote/static
         target: /app/static
         read_only: true
       - type: bind
-        source: ${APP_DIR:-/home/pi/NAS-Demo}/logs
+        source: __APP_DIR__/logs
         target: /logs
     x-casaos:
       envs:
@@ -39,7 +39,7 @@ services:
           description:
             en_US: Optional trigger token
       ports:
-        - container: "8082"
+        - container: "28083"
           description:
             en_US: Voice assistant web UI
 
