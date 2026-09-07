@@ -35,17 +35,15 @@ def _safe_segment(seg):
 def _safe_subdir(subdir):
     raw = (subdir or "").strip()
     if not raw:
-        return "家庭影院"
+        return "Movies"
 
-    lowered = raw.replace(" ", "")
-    if any(k in lowered for k in ("剧集", "电视剧", "连续剧")):
-        return "家庭影院/剧集"
-    if "电影" in lowered:
-        return "家庭影院/电影"
-    if "家庭影院" in lowered:
-        return "家庭影院"
+    lowered = raw.replace(" ", "").lower()
+    if any(k in lowered for k in ("剧集", "电视剧", "连续剧", "tvshows", "tvshow", "series", "episode", "episodes")):
+        return "TV Shows"
+    if any(k in lowered for k in ("电影", "影片", "家庭影院", "视频", "预告片", "纪录片", "movie", "movies", "film", "video", "trailer", "documentary")):
+        return "Movies"
     if not lowered:
-        return "家庭影院"
+        return "Movies"
 
     parts = []
     for part in raw.replace("\\", "/").split("/"):
@@ -53,7 +51,7 @@ def _safe_subdir(subdir):
         if cleaned:
             parts.append(cleaned)
 
-    return "/".join(parts) if parts else "家庭影院"
+    return "/".join(parts) if parts else "Movies"
 
 
 def _resolve_target_dir(subdir):

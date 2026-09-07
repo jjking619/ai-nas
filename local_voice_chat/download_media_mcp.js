@@ -11,40 +11,40 @@ const MEDIA_LIBRARY = {
   "海洋": {
     url: "https://vjs.zencdn.net/v/oceans.mp4",
     label: "海洋纪录片",
-    default_folder: "视频",
+    default_folder: "Movies",
   },
-  "大海": { url: "https://vjs.zencdn.net/v/oceans.mp4", label: "海洋纪录片", default_folder: "视频" },
+  "大海": { url: "https://vjs.zencdn.net/v/oceans.mp4", label: "海洋纪录片", default_folder: "Movies" },
   // 电影预告片
   "预告片": {
     url: "https://media.w3.org/2010/05/sintel/trailer.mp4",
     label: "Sintel电影预告片",
-    default_folder: "家庭影院/电影",
+    default_folder: "Movies",
   },
   "sintel": {
     url: "https://media.w3.org/2010/05/sintel/trailer.mp4",
     label: "Sintel电影预告片",
-    default_folder: "家庭影院/电影",
+    default_folder: "Movies",
   },
   "兔子": {
     url: "https://www.w3schools.com/html/mov_bbb.mp4",
     label: "Big Buck Bunny动画短片",
-    default_folder: "家庭影院/电影",
+    default_folder: "Movies",
   },
   "bunny": {
     url: "https://www.w3schools.com/html/mov_bbb.mp4",
     label: "Big Buck Bunny动画短片",
-    default_folder: "家庭影院/电影",
+    default_folder: "Movies",
   },
   // 通用样本
   "样本": {
     url: "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4",
     label: "通用视频样本",
-    default_folder: "视频",
+    default_folder: "Movies",
   },
   "测试": {
     url: "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4",
     label: "通用视频样本",
-    default_folder: "视频",
+    default_folder: "Movies",
   },
 };
 
@@ -70,7 +70,7 @@ const TOOL = {
       },
       target_folder: {
         type: "string",
-        description: "目标文件夹描述，例如：家庭影院文件夹、电影。不指定时使用关键词默认值",
+        description: "目标文件夹描述，例如：Movies、TV Shows、电影、剧集。不指定时使用关键词默认值",
       },
       notify_tts: {
         type: "boolean",
@@ -86,20 +86,28 @@ const TOOL = {
 };
 
 const shortMap = [
-  ["电影", "家庭影院/电影"],
-  ["剧集", "家庭影院/剧集"],
-  ["电视剧", "家庭影院/剧集"],
+  ["tvshows", "TV Shows"],
+  ["tvshow", "TV Shows"],
+  ["series", "TV Shows"],
+  ["剧集", "TV Shows"],
+  ["电视剧", "TV Shows"],
+  ["连续剧", "TV Shows"],
+  ["movies", "Movies"],
+  ["movie", "Movies"],
+  ["电影", "Movies"],
+  ["影片", "Movies"],
+  ["家庭影院", "Movies"],
+  ["视频", "Movies"],
+  ["video", "Movies"],
   ["音乐", "音乐"],
-  ["短视频", "视频"],
-  ["视频", "视频"],
-  ["家庭影院", "家庭影院"],
+  ["music", "音乐"],
 ];
 
 function mapTargetFolder(raw) {
   const v = String(raw || "").trim();
-  if (!v) return "家庭影院";
+  if (!v) return "Movies";
 
-  const compact = v.replace(/\s+/g, "");
+  const compact = v.replace(/\s+/g, "").toLowerCase();
   for (const [k, val] of shortMap) {
     if (compact.includes(k)) return val;
   }
@@ -118,7 +126,7 @@ function mapTargetFolder(raw) {
     .filter(Boolean)
     .join("/");
 
-  return safe || "家庭影院";
+  return safe || "Movies";
 }
 
 function send(msg) {
@@ -211,7 +219,7 @@ async function callDownloadApi(args) {
 }
 
 function renderSuccess(data) {
-  const safeSubdir = data.safe_subdir || "家庭影院";
+  const safeSubdir = data.safe_subdir || "Movies";
   const files = Array.isArray(data.files) ? data.files : [];
   const first = files.length > 0 ? files[0] : "(文件名未返回)";
   const ttsText = data.notify_tts ? `；通知：${data.tts_text || DEFAULT_NOTIFY_TEXT}` : "";

@@ -70,6 +70,9 @@ def load_runtime_env(env_file: str | Path | None = None) -> dict[str, str]:
 
 
 load_runtime_env()
+REPO_ROOT = Path(__file__).resolve().parent.parent
+NAS_ROOT = Path(os.getenv("NAS_ROOT", str(Path.home() / "nas_share"))).expanduser()
+DEFAULT_LOG_FILE = REPO_ROOT / "logs" / "voice_bridge.log"
 
 
 def _resolve_sdk_root(folder_name: str) -> Path:
@@ -78,8 +81,8 @@ def _resolve_sdk_root(folder_name: str) -> Path:
     if env_base:
         candidates.append(Path(env_base) / folder_name)
 
-    candidates.append(Path(__file__).resolve().parent.parent / folder_name)
-    candidates.append(Path("/home/pi/voice") / folder_name)
+    candidates.append(REPO_ROOT / folder_name)
+    candidates.append(Path.home() / "voice" / folder_name)
 
     for p in candidates:
         if p.exists():
@@ -231,7 +234,7 @@ def parse_args():
     )
     parser.add_argument(
         "--log-file",
-        default="/home/pi/NAS-Demo/logs/voice_bridge.log",
+        default=str(DEFAULT_LOG_FILE),
         help="Local log file path",
     )
     parser.add_argument(
@@ -602,7 +605,7 @@ def ensure_openclaw_exec_access(container_name: str) -> None:
     if container_name not in names:
         raise RuntimeError(
             f"OpenClaw container '{container_name}' is not running. "
-            "Please run: /home/pi/NAS-Demo/oc.sh status"
+            f"Please run: {REPO_ROOT / 'oc.sh'} status"
         )
 
 
@@ -619,12 +622,12 @@ def sync_runtime_scripts() -> None:
 def sync_nas_classify_script() -> Path:
     """同步 NAS-Demo 下的唯一源文件到容器内运行位置。
 
-    /home/pi/NAS-Demo/local_voice_chat/nas_classify.py 是唯一维护源；
+    NAS-Demo/local_voice_chat/nas_classify.py 是唯一维护源；
     容器通过 /nas_share 挂载访问 /nas_share/tools/nas_classify.py（运行必需），
     每次启动时若内容有差异自动覆盖，避免两份漂移。
     """
     src = Path(__file__).resolve().parent / "nas_classify.py"
-    dst = Path("/home/pi/nas_share/tools/nas_classify.py")
+    dst = NAS_ROOT / "tools" / "nas_classify.py"
 
     if not src.exists():
         raise RuntimeError(f"nas_classify.py 源文件不存在: {src}")
@@ -643,7 +646,7 @@ def sync_nas_classify_script() -> Path:
 def sync_image_batch_script() -> Path:
     """同步滤镜批处理脚本到 /nas_share/tools，便于容器挂载可见。"""
     src = Path(__file__).resolve().parent / "image_batch.py"
-    dst = Path("/home/pi/nas_share/tools/image_batch.py")
+    dst = NAS_ROOT / "tools" / "image_batch.py"
 
     if not src.exists():
         raise RuntimeError(f"image_batch.py 源文件不存在: {src}")
@@ -755,7 +758,10 @@ def normalize_asr_text(text: str) -> str:
         text = text.replace("全部图", "全部图片")
 
     # 下载/播放语境下的轻量纠偏（避免把"测试视频"识别成"特视频/测视频"）
-    is_media_cmd = any(k in text for k in ("下载", "播放", "视频", "电影", "预告片", "纪录片"))
+    text_lower = text.lower()
+    is_media_cmd = any(k in text for k in ("下载", "播放", "视频", "电影", "预告片", "纪录片")) or any(
+        k in text_lower for k in ("download", "play", "video", "movie", "movies", "trailer", "series", "tvshow", "tv show")
+    )
     if is_media_cmd:
         text = text.replace("特视频", "测试视频")
         text = text.replace("测视频", "测试视频")
@@ -872,7 +878,7 @@ def _run_image_batch_reply(target: str, style: str, dry: bool):
         sys.executable,
         str(script),
         "--dir",
-        str(Path("/home/pi/nas_share") / target),
+        str(NAS_ROOT / target),
         "--style",
         style,
         "--recursive",
@@ -1008,47 +1014,48 @@ _PLAY_ALIASES = {
 _DOWNLOAD_MEDIA_LIBRARY = {
     "海洋": {
         "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "视频",
+        "default_folder": "Movies",
     },
     "大海": {
         "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "视频",
+        "default_folder": "Movies",
     },
     "预告片": {
         "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
-        "default_folder": "家庭影院/电影",
+        "default_folder": "Movies",
     },
     "sintel": {
         "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
-        "default_folder": "家庭影院/电影",
+        "default_folder": "Movies",
     },
     "兔子": {
         "url": "https://www.w3schools.com/html/mov_bbb.mp4",
-        "default_folder": "家庭影院/电影",
+        "default_folder": "Movies",
     },
     "bunny": {
         "url": "https://www.w3schools.com/html/mov_bbb.mp4",
-        "default_folder": "家庭影院/电影",
+        "default_folder": "Movies",
     },
     "样本": {
         "url": "https://www.w3schools.com/html/mov_bbb.mp4",
-        "default_folder": "视频",
+        "default_folder": "Movies",
     },
     "测试": {
         "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "视频",
+        "default_folder": "Movies",
     },
     "测试视频": {
         "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "视频",
+        "default_folder": "Movies",
     },
 }
 
 
 def _fast_local_download_reply(args, user_text: str):
     """命中下载指令时，直连 media_downloader API，避免走 agent 长链路。"""
-    short_dl = bool(re.search(r"(^|帮我|给我|请)下(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny)", user_text))
-    if ("下载" not in user_text) and (not short_dl):
+    user_text_lower = user_text.lower()
+    short_dl = bool(re.search(r"(^|帮我|给我|请|please\s*)(下|下载|download)\s*(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny|sample|test|trailer|ocean)", user_text, flags=re.IGNORECASE))
+    if ("下载" not in user_text) and ("download" not in user_text_lower) and (not short_dl):
         return None
     if "下载的" in user_text and not user_text.strip().startswith("下载") and "帮我下载" not in user_text:
         return None
@@ -1056,7 +1063,7 @@ def _fast_local_download_reply(args, user_text: str):
     matched = None
     matched_key = ""
     for key in sorted(_DOWNLOAD_MEDIA_LIBRARY.keys(), key=len, reverse=True):
-        if key in user_text:
+        if key in user_text or key.lower() in user_text_lower:
             matched = _DOWNLOAD_MEDIA_LIBRARY[key]
             matched_key = key
             break
@@ -1067,6 +1074,7 @@ def _fast_local_download_reply(args, user_text: str):
         "下载", "搜索", "查找", "找",
         "播放", "放一下", "放出来", "看一下", "看看", "并播放", "并且播放",
         "视频", "电影", "影片", "纪录片", "一下", "一部", "一个",
+        "please", "download", "search", "find", "play", "video", "movie", "movies", "series", "tv", "show", "trailer", "sample", "test",
     ):
         term = term.replace(w, "")
     term = term.replace("并且", "").replace("并", "")
@@ -1075,11 +1083,14 @@ def _fast_local_download_reply(args, user_text: str):
     if not matched and not term:
         return None
 
-    target_subdir = "视频"
+    compact_lower = user_text_lower.replace(" ", "")
+    target_subdir = "Movies"
     if matched:
-        target_subdir = matched.get("default_folder", "视频")
-    elif any(k in user_text for k in ("电影", "预告片", "剧集", "电视剧")):
-        target_subdir = "家庭影院/电影"
+        target_subdir = matched.get("default_folder", "Movies")
+    elif any(k in user_text for k in ("剧集", "电视剧", "连续剧")) or any(k in compact_lower for k in ("tvshows", "tvshow", "series", "episode", "episodes")):
+        target_subdir = "TV Shows"
+    elif any(k in user_text for k in ("电影", "预告片", "视频", "纪录片")) or any(k in compact_lower for k in ("movie", "movies", "film", "video", "trailer", "documentary")):
+        target_subdir = "Movies"
 
     import json as _json
     import urllib.request as _ur
@@ -1725,8 +1736,9 @@ def ask_openclaw(args, user_text):
         "直接执行给结果，回复简短中文，不超过20字，一句说完，纯文字，禁止markdown（**加粗**、-列表、#标题）。\n"
         "【执行规则】\n"
         "1.下载视频/音频：必须调用 download_media 工具，禁止编造结果。关键词（默认保存位置）："
-        "海洋/大海→海洋纪录片(视频)、预告片/sintel→Sintel预告片(电影)、兔子/bunny→Big Buck Bunny(电影)、"
-        "样本/测试→通用样本(视频)；用户给URL用url参数，说搜索影视名用query参数(yt-dlp)。\n"
+        "海洋/大海→海洋纪录片(Movies)、预告片/sintel→Sintel预告片(Movies)、兔子/bunny→Big Buck Bunny(Movies)、"
+        "样本/测试→通用样本(Movies)；用户说剧集/电视剧/series/tv show 时保存到 TV Shows，其余默认 Movies；"
+        "用户给URL用url参数，说搜索影视名用query参数(yt-dlp)。\n"
         "2.播放库中视频：先尝试Jellyfin播放；无法播放则回复'请在Jellyfin打开'并列出可播放列表，禁止直接说无法播放。\n"
         "3.操作NAS文件：必须用 nas_files 工具(list_directory/move_file/create_directory)，禁止猜测或编造路径。"
         "根目录(/nas_share)可用目录：备份、家庭相册、工作文档、手机相册、旅行。\n"
