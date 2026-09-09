@@ -78,6 +78,43 @@ detect_python() {
 PYTHON_BIN="$(detect_python)" || { echo "[install][ERROR] 找不到装有 numpy/sherpa_onnx 的 python3，请先安装依赖" >&2; exit 1; }
 VOICE_SDK_BASE="${VOICE_SDK_BASE:-$RUN_USER_HOME/voice}"
 
+# ---------------------------------------------------------------------------
+# 语音模型预检/预下载：在安装服务前保证 ASR(conformer)+TTS 模型就绪。
+# 否则 voice_bridge 会在服务启动后的首次语音触发时才现场下载
+# （大文件下载期间无法唤醒，且用户只看到 "downloading ..." 不知在干嘛）。
+# 复用 local_voice_chat 的模型准备函数：本地已就绪则秒过，缺失才下载。
+# ---------------------------------------------------------------------------
+MODEL_ASR_ROOT="${VOICE_SDK_BASE}/asr"
+MODEL_TTS_ROOT="${VOICE_SDK_BASE}/tts"
+echo "[install] 检查语音模型（ASR/TTS，缺失将自动预下载，首次视网络需数分钟）..."
+if ( cd "$SCRIPT_DIR" && PYTHONPATH="${APP_DIR}:${SCRIPT_DIR}" "$PYTHON_BIN" - "$MODEL_ASR_ROOT" "$MODEL_TTS_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+asr_root = Path(sys.argv[1])
+tts_root = Path(sys.argv[2])
+asr_root.mkdir(parents=True, exist_ok=True)
+tts_root.mkdir(parents=True, exist_ok=True)
+
+from local_voice_chat import (
+    ensure_transducer_model,
+    ensure_official_matcha_tts,
+)
+
+# 本地已存在完整模型时直接复用（幂等），仅缺失时下载解压
+files = ensure_transducer_model(asr_root, "conformer")
+print(f"[install][模型] ASR 就绪: {Path(files['encoder']).name} + {Path(files['tokens']).name}")
+
+model_dir, vocoder = ensure_official_matcha_tts(tts_root, force_download=True)
+print(f"[install][模型] TTS 就绪: {model_dir.name} + {Path(vocoder).name}")
+PY
+); then
+  echo "[install] 语音模型已就绪：$MODEL_ASR_ROOT + $MODEL_TTS_ROOT"
+else
+  echo "[install][WARN] 语音模型预下载失败（可稍后重跑本脚本补齐）；" >&2
+  echo "[install][WARN] 首次语音唤醒时可能需要现场下载，期间暂无法唤醒。" >&2
+fi
+
 escape_sed_replacement() {
   printf '%s' "$1" | sed 's/[\/&]/\\&/g'
 }
