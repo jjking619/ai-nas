@@ -170,25 +170,43 @@ bash ./oc.sh url
 - 选择语言，后面使用默认配置继续下一步即可
 - 首次进入建议建相册并上传照片，稍候 CLIP 后台任务完成即可语义搜索
 
+**若想启用语义搜索**（可选，不影响照片分类），在 Immich 中创建 API Key：
+
+1. 在 Immich：管理后台 → API Keys → 新建 API Key（选择所有权限）
+2. 把密钥写入 `~/NAS-Demo/.env` 的 `IMMICH_API_KEY` 字段
+3. 注册 immich 工具：
+   ```bash
+   cd ~/NAS-Demo
+   ./oc.sh tools-immich-setup
+   ```
+4. 验证语义搜索：`./oc.sh immich-sync-jobs`（触发 CLIP smart search 后台任务）
+
 ### 4. 首次配置 Jellyfin
 
 - 地址：`http://<IP>:8096`（首次打开为设置向导，创建本地管理员即可，与 Immich 无关）
 - 首次启动约需 10~20 秒初始化数据库，期间页面打不开属正常，稍等刷新
 - 媒体目录挂载关系：宿主 `${HOME}/nas_share/downloads` → 容器 `/media`
 
-首次向导建议步骤：
+> **媒体目录已自动建好**：`install.sh` 安装时已创建 `Movies` 与 `TV Shows` 文件夹（属主、权限一并设置），
+> 正常情况下进入向导即可直接选择 `/media/Movies`、`/media/TV Shows`，无需返回终端。
+> 若缺失（如跳过安装脚本单独部署），先执行 `./oc.sh tools-media-setup` 自动补建，再刷新向导即可。
+
+首次向导步骤：
 
 1. 选择语言，继续下一步
 2. 创建管理员账号和密码
 3. 添加媒体库：
    - 类型「电影」→ 路径填 `/media/Movies`
    - 类型「电视节目」→ 路径填 `/media/TV Shows`
-   - 若选择器里只能看到 `/media`、点不开子目录，说明宿主还没有对应文件夹，先在宿主机创建：
-     ```bash
-     mkdir -p ~/nas_share/downloads/Movies ~/nas_share/downloads/'TV Shows'
-     ```
-   - 创建后回到向导，点击文件夹列表上方的「刷新」重新浏览 `/media/Movies` 与 `/media/TV Shows` 即可选择
+   - 若选择器里只能看到 `/media`、点不开子目录，回到终端执行上面提到的 `./oc.sh tools-media-setup`，然后点击文件夹列表上方的「刷新」重新浏览即可选择
 4. 元数据语言默认即可，完成向导
+
+**向导完成后，创建一个 API 密钥**（语音说“播放 / 下载后自动播放”时，语音桥需调用 Jellyfin API 自动扫库、搜索与远程播放；不配置只影响自动播放，不影响下载与唤醒）：
+
+1. 在 Jellyfin：管理后台 → 高级 → API 密钥 → 新增 API 密钥
+2. 把生成的密钥写入 `~/NAS-Demo/.env`文件`JELLYFIN_API_KEY`中
+3. 重启语音桥使其生效：`cd ~/NAS-Demo/local_voice_chat && sudo systemctl restart voice-bridge`
+4. 验证：`journalctl -u voice-bridge | grep Jellyfin` 不再出现 `401 Unauthorized`
 
 以后 media_downloader 下载的视频放入 `~/nas_share/downloads/Movies` 或 `~/nas_share/downloads/TV Shows`，Jellyfin 会自动扫描入库。
 
@@ -224,7 +242,7 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 
 ### 6. 试试说一句话
 
-在 OpenClaw 控制台 / 网页对话助手 / 语音助手里输入（或说出唤醒词“小远同学”）：
+在 OpenClaw 控制台 / 对话助手 / 语音助手里输入（或说出唤醒词“小远同学”）：
 
 ```text
 把周末派对照片移到家庭相册
@@ -232,6 +250,11 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 帮我把手机相册的照片分类
 住房合同在哪
 ```
+
+> 想快速试「照片分类/滤镜」但没有自己的照片？
+> 仓库内置 10 张公有领域/CC0 测试照片（`assets/sample_photos/`），
+> 安装/`./oc.sh tools-photos-setup` 时会自动同步到 `家庭相册/测试样例/`，可直接对它说：
+> “帮我把家庭相册测试样例的照片分类” / “把家庭相册测试样例的照片处理成复古风格”。
 
 ---
 
@@ -263,6 +286,7 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 ./oc.sh nas-files-deploy      # 部署 NAS 文件浏览
 ./oc.sh voice-assistant-deploy  # 部署网页对话助手
 ./oc.sh tools-sync            # 同步源码 → 容器运行副本
+./oc.sh tools-photos-setup    # 同步样例照片 → 家庭相册/测试样例（幂等，可重复执行）
 ```
 
 > **唯一源码约定**：运行脚本的唯一源码在本仓库 `NAS-Demo/`（进 git）；

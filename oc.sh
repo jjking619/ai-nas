@@ -45,6 +45,7 @@ Usage:
   ./oc.sh tools-kb-setup
   ./oc.sh tools-kb-show
   ./oc.sh tools-sync         Sync NAS-Demo sources -> nas_share/tools (runtime copy)
+  ./oc.sh tools-photos-setup  Sync sample photos (assets/sample_photos) -> NAS album 家庭相册/测试样例
   ./oc.sh pair-list
   ./oc.sh pair-approve <request_id>
   ./oc.sh openclaw-app-deploy  Install OpenClaw launcher (CasaOS web app)
@@ -144,9 +145,35 @@ openclaw_base_url() {
   echo "${scheme}://${host}:24190"
 }
 
+ensure_openclaw_on_immich_network() {
+  local network_name="big-bear-immich_big_bear_immich_network"
+  if ! docker_cmd inspect openclaw >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! docker_cmd network inspect "$network_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  if docker_cmd inspect openclaw --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | tr ' ' '\n' | grep -qx "$network_name"; then
+    return 0
+  fi
+  docker_cmd network connect "$network_name" openclaw >/dev/null 2>&1 || true
+}
+
+# Immich API Key：优先宿主 .env（oc.sh 启动时已 source，用户唯一配置源），
+# 缺失时回退运行中容器注入值。这样修改 .env 后直接重跑 tools-*-setup 即可生效，
+# 无需重建 openclaw 容器。
+immich_api_key() {
+  if [[ -n "${IMMICH_API_KEY:-}" ]]; then
+    printf '%s' "$IMMICH_API_KEY"
+    return 0
+  fi
+  docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || true
+}
+
 case "${1:-}" in
   deploy)
     "$APP_DIR/deploy.sh"
+    ensure_openclaw_on_immich_network
     ;;
   reset)
     bash "$APP_DIR/install.sh" reset
@@ -231,12 +258,13 @@ case "${1:-}" in
     docker_cmd exec openclaw node dist/index.js mcp show download_media --json
     ;;
   tools-immich-setup)
-    # Read env vars from running container (set in docker-compose.yml)
+    ensure_openclaw_on_immich_network
+    # Read env vars: prefer host .env, fallback to container (set in docker-compose.yml)
     IMMICH_URL_VAL="$(docker_cmd exec openclaw printenv IMMICH_URL 2>/dev/null || echo 'http://immich-server:2283')"
-    IMMICH_KEY_VAL="$(docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || echo '')"
+    IMMICH_KEY_VAL="$(immich_api_key)"
     if [[ -z "${IMMICH_KEY_VAL}" ]]; then
-      echo "ERROR: IMMICH_API_KEY is not set in the openclaw container."
-      echo "Please set it in docker-compose.yml and run: ./oc.sh deploy"
+      echo "ERROR: IMMICH_API_KEY 未配置。"
+      echo "请在 Immich 后台创建 API Key 后，写入 $APP_DIR/.env 的 IMMICH_API_KEY，再重试本命令。"
       exit 1
     fi
     # immich-mcp requires IMMICH_BASE_URL in the form http://<host>:<port>/api
@@ -343,6 +371,38 @@ case "${1:-}" in
       echo "MCP 脚本无变更，无需重启 openclaw"
     fi
     echo "tools-sync done: $synced file(s) synced"
+    ;;
+  tools-photos-setup)
+    # 同步仓库内置样例照片到 NAS 相册，方便测试照片分类/滤镜功能。
+    # 目标：$NAS_ROOT/家庭相册/测试样例（语音指令可命中"家庭相册"路由）
+    src_dir="$APP_DIR/assets/sample_photos"
+    album_root="$NAS_ROOT/家庭相册"
+    dest_dir="$album_root/测试样例"
+    if [[ ! -d "$src_dir" ]]; then
+      echo "SKIP  sample_photos 源目录不存在: $src_dir"
+      exit 0
+    fi
+    mkdir -p "$dest_dir"
+    photos_copied=0
+    for src in "$src_dir"/*.jpg; do
+      [[ -f "$src" ]] || continue
+      name="$(basename "$src")"
+      dst="$dest_dir/$name"
+      if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+        echo "SAME  $name"
+        continue
+      fi
+      cp "$src" "$dst"
+      echo "SYNC  $name -> 家庭相册/测试样例/"
+      photos_copied=$((photos_copied + 1))
+    done
+    # 目录权限对齐宿主用户（避免容器以其它 uid 创建后无法写入）
+    if [[ "${EUID}" -eq 0 ]]; then
+      chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+    else
+      sudo chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+    fi
+    echo "tools-photos-setup done: $photos_copied photo(s) synced to 家庭相册/测试样例"
     ;;
   pair-list)
     docker_cmd exec -it openclaw node dist/index.js devices list

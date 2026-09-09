@@ -18,14 +18,10 @@ from local_voice_chat import (
     build_asr_recognizer,
     build_tts,
     check_cmd_exists,
-    collect_keyword_bins,
-    detect_wakeup,
-    detect_wakeup_any,
     ensure_sensevoice_model,
     record_audio_auto_backend,
     record_speech_until_silence,
     tts_speak,
-    wakeword_hint_from_bin,
     wav_level_dbfs,
 )
 
@@ -73,6 +69,37 @@ load_runtime_env()
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NAS_ROOT = Path(os.getenv("NAS_ROOT", str(Path.home() / "nas_share"))).expanduser()
 DEFAULT_LOG_FILE = REPO_ROOT / "logs" / "voice_bridge.log"
+DEFAULT_WAKE_WORDS = ["小远同学", "xiaoyuan"]
+
+
+def _parse_wake_words(value: str) -> list[str]:
+    parts = re.split(r"[,，;；\n]+", value or "")
+    out = []
+    seen = set()
+    for part in parts:
+        w = part.strip()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out
+
+
+def _normalize_for_wake(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", text)
+    return text
+
+
+def _detect_wakeup_open_asr(recognizer, wav_path: Path, wake_words: list[str], engine: str):
+    text = asr_transcribe(recognizer, wav_path, engine=engine)
+    norm_text = _normalize_for_wake(text)
+    for word in wake_words:
+        norm_word = _normalize_for_wake(word)
+        if norm_word and norm_word in norm_text:
+            return True, word, text
+    return False, "", text
 
 
 def _resolve_sdk_root(folder_name: str) -> Path:
@@ -91,39 +118,28 @@ def _resolve_sdk_root(folder_name: str) -> Path:
 
 
 def parse_args():
-    kws_root = _resolve_sdk_root("kws1.0.0.1_SDK_16k_10ms_enwatermark_8h")
-    asr_root = _resolve_sdk_root("asr_cpu_1.19")
-    tts_root = _resolve_sdk_root("tts_cpu_2.1")
+    asr_root = _resolve_sdk_root("asr")
+    tts_root = _resolve_sdk_root("tts")
 
     parser = argparse.ArgumentParser(
-        description="Voice bridge: KWS -> ASR -> OpenClaw -> TTS"
+        description="Voice bridge: open-asr wake -> ASR -> OpenClaw -> TTS"
     )
-    parser.add_argument("--kws-root", default=str(kws_root))
     parser.add_argument("--asr-root", default=str(asr_root))
     parser.add_argument("--tts-root", default=str(tts_root))
 
-    # Default wake word: 小远同学
     parser.add_argument(
-        "--wake-keyword-bin",
-        default=str(kws_root / "res_shuffnet_v2" / "keyword_xiaoyuantongxue.bin"),
+        "--wake-words",
+        default=os.getenv("VOICE_WAKE_WORDS", "小远同学,xiaoyuan"),
+        help="Comma-separated wake words detected via open-source ASR text matching",
     )
-    parser.add_argument(
-        "--wake-any-keyword",
-        action="store_true",
-        help="Try all built-in keyword_*.bin and wake if any one matches",
-    )
-    parser.add_argument(
-        "--wake-filler",
-        default=str(
-            kws_root
-            / "res_shuffnet_v2"
-            / "Filler"
-            / "state_filler_3000s_kladi_1179.txt"
-        ),
-    )
-    parser.add_argument("--wake-mlp", default=str(kws_root / "res_shuffnet_v2" / "mlp.bin"))
 
     parser.add_argument("--wake-duration", type=float, default=4.0)
+    parser.add_argument(
+        "--wake-min-level-dbfs",
+        type=float,
+        default=float(os.getenv("VOICE_WAKE_MIN_LEVEL_DBFS", "-45.0")),
+        help="忽略低于该音量阈值的唤醒片段，避免底噪/环境噪声持续触发 ASR",
+    )
     parser.add_argument(
         "--wake-low-level-dbfs",
         type=float,
@@ -136,8 +152,12 @@ def parse_args():
         default=6.0,
         help="低电平重试时的增益(dB)，设为0可关闭",
     )
-    parser.add_argument("--record-backend", choices=["auto", "pulse", "alsa"], default="alsa")
-    parser.add_argument("--mic-input", default="plughw:0,0")
+    parser.add_argument(
+        "--record-backend",
+        choices=["auto", "pulse", "alsa"],
+        default=os.getenv("VOICE_RECORD_BACKEND", "auto"),
+    )
+    parser.add_argument("--mic-input", default=os.getenv("VOICE_MIC_INPUT", "default"))
 
     parser.add_argument("--speech-duration", type=float, default=15.0)
     parser.add_argument("--speech-min-duration", type=float, default=1.5)
@@ -165,7 +185,7 @@ def parse_args():
 
     parser.add_argument("--jellyfin-url", default="http://127.0.0.1:8096",
                         help="Jellyfin 服务地址")
-    parser.add_argument("--jellyfin-api-key", default="",
+    parser.add_argument("--jellyfin-api-key", default=os.getenv("JELLYFIN_API_KEY", ""),
                         help="Jellyfin API Key（管理后台→控制台→API 密钥→新增密钥）")
 
     parser.add_argument(
@@ -411,10 +431,10 @@ def _html_response(handler, status: int, html: str) -> None:
 
 def _http_ui_html(trigger_port: int) -> str:
     return f"""<!DOCTYPE html>
-<html lang=\"zh-CN\">
+<html lang="zh-CN">
 <head>
-    <meta charset=\"utf-8\">
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>对话助手</title>
     <style>
         :root {{
@@ -485,15 +505,15 @@ def _http_ui_html(trigger_port: int) -> str:
     </style>
 </head>
 <body>
-    <main class=\"panel\">
-        <div class=\"hero\">
+    <main class="panel">
+        <div class="hero">
             <h1>点击后直接说话</h1>
             <p>按钮触发后会立即开始录音，不再常驻监听唤醒词。这样待机几乎不占 CPU，只在你点击时才加载识别与播报能力。</p>
         </div>
 
-        <button id=\"triggerBtn\" class=\"button\">开始一次语音指令</button>
-        <div id=\"status\" class=\"status\">待机中。点击按钮后，请立刻对麦克风说话。</div>
-        <div class=\"meta\">接口地址：/trigger · 端口：{trigger_port}</div>
+        <button id="triggerBtn" class="button">开始一次语音指令</button>
+        <div id="status" class="status">待机中。点击按钮后，请立刻对麦克风说话。</div>
+        <div class="meta">接口地址：/trigger · 端口：{trigger_port}</div>
     </main>
 
     <script>
@@ -1000,7 +1020,7 @@ def _fast_local_image_filter_reply(_args, user_text: str):
 
 
 # 口语/别名 → 库中媒体名（ASR 常把英文媒体名识别成中文口语）
-_PLAY_ALIASES = {
+PLAY_ALIASES = {
     "兔子": "Big_Buck_Bunny",
     "bunny": "Big_Buck_Bunny",
     "大兔": "Big_Buck_Bunny",
@@ -1010,8 +1030,10 @@ _PLAY_ALIASES = {
     "预告片": "Sintel",
     "sintel": "Sintel",
 }
+# Backward-compatible alias used by older references in this file.
+_PLAY_ALIASES = PLAY_ALIASES
 
-_DOWNLOAD_MEDIA_LIBRARY = {
+DOWNLOAD_MEDIA_LIBRARY = {
     "海洋": {
         "url": "https://vjs.zencdn.net/v/oceans.mp4",
         "default_folder": "Movies",
@@ -1028,16 +1050,8 @@ _DOWNLOAD_MEDIA_LIBRARY = {
         "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
         "default_folder": "Movies",
     },
-    "兔子": {
-        "url": "https://www.w3schools.com/html/mov_bbb.mp4",
-        "default_folder": "Movies",
-    },
-    "bunny": {
-        "url": "https://www.w3schools.com/html/mov_bbb.mp4",
-        "default_folder": "Movies",
-    },
     "样本": {
-        "url": "https://www.w3schools.com/html/mov_bbb.mp4",
+        "url": "https://vjs.zencdn.net/v/oceans.mp4",
         "default_folder": "Movies",
     },
     "测试": {
@@ -1049,6 +1063,8 @@ _DOWNLOAD_MEDIA_LIBRARY = {
         "default_folder": "Movies",
     },
 }
+# Backward-compatible alias used by older references in this file.
+_DOWNLOAD_MEDIA_LIBRARY = DOWNLOAD_MEDIA_LIBRARY
 
 
 def _fast_local_download_reply(args, user_text: str):
@@ -1062,9 +1078,9 @@ def _fast_local_download_reply(args, user_text: str):
 
     matched = None
     matched_key = ""
-    for key in sorted(_DOWNLOAD_MEDIA_LIBRARY.keys(), key=len, reverse=True):
+    for key in sorted(DOWNLOAD_MEDIA_LIBRARY.keys(), key=len, reverse=True):
         if key in user_text or key.lower() in user_text_lower:
-            matched = _DOWNLOAD_MEDIA_LIBRARY[key]
+            matched = DOWNLOAD_MEDIA_LIBRARY[key]
             matched_key = key
             break
 
@@ -1115,8 +1131,9 @@ def _fast_local_download_reply(args, user_text: str):
             raw = resp.read().decode("utf-8", errors="ignore")
             data = _json.loads(raw) if raw else {}
             if not (200 <= resp.status < 300) or not data.get("ok"):
+                reason = f"下载接口返回异常 status={resp.status}"
                 print(f"[DL] local download not ok status={resp.status} body={raw[:240]}")
-                return _download_failed_play_test_video(args)
+                return _download_failed_play_test_video(args, reason)
 
         files = data.get("files") if isinstance(data.get("files"), list) else []
         safe_subdir = str(data.get("safe_subdir") or target_subdir)
@@ -1127,8 +1144,14 @@ def _fast_local_download_reply(args, user_text: str):
         print(f"[DL] local download success key={matched_key or '(query)'}")
         return f"下载已完成，已保存到{safe_subdir}。"
     except Exception as e:  # noqa: BLE001
+        reason = f"外部视频源不可访问 ({e})"
         print(f"[DL] local download failed, default to test video: {e}")
-        return _download_failed_play_test_video(args)
+        try:
+            fallback = _download_failed_play_test_video(args, reason)
+            return fallback
+        except Exception as fallback_err:  # noqa: BLE001
+            print(f"[DL] fallback error: {fallback_err}")
+            return f"下载失败：{reason}，未成功写入 Movies。"
 
 
 def _open_jellyfin_in_firefox(jellyfin_url: str, item_id: str | None = None) -> bool:
@@ -1452,20 +1475,23 @@ def _fast_local_play_reply(args, user_text: str):
         return f"播放失败，请在 Jellyfin 手动播放：{item_name}"
 
 
-def _download_failed_play_test_video(args):
-    """下载失败时的默认兜底：直接播放 Jellyfin 库中已有的测试视频。
+def _download_failed_play_test_video(args, reason: str | None = None):
+    """下载失败时的默认兜底：优先尝试播放 Jellyfin 中已有的测试视频；
 
-    返回兜底回复文本；优先走播放通道，播放不可用时回退为文字提示。
+    如果库中没有测试视频，则明确说明下载失败的真实原因，而不是误报“没找到测试”。
     """
     if getattr(args, "jellyfin_api_key", None):
         try:
             play_reply = _fast_local_play_reply(args, "播放测试视频")
-            if play_reply:
+            if play_reply and "暂无视频" not in play_reply:
                 print(f"[DL] download failed, default to playing test video: {play_reply}")
                 return play_reply
         except Exception as e:  # noqa: BLE001
             print(f"[DL] play test video on download fail error: {e}")
-    return "下载暂时不可用，测试视频已存在，可在 Jellyfin 打开观看。"
+
+    if reason:
+        return f"我已经尝试下载，但目标视频源不可访问，当前没有写入 Movies 文件夹；{reason}。"
+    return "我已经尝试下载，但目标视频源不可访问，当前没有写入 Movies 文件夹。"
 
 
 def _fast_local_download_reply_with_args(args, user_text: str):
@@ -2076,13 +2102,22 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
     hdrs_get  = {"X-MediaBrowser-Token": api_key}
 
     def _req(method, path, body=None, timeout=8):
-        url  = base + path
+        url = base + path
         data = _json.dumps(body).encode() if body is not None else None
-        req  = _ur.Request(url, data=data, method=method,
-                           headers=hdrs_json if data else hdrs_get)
-        with _ur.urlopen(req, timeout=timeout) as r:
-            content = r.read()
-            return _json.loads(content) if content.strip() else {}
+        req = _ur.Request(
+            url,
+            data=data,
+            method=method,
+            headers=hdrs_json if data else hdrs_get,
+        )
+        try:
+            with _ur.urlopen(req, timeout=timeout) as r:
+                content = r.read()
+                return _json.loads(content) if content.strip() else {}
+        except _ur.HTTPError as err:
+            if getattr(err, "code", None) == 401:
+                raise PermissionError("Jellyfin API key invalid or unauthorized") from err
+            raise
 
     # 1. 动态查找"扫描媒体库"任务并触发
     try:
@@ -2098,6 +2133,9 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
         else:
             _req("POST", "/Library/Refresh")  # 旧版兜底
             print("[Jellyfin] library refresh triggered (fallback)")
+    except PermissionError:
+        print("[Jellyfin] unauthorized (401), skip auto scan/play")
+        return ""
     except Exception as e:
         print(f"[Jellyfin] scan failed: {e}")
         return ""
@@ -2147,6 +2185,9 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
                 item_name = items[0]["Name"]
                 print(f"[Jellyfin] found: {item_name} (id={item_id}) attempt={i+1}")
                 break
+        except PermissionError:
+            print("[Jellyfin] unauthorized (401), skip auto search/play")
+            return ""
         except Exception as e:
             print(f"[Jellyfin] search [{i+1}]: {e}")
 
@@ -2165,6 +2206,9 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
                     item_name = it.get("Name") or term
                     print(f"[Jellyfin] path fallback hit: {item_name} (id={item_id})")
                     break
+        except PermissionError:
+            print("[Jellyfin] unauthorized (401), skip auto path fallback")
+            return ""
         except Exception as e:
             print(f"[Jellyfin] path fallback failed: {e}")
 
@@ -2205,6 +2249,9 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
                     print(f"[Jellyfin] play sent after firefox open: session {sid}")
                     return f"正在 Jellyfin 播放：{item_name}"
         return f"已打开 Jellyfin，正在进入：{item_name}" if opened else f"请在 Jellyfin 播放：{item_name}"
+    except PermissionError:
+        print("[Jellyfin] unauthorized (401), skip auto play")
+        return ""
     except Exception as e:
         print(f"[Jellyfin] play failed: {e}")
         return f"视频已就绪，请在 Jellyfin 播放：{item_name}"
@@ -2519,12 +2566,31 @@ def _run_http_wakeword_loop(
     work_dir: Path,
     asr_root: Path,
     tts_root: Path,
-    kws_root: Path,
-    wake_keyword_bin: Path,
-    wake_filler: Path,
-    wake_mlp: Path,
-    wake_keyword_bins: list[Path],
+    wake_words: list[str],
 ) -> None:
+    keep_models = bool(getattr(args, "http_keep_models", True))
+    cache_key = (
+        args.asr_engine,
+        args.asr_language,
+        str(args.asr_model or ""),
+        str(args.hotwords_file or ""),
+        float(args.hotwords_score),
+    )
+    wake_recognizer = _HTTP_MODEL_CACHE["recognizers"].get(cache_key) if keep_models else None
+    if wake_recognizer is None:
+        asr_model_path = _resolve_asr_model_path(args, asr_root)
+        print(f"[HTTP][WAKE] building ASR recognizer (engine={args.asr_engine})...")
+        wake_recognizer = build_asr_recognizer(
+            asr_root,
+            asr_model_path,
+            args.asr_language,
+            engine=args.asr_engine,
+            hotwords_file=args.hotwords_file,
+            hotwords_score=args.hotwords_score,
+        )
+        if keep_models:
+            _HTTP_MODEL_CACHE["recognizers"][cache_key] = wake_recognizer
+
     while True:
         if trigger_lock.locked():
             time.sleep(0.2)
@@ -2547,29 +2613,30 @@ def _run_http_wakeword_loop(
             level = wav_level_dbfs(wake_wav)
             if args.verbose:
                 print(f"[HTTP][WAKE] clip level: {level:.1f} dBFS")
-
-            if args.wake_any_keyword:
-                hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
-                    kws_root,
-                    wake_wav,
-                    wake_keyword_bins,
-                    wake_filler,
-                    wake_mlp,
-                )
-            else:
-                hit, hit_keyword, _raw = detect_wakeup(
-                    kws_root,
-                    wake_wav,
-                    wake_keyword_bin,
-                    wake_filler,
-                    wake_mlp,
-                )
-                matched_bin = wake_keyword_bin
-
-            if not hit:
+            if level < args.wake_min_level_dbfs:
+                if args.verbose:
+                    print(
+                        f"[HTTP][WAKE] below wake threshold: {level:.1f} dBFS < "
+                        f"{args.wake_min_level_dbfs:.1f} dBFS, skipping ASR"
+                    )
                 continue
 
-            print(f"[HTTP][WAKE] detected: {hit_keyword or '(unknown)'} via {matched_bin.name}")
+            hit, hit_keyword, raw_text = _detect_wakeup_open_asr(
+                wake_recognizer,
+                wake_wav,
+                wake_words,
+                args.asr_engine,
+            )
+
+            if not hit:
+                if args.verbose:
+                    print(
+                        f"[HTTP][WAKE] no hit, level={level:.1f} dBFS, "
+                        f"asr={raw_text.strip() or '(empty)'!r}"
+                    )
+                continue
+
+            print(f"[HTTP][WAKE] detected: {hit_keyword or '(unknown)'} via open-asr")
             _set_bridge_state("awake")
 
             if not trigger_lock.acquire(blocking=False):
@@ -2636,7 +2703,6 @@ def _run_http_server(args) -> None:
 
     asr_root = Path(args.asr_root)
     tts_root = Path(args.tts_root)
-    kws_root = Path(args.kws_root)
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2648,13 +2714,9 @@ def _run_http_server(args) -> None:
     )
     print(f"[TURNS] file: {_TURNS_FILE}")
 
-    wake_keyword_bin = Path(args.wake_keyword_bin)
-    wake_filler = Path(args.wake_filler)
-    wake_mlp = Path(args.wake_mlp)
-    wake_keyword_bins = collect_keyword_bins(kws_root)
-
-    if args.wake_any_keyword and not wake_keyword_bins:
-        raise RuntimeError("No keyword_*.bin found under res_shuffnet_v2")
+    wake_words = _parse_wake_words(args.wake_words)
+    if not wake_words:
+        wake_words = list(DEFAULT_WAKE_WORDS)
 
     trigger_lock = threading.Lock()
     audio_lock = threading.Lock()
@@ -2776,18 +2838,13 @@ def _run_http_server(args) -> None:
                 work_dir,
                 asr_root,
                 tts_root,
-                kws_root,
-                wake_keyword_bin,
-                wake_filler,
-                wake_mlp,
-                wake_keyword_bins,
+                wake_words,
             ),
             daemon=True,
             name="http-wakeword-loop",
         )
         wake_thread.start()
-        mode_hint = "any built-in keyword" if args.wake_any_keyword else wakeword_hint_from_bin(wake_keyword_bin)
-        print(f"[HTTP][WAKE] enabled, mode={mode_hint}")
+        print(f"[HTTP][WAKE] enabled, mode=open-asr, words={', '.join(wake_words)}")
     else:
         print("[HTTP][WAKE] disabled")
 
@@ -2817,20 +2874,15 @@ def main():
     ensure_openclaw_exec_access(args.openclaw_container)
     sync_runtime_scripts()
 
-    kws_root = Path(args.kws_root)
     asr_root = Path(args.asr_root)
     tts_root = Path(args.tts_root)
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    wake_keyword_bin = Path(args.wake_keyword_bin)
-    wake_filler = Path(args.wake_filler)
-    wake_mlp = Path(args.wake_mlp)
-    wake_keyword_bins = collect_keyword_bins(kws_root)
-
-    if args.wake_any_keyword and not wake_keyword_bins:
-        raise RuntimeError("No keyword_*.bin found under res_shuffnet_v2")
+    wake_words = _parse_wake_words(args.wake_words)
+    if not wake_words:
+        wake_words = list(DEFAULT_WAKE_WORDS)
 
     if args.session_idle_rounds < 1:
         args.session_idle_rounds = 1
@@ -2860,13 +2912,7 @@ def main():
     print("[INIT] building TTS engine...")
     tts = build_tts(tts_root)
 
-    if args.wake_any_keyword:
-        print("[INIT] wake mode: any built-in keyword")
-        print("[INIT] available wake words:")
-        for kb in wake_keyword_bins:
-            print(f"  - {wakeword_hint_from_bin(kb)} ({kb.name})")
-    else:
-        print(f"[INIT] wake mode: {wakeword_hint_from_bin(wake_keyword_bin)}")
+    print(f"[INIT] wake mode: open-asr ({', '.join(wake_words)})")
 
     print(f"[INIT] OpenClaw target: container={args.openclaw_container}, session={args.openclaw_session_key}")
     print("[INIT] dialog mode: wake once, then continuous conversation")
@@ -2883,10 +2929,7 @@ def main():
         reply_wav = work_dir / "reply.wav"
 
         if not session_awake:
-            if args.wake_any_keyword:
-                print("\n[WAIT] say wake word (any built-in wake word)...")
-            else:
-                print(f"\n[WAIT] say wake word: {wakeword_hint_from_bin(wake_keyword_bin)}")
+            print(f"\n[WAIT] say wake word: {', '.join(wake_words)}")
 
             record_audio_auto_backend(
                 wake_wav,
@@ -2897,26 +2940,22 @@ def main():
             level = wav_level_dbfs(wake_wav)
             if args.verbose:
                 print(f"[MIC] wake clip level: {level:.1f} dBFS")
+            if level < args.wake_min_level_dbfs:
+                if args.verbose:
+                    print(
+                        f"[MIC] wake clip below threshold {args.wake_min_level_dbfs:.1f} dBFS, "
+                        f"skipping ASR (level={level:.1f} dBFS)"
+                    )
+                continue
             if level < -45:
                 print("[MIC] warning: volume is low, move closer or raise gain")
 
-            if args.wake_any_keyword:
-                hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
-                    kws_root,
-                    wake_wav,
-                    wake_keyword_bins,
-                    wake_filler,
-                    wake_mlp,
-                )
-            else:
-                hit, hit_keyword, _raw = detect_wakeup(
-                    kws_root,
-                    wake_wav,
-                    wake_keyword_bin,
-                    wake_filler,
-                    wake_mlp,
-                )
-                matched_bin = wake_keyword_bin
+            hit, hit_keyword, raw_text = _detect_wakeup_open_asr(
+                recognizer,
+                wake_wav,
+                wake_words,
+                args.asr_engine,
+            )
 
             # 低音量下首次未命中：做一次增益重试，降低漏唤醒
             if (not hit) and (level < args.wake_low_level_dbfs) and (args.wake_boost_db > 0):
@@ -2949,23 +2988,12 @@ def main():
                     boosted_level = wav_level_dbfs(boosted_wav)
                     if args.verbose:
                         print(f"[MIC] boosted wake clip level: {boosted_level:.1f} dBFS")
-                    if args.wake_any_keyword:
-                        hit, hit_keyword, _raw, matched_bin = detect_wakeup_any(
-                            kws_root,
-                            boosted_wav,
-                            wake_keyword_bins,
-                            wake_filler,
-                            wake_mlp,
-                        )
-                    else:
-                        hit, hit_keyword, _raw = detect_wakeup(
-                            kws_root,
-                            boosted_wav,
-                            wake_keyword_bin,
-                            wake_filler,
-                            wake_mlp,
-                        )
-                        matched_bin = wake_keyword_bin
+                    hit, hit_keyword, _raw = _detect_wakeup_open_asr(
+                        recognizer,
+                        boosted_wav,
+                        wake_words,
+                        args.asr_engine,
+                    )
                 else:
                     err = (p.stderr or p.stdout or "ffmpeg boost failed").strip()
                     print(f"[KWS] boost retry skipped: {err}")
@@ -2973,11 +3001,15 @@ def main():
                 boosted_wav.unlink(missing_ok=True)
 
             if not hit:
-                print("[KWS] no wake word detected.")
+                if args.verbose:
+                    print(
+                        f"[MIC] no hit, level={level:.1f} dBFS, "
+                        f"asr={raw_text.strip() or '(empty)'!r}"
+                    )
                 continue
 
             print(f"[KWS] wake word detected: {hit_keyword or '(unknown)'}")
-            print(f"[KWS] matched model: {matched_bin.name}")
+            print("[KWS] matched source: open-asr")
             print("[SESSION] wake accepted. Continuous dialog is active.")
             session_awake = True
             idle_rounds = 0

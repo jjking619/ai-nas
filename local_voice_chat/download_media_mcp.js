@@ -25,19 +25,9 @@ const MEDIA_LIBRARY = {
     label: "Sintel电影预告片",
     default_folder: "Movies",
   },
-  "兔子": {
-    url: "https://www.w3schools.com/html/mov_bbb.mp4",
-    label: "Big Buck Bunny动画短片",
-    default_folder: "Movies",
-  },
-  "bunny": {
-    url: "https://www.w3schools.com/html/mov_bbb.mp4",
-    label: "Big Buck Bunny动画短片",
-    default_folder: "Movies",
-  },
   // 通用样本
   "样本": {
-    url: "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4",
+    url: "https://vjs.zencdn.net/v/oceans.mp4",
     label: "通用视频样本",
     default_folder: "Movies",
   },

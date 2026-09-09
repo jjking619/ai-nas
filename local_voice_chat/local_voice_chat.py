@@ -19,6 +19,16 @@ CONFORMER_MODEL_URL = (
     "sherpa-onnx-conformer-zh-stateless2-2023-05-23.tar.bz2"
 )
 
+MATCHA_ZH_EN_TTS_URL = (
+	"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
+	"matcha-icefall-zh-en.tar.bz2"
+)
+VOCODER_16KHZ_URL = (
+	"https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/"
+	"vocos-16khz-univ.onnx"
+)
+OFFICIAL_MATCHA_DIRNAME = "matcha-icefall-zh-en"
+
 DEFAULT_HOTWORDS = [
     "家庭相册", "手机相册", "工作文档", "备份", "旅行",
     "图片", "照片", "文件夹", "文件", "视频",
@@ -43,6 +53,36 @@ def ensure_hotwords_file(path: Path = None) -> Path:
         path.write_text("\n".join(DEFAULT_HOTWORDS) + "\n", encoding="utf-8")
         print(f"[ASR] hotwords file created: {path}")
     return path
+
+
+def _parse_wake_words(value: str) -> list[str]:
+    parts = re.split(r"[,，;；\n]+", value or "")
+    out = []
+    seen = set()
+    for part in parts:
+        w = part.strip()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out
+
+
+def _normalize_for_wake(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", text)
+    return text
+
+
+def _detect_wakeup_open_asr(recognizer, wav_path: Path, wake_words: list[str], engine: str):
+    text = asr_transcribe(recognizer, wav_path, engine=engine)
+    norm_text = _normalize_for_wake(text)
+    for word in wake_words:
+        norm_word = _normalize_for_wake(word)
+        if norm_word and norm_word in norm_text:
+            return True, word, text
+    return False, "", text
 
 
 def _resolve_sdk_root(folder_name: str) -> Path:
@@ -101,23 +141,64 @@ def record_audio_with_ffmpeg(
 	if p.returncode != 0:
 		raise RuntimeError(p.stderr.strip() or p.stdout.strip() or "ffmpeg record failed")
 
+	# Some audio backends can occasionally return success but write a near-empty WAV.
+	# Reject such clips so caller fallback/retry logic can pick a healthier source.
+	try:
+		import wave
+
+		with wave.open(str(out_wav), "rb") as wf:
+			sr = wf.getframerate() or 16000
+			n_frames = wf.getnframes()
+			duration_sec = float(n_frames) / float(sr)
+
+		min_valid_sec = max(0.12, min(0.8, float(duration) * 0.2))
+		if duration_sec < min_valid_sec:
+			raise RuntimeError(
+				f"Recorded clip too short: {duration_sec:.3f}s "
+				f"(expect >= {min_valid_sec:.3f}s, backend={backend}, mic={mic_input})"
+			)
+	except RuntimeError:
+		raise
+	except Exception as e:  # noqa: BLE001
+		raise RuntimeError(
+			f"Recorded WAV validation failed (backend={backend}, mic={mic_input}): {e}"
+		)
+
+
+def _candidate_mic_inputs(mic_input: str) -> list[str]:
+	candidates = []
+	for value in [
+		mic_input,
+		"regular0",
+		"regular2",
+		"default",
+		"sysdefault",
+		"hw:1,0",
+		"plughw:1,0",
+		"hw:0,0",
+		"plughw:0,0",
+	]:
+		value = (value or "").strip()
+		if value and value not in candidates:
+			candidates.append(value)
+	return candidates
+
 
 def record_audio_auto_backend(
 	out_wav: Path, duration: float, mic_input: str, backend: str
 ) -> None:
-	if backend in ("pulse", "alsa"):
-		record_audio_with_ffmpeg(out_wav, duration, mic_input, backend)
-		return
-
-	# auto mode: try pulse first, then alsa
+	backend_candidates = ("pulse", "alsa") if backend == "auto" else (backend,)
 	last_err = None
-	for b in ("pulse", "alsa"):
-		try:
-			record_audio_with_ffmpeg(out_wav, duration, mic_input, b)
-			return
-		except Exception as e:  # noqa: BLE001
-			last_err = e
-	raise RuntimeError(f"Unable to record audio with pulse/alsa: {last_err}")
+	for b in backend_candidates:
+		for candidate_mic in _candidate_mic_inputs(mic_input):
+			try:
+				record_audio_with_ffmpeg(out_wav, duration, candidate_mic, b)
+				return
+			except Exception as e:  # noqa: BLE001
+				last_err = e
+				if candidate_mic != mic_input:
+					print(f"[MIC] fallback to onboard mic: backend={b}, mic={candidate_mic}")
+	raise RuntimeError(f"Unable to record audio with {backend}: {last_err}")
 
 
 def play_wav(wav_path: Path) -> None:
@@ -301,76 +382,6 @@ def record_speech_until_silence(
 		f.unlink(missing_ok=True)
 
 
-def wakeword_hint_from_bin(keyword_bin: Path) -> str:
-	name = keyword_bin.name
-	mapping = {
-		"keyword_xiaochuangxiaochuang.bin": "小创小创（可试：你好小创）",
-		"keyword_xiaoyanxiaoyan.bin": "小燕小燕",
-		"keyword_yunlingyunling.bin": "云铃云铃（可试：你好小云）",
-		"keyword_xiaoyuantongxue.bin": "小远同学",
-		"keyword_Amigo.bin": "Amigo",
-		"keyword_kws_demo.bin": "KWS Demo 预置词",
-	}
-	return mapping.get(name, name)
-
-
-def collect_keyword_bins(kws_root: Path):
-	res_dir = kws_root / "res_shuffnet_v2"
-	bins = sorted(res_dir.glob("keyword_*.bin"))
-	return bins
-
-
-def detect_wakeup_any(
-	kws_root: Path,
-	wav_path: Path,
-	keyword_bins,
-	filler_path: Path,
-	mlp_path: Path,
-):
-	for kb in keyword_bins:
-		hit, keyword, raw = detect_wakeup(kws_root, wav_path, kb, filler_path, mlp_path)
-		if hit:
-			return True, keyword, raw, kb
-	return False, "", "", None
-
-
-def detect_wakeup(
-	kws_root: Path,
-	wav_path: Path,
-	keyword_bin: Path,
-	filler_path: Path,
-	mlp_path: Path,
-):
-	list_file = wav_path.with_suffix(".txt")
-	list_file.write_text(str(wav_path) + "\n", encoding="utf-8")
-
-	env = os.environ.copy()
-	lib_dir = str(kws_root / "lib" / "linux_aarch64_v8")
-	env["LD_LIBRARY_PATH"] = (
-		lib_dir if not env.get("LD_LIBRARY_PATH") else lib_dir + ":" + env["LD_LIBRARY_PATH"]
-	)
-
-	cmd = [
-		str(kws_root / "bin" / "linux_aarch64_v8" / "ivw_demo"),
-		"-pcm",
-		str(list_file),
-		"-IVW_FILLER",
-		str(filler_path),
-		"-IVW_MLP",
-		str(mlp_path),
-		"-IVW_KEYWORD",
-		str(keyword_bin),
-	]
-
-	p = run_cmd(cmd, cwd=str(kws_root), env=env, input_text="\n")
-	output = (p.stdout or "") + "\n" + (p.stderr or "")
-
-	hit = "ivw wakeup reslut string" in output
-	keyword_match = re.search(r'"keyword":"([^"]+)"', output)
-	keyword = keyword_match.group(1) if keyword_match else ""
-	return hit, keyword, output
-
-
 def _download_model_archive(url: str, dest_dir: Path, archive_name: str) -> Path:
 	"""下载并解压 tar.bz2 模型包，返回解压目录。"""
 	dest_dir.mkdir(parents=True, exist_ok=True)
@@ -457,8 +468,11 @@ def ensure_transducer_model(asr_root: Path, engine: str, force_download: bool = 
 		cands = sorted(base.glob(f"*{part}*.onnx"))
 		if not cands:
 			raise RuntimeError(f"missing {part} onnx under {base}")
-		int8 = [c for c in cands if "int8" in c.name]
-		return str((int8 or cands)[0])
+		if part == "encoder":
+			int8 = [c for c in cands if "int8" in c.name]
+			return str((int8 or cands)[0])
+		non_int8 = [c for c in cands if "int8" not in c.name]
+		return str((non_int8 or cands)[0])
 
 	return {
 		"engine": engine,
@@ -554,11 +568,62 @@ def asr_transcribe(recognizer, wav_path: Path, engine: str = "sensevoice") -> st
 	return text.strip()
 
 
+def _tts_assets_ready(model_dir: Path, vocoder_path: Path) -> bool:
+	required = [
+		model_dir / "model-steps-3.onnx",
+		model_dir / "lexicon.txt",
+		model_dir / "tokens.txt",
+		model_dir / "phone-zh.fst",
+		model_dir / "date-zh.fst",
+		model_dir / "number-zh.fst",
+		model_dir / "espeak-ng-data",
+		vocoder_path,
+	]
+	return all(p.exists() for p in required)
+
+
+def ensure_official_matcha_tts(tts_root: Path, force_download: bool = True):
+	model_dir = tts_root / OFFICIAL_MATCHA_DIRNAME
+	vocoder_path = tts_root / "vocos-16khz-univ.onnx"
+
+	if _tts_assets_ready(model_dir, vocoder_path):
+		return model_dir, vocoder_path
+
+	if not force_download:
+		raise RuntimeError(f"official TTS assets missing under {tts_root}")
+
+	tts_root.mkdir(parents=True, exist_ok=True)
+	archive = tts_root / f"{OFFICIAL_MATCHA_DIRNAME}.tar.bz2"
+	print(f"[TTS] downloading official Matcha model: {archive.name}")
+	p = run_cmd(["curl", "-L", "-o", str(archive), MATCHA_ZH_EN_TTS_URL])
+	if p.returncode != 0:
+		raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"Failed to download {MATCHA_ZH_EN_TTS_URL}")
+
+	try:
+		with tarfile.open(archive, "r:bz2") as tf:
+			tf.extractall(tts_root)
+	finally:
+		archive.unlink(missing_ok=True)
+
+	if not vocoder_path.exists():
+		print("[TTS] downloading official vocoder: vocos-16khz-univ.onnx")
+		p = run_cmd(["curl", "-L", "-o", str(vocoder_path), VOCODER_16KHZ_URL])
+		if p.returncode != 0:
+			raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"Failed to download {VOCODER_16KHZ_URL}")
+
+	if not _tts_assets_ready(model_dir, vocoder_path):
+		raise RuntimeError(f"official Matcha TTS assets are incomplete under {tts_root}")
+
+	print(f"[TTS] official model ready: {model_dir}")
+	return model_dir, vocoder_path
+
+
 def build_tts(tts_root: Path):
-	model_dir = tts_root / "model"
+	model_dir, vocoder_path = ensure_official_matcha_tts(tts_root, force_download=True)
+
 	matcha = sherpa_onnx.OfflineTtsMatchaModelConfig(
 		acoustic_model=str(model_dir / "model-steps-3.onnx"),
-		vocoder=str(model_dir / "vocos-16khz-univ.onnx"),
+		vocoder=str(vocoder_path),
 		lexicon=str(model_dir / "lexicon.txt"),
 		tokens=str(model_dir / "tokens.txt"),
 		data_dir=str(model_dir / "espeak-ng-data"),
@@ -614,30 +679,17 @@ def make_reply(text: str):
 
 
 def parse_args():
-	kws_root = _resolve_sdk_root("kws1.0.0.1_SDK_16k_10ms_enwatermark_8h")
-	asr_root = _resolve_sdk_root("asr_cpu_1.19")
-	tts_root = _resolve_sdk_root("tts_cpu_2.1")
+	asr_root = _resolve_sdk_root("asr")
+	tts_root = _resolve_sdk_root("tts")
 
-	parser = argparse.ArgumentParser(description="Local voice chain: KWS -> ASR -> TTS")
-	parser.add_argument("--kws-root", default=str(kws_root))
+	parser = argparse.ArgumentParser(description="Local voice chain: open-source ASR wake -> ASR -> TTS")
 	parser.add_argument("--asr-root", default=str(asr_root))
 	parser.add_argument("--tts-root", default=str(tts_root))
-
 	parser.add_argument(
-		"--wake-keyword-bin",
-		default=str(kws_root / "res_shuffnet_v2" / "keyword_xiaochuangxiaochuang.bin"),
+		"--wake-words",
+		default=os.getenv("VOICE_WAKE_WORDS", "小远同学,xiaoyuan"),
+		help="Comma-separated wake words detected via ASR text matching",
 	)
-	parser.add_argument(
-		"--wake-any-keyword",
-		action="store_true",
-		help="Try all built-in keyword_*.bin and wake if any one matches",
-	)
-	parser.add_argument(
-		"--wake-filler",
-		default=str(kws_root / "res_shuffnet_v2" / "Filler" / "state_filler_3000s_kladi_1179.txt"),
-	)
-	parser.add_argument("--wake-mlp", default=str(kws_root / "res_shuffnet_v2" / "mlp.bin"))
-
 	parser.add_argument("--wake-duration", type=float, default=3.0)
 	parser.add_argument("--speech-duration", type=float, default=12.0, help="Max speech capture duration in seconds")
 	parser.add_argument("--speech-min-duration", type=float, default=1.5, help="Minimum speech capture duration before silence can end turn")
@@ -650,7 +702,7 @@ def parse_args():
 	parser.add_argument(
 		"--require-wake-each-turn",
 		action="store_true",
-		help="Require wake word before every dialog turn (legacy behavior)",
+		help="Require wake word before every dialog turn",
 	)
 	parser.add_argument(
 		"--session-idle-rounds",
@@ -666,7 +718,7 @@ def parse_args():
 		"--asr-engine",
 		choices=["sensevoice", "conformer"],
 		default="sensevoice",
-		help="sensevoice=不支持热词(默认)；conformer=离线大模型+热词",
+		help="sensevoice=ASR 文本唤醒(默认)；conformer=离线ASR+热词支持",
 	)
 	parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
 	parser.add_argument("--hotwords-score", type=float, default=2.5, help="热词增益分数")
@@ -684,20 +736,14 @@ def main():
 	check_cmd_exists("ffplay")
 	check_cmd_exists("curl")
 
-	kws_root = Path(args.kws_root)
 	asr_root = Path(args.asr_root)
 	tts_root = Path(args.tts_root)
+	wake_words = _parse_wake_words(args.wake_words)
+	if not wake_words:
+		raise RuntimeError("No wake words configured; set --wake-words or VOICE_WAKE_WORDS")
 
 	work_dir = Path(args.work_dir)
 	work_dir.mkdir(parents=True, exist_ok=True)
-
-	wake_keyword_bin = Path(args.wake_keyword_bin)
-	wake_filler = Path(args.wake_filler)
-	wake_mlp = Path(args.wake_mlp)
-	wake_keyword_bins = collect_keyword_bins(kws_root)
-
-	if args.wake_any_keyword and not wake_keyword_bins:
-		raise RuntimeError("No keyword_*.bin found under res_shuffnet_v2")
 
 	if args.session_idle_rounds < 1:
 		args.session_idle_rounds = 1
@@ -726,13 +772,8 @@ def main():
 	)
 	print("[INIT] building TTS engine...")
 	tts = build_tts(tts_root)
-	if args.wake_any_keyword:
-		print("[INIT] wake mode: any built-in keyword")
-		print("[INIT] available wake words:")
-		for kb in wake_keyword_bins:
-			print(f"  - {wakeword_hint_from_bin(kb)} ({kb.name})")
-	else:
-		print(f"[INIT] wake mode: single keyword -> {wakeword_hint_from_bin(wake_keyword_bin)}")
+	print("[INIT] wake mode: open-source ASR text matching")
+	print(f"[INIT] wake words: {', '.join(wake_words)}")
 	if args.require_wake_each_turn:
 		print("[INIT] dialog mode: require wake word for every turn")
 	else:
@@ -757,10 +798,7 @@ def main():
 				wake_wav = wake_input
 				print(f"\n[WAIT] using wake audio file: {wake_wav}")
 			else:
-				if args.wake_any_keyword:
-					print("\n[WAIT] say wake word (any built-in wake word)...")
-				else:
-					print(f"\n[WAIT] say wake word: {wakeword_hint_from_bin(wake_keyword_bin)}")
+				print(f"\n[WAIT] say wake word: {', '.join(wake_words)}")
 				record_audio_auto_backend(
 					wake_wav,
 					duration=args.wake_duration,
@@ -772,36 +810,16 @@ def main():
 				if level < -45:
 					print("[MIC] warning: volume is very low, please move closer or increase mic gain")
 
-			if args.wake_any_keyword:
-				hit, hit_keyword, raw, matched_bin = detect_wakeup_any(
-					kws_root,
-					wake_wav,
-					wake_keyword_bins,
-					wake_filler,
-					wake_mlp,
-				)
-			else:
-				hit, hit_keyword, raw = detect_wakeup(
-					kws_root,
-					wake_wav,
-					wake_keyword_bin,
-					wake_filler,
-					wake_mlp,
-				)
-				matched_bin = wake_keyword_bin
+			hit, hit_keyword, _raw = _detect_wakeup_open_asr(recognizer, wake_wav, wake_words, args.asr_engine)
 			if not hit:
-				print("[KWS] no wake word detected.")
-				if args.wake_any_keyword:
-					print("[KWS] tried all built-in wake words. Please retry speaking clearly.")
-				else:
-					print(f"[KWS] expected wake word: {wakeword_hint_from_bin(wake_keyword_bin)}")
+				print("[WAKE] no wake word detected.")
+				print(f"[WAKE] expected wake words: {', '.join(wake_words)}")
 				if args.wake_audio_file:
 					print("[EXIT] wake audio file mode finished")
 					break
 				continue
 
-			print(f"[KWS] wake word detected: {hit_keyword or '(unknown)'}")
-			print(f"[KWS] matched model: {matched_bin.name}")
+			print(f"[WAKE] wake word detected: {hit_keyword or '(unknown)'}")
 			session_awake = True
 			idle_rounds = 0
 			if not args.require_wake_each_turn:

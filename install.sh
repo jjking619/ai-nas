@@ -560,6 +560,7 @@ EOF
   bash "$APP_DIR/oc.sh" tools-nas-setup || warn "tools-nas-setup 失败"
   bash "$APP_DIR/oc.sh" tools-media-setup || warn "tools-media-setup 失败"
   bash "$APP_DIR/oc.sh" tools-kb-setup || warn "tools-kb-setup 失败"
+  bash "$APP_DIR/oc.sh" tools-photos-setup || warn "tools-photos-setup 失败"
 
   # Immich MCP：key 已存在（.env 或 /DATA/AppData/openclaw/.env）则由 oc.sh 注册
   sync_immich_key_to_env_if_exists

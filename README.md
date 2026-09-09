@@ -26,6 +26,7 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh tools-kb-setup     # 配置知识库搜索（kb_search MCP）
 /home/pi/NAS-Demo/oc.sh tools-kb-show       # 查看知识库搜索 MCP 配置
 /home/pi/NAS-Demo/oc.sh tools-sync          # 统一同步源码→运行副本（改完代码后执行）
+/home/pi/NAS-Demo/oc.sh tools-photos-setup  # 同步内置测试照片 → 家庭相册/测试样例（幂等）
 /home/pi/NAS-Demo/oc.sh pair-list
 /home/pi/NAS-Demo/oc.sh pair-approve <request_id>
 /home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）
@@ -525,6 +526,8 @@ cd /home/pi/NAS-Demo
 
 1. 建媒体库：类型选「电影」→ 路径 `/media/家庭影院/电影`；再建类型「电视节目」→ `/media/家庭影院/剧集`
 2. 关闭转码：管理后台 → 控制台 → 播放 → 转码 → 取消勾选「允许转码」（树莓派 CPU 弱，必须关）
+3. （推荐）创建 API 密钥：管理后台 → 控制台 → 高级 → API 密钥 → 新增，把密钥写入 `~/NAS-Demo/.env` 的 `JELLYFIN_API_KEY=...`（已有该行则替换值），再 `sudo systemctl restart voice-bridge`。
+   语音说“播放 / 下载后自动播放”时，voice-bridge 靠它调用 Jellyfin API 扫库、搜索与远程播放；不配置只跳过自动播放。
 
 常见坑（已踩过并修复）：
 

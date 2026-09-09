@@ -1,14 +1,14 @@
-# Local Voice Chat (KWS -> ASR -> TTS)
+# Local Voice Chat (open-source ASR wake -> ASR -> TTS)
 
-This directory adds a minimal local voice chain on Linux arm64 without changing your existing SDK code.
+This directory adds a minimal local voice chain on Linux arm64 without any proprietary KWS SDK.
 
 ## What it does
 
 1. Record a short wakeup clip from microphone
-2. Run KWS (`ivw_demo`) to detect wake word
+2. Run open-source ASR wake-word matching to detect configured wake words
 3. If wakeup is detected, record user speech clip
 4. Run ASR (SenseVoice via `sherpa-onnx`)
-5. Synthesize reply with MatchaTTS (existing model in `tts_cpu_2.1/model`)
+5. Synthesize reply with MatchaTTS (official model auto-download or local `tts` layout)
 6. Play reply audio
 
 By default, you only need to wake once. Then continuous dialog is active.
@@ -47,7 +47,7 @@ cd ~/NAS-Demo/local_voice_chat
 python3 voice_bridge.py
 ```
 
-Default wake word in bridge mode is 小远同学 (`keyword_xiaoyuantongxue.bin`).
+Default wake words in bridge mode are 小远同学 and xiaoyuan.
 
 Install as systemd service:
 
@@ -75,10 +75,10 @@ The sudoers rule above makes that fallback work without re-login.
 Recommended for first real-mic run:
 
 ```bash
-./run_local_voice_chat.sh --wake-any-keyword --wake-duration 4
+./run_local_voice_chat.sh --wake-words "小远同学,xiaoyuan" --wake-duration 4
 ```
 
-This will try all built-in wake words and print mic level each turn.
+This will try the configured wake words and print mic level each turn.
 After one successful wakeup, later turns do not need wake words.
 
 ## Offline file test (no microphone)
@@ -89,13 +89,13 @@ Use existing sample files to verify the full chain once:
 ./run_local_voice_chat.sh \
 	--once \
 	--no-play \
-	--wake-audio-file ${HOME}/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/audio/xiaochuang.wav \
-	--speech-audio-file ${HOME}/voice/asr_cpu_1.19/test/resources/audios/1.wav
+	--wake-audio-file /path/to/wake.wav \
+	--speech-audio-file /path/to/speech.wav
 ```
 
 ## First run note
 
-If `${HOME}/voice/asr_cpu_1.19/model/model.int8.onnx` (or `model.onnx`) is missing,
+If `${HOME}/voice/asr/model/model.int8.onnx` (or `model.onnx`) is missing,
 this script will auto-download SenseVoice int8 model from sherpa-onnx release.
 
 If you want to disable auto-download:
@@ -113,11 +113,11 @@ If you want to disable auto-download:
 # One round only, file-mode (no microphone)
 ./run_local_voice_chat.sh --once --wake-audio-file /path/to/wake.wav --speech-audio-file /path/to/speech.wav
 
-# Switch wake word model
-./run_local_voice_chat.sh --wake-keyword-bin ${HOME}/voice/kws1.0.0.1_SDK_16k_10ms_enwatermark_8h/res_shuffnet_v2/keyword_yunlingyunling.bin
+# Configure open-source wake words (bridge mode)
+python3 voice_bridge.py --wake-words "小远同学,xiaoyuan"
 
-# Try any built-in wake word model
-./run_local_voice_chat.sh --wake-any-keyword
+# Use a custom wake-word list
+./run_local_voice_chat.sh --wake-words "小远同学,xiaoyuan"
 
 # Legacy behavior: require wake word before every turn
 ./run_local_voice_chat.sh --wake-any-keyword --require-wake-each-turn
