@@ -101,21 +101,8 @@ bash install.sh
 4. 注册 4 个 MCP 工具：`nas_files`、`download_media`、`kb_search`、`immich`
 5. 输出各服务访问地址
 
-> 网页对话助手（28083）**随安装自动启用**；如需「唤醒词语音对话」（对小远同学说话），首次使用还需执行一次 `./install_voice_bridge_service.sh`，见下方[首次使用第 5 步](#5-启用语音入口必做)。
-
-非交互方式（远程/脚本）：
-
-```bash
-# 1) 前面没填 API，后面补配置
-export OPENCLAW_API_KEY='sk-xxxx'
-bash install.sh --api-key="$OPENCLAW_API_KEY"
-
-# 2) 指定提供商/模型
-bash install.sh \
-  --model-base-url=<你的BaseURL> \
-  --api-key="$OPENCLAW_API_KEY" \
-  --model-id=<你的ModelID>
-```
+> 直接编辑 `~/NAS-Demo/.env` 里的 `OPENCLAW_MODEL_BASE_URL` / `OPENCLAW_MODEL_API_KEY` / `OPENCLAW_MODEL_ID`，
+> 然后执行 `./oc.sh model-apply`，约 10 秒即可生效（自动写入配置并重启 openclaw，不影响其它服务）。
 
 常见提供商参数：
 
@@ -126,6 +113,8 @@ OpenAI:    base-url=https://api.openai.com/v1                            model-i
 ```
 
 说明：`install.sh` 可重复执行（幂等），会在保留现有服务的前提下更新模型配置。
+
+
 
 常用参数：
 
@@ -150,7 +139,6 @@ bash ./oc.sh casaos-url
 ```
 
 先在 CasaOS 应用页确认/配置其它应用（如 Immich、Jellyfin、文件浏览、网页对话助手）。
-其中「网页对话助手 / 语音」是本系统的默认入口，启用方式见下方[第 5 步](#5-启用语音入口必做)。
 
 ### 2. 打开 OpenClaw 控制台并配对
 
@@ -158,6 +146,7 @@ bash ./oc.sh casaos-url
 # 终端查看本机 IP 和完整带 token 的地址
 bash ./oc.sh url
 ```
+
 
 浏览器打开 `https://<IP>:24190/#token=<token>`，首次会提示自签证书风险 → 点“继续访问”。在页面中 **approve 设备配对**（若不方便，可终端执行  `./oc.sh pair-list` 后再 `./oc.sh pair-approve <request_id>`）。
 
@@ -172,14 +161,14 @@ bash ./oc.sh url
 
 **若想启用语义搜索**（可选，不影响照片分类），在 Immich 中创建 API Key：
 
-1. 在 Immich：管理后台 → API Keys → 新建 API Key（选择所有权限）
+1. 在 Immich：管理后台 → API Keys → 新建 API Key（赋予所有权限）
 2. 把密钥写入 `~/NAS-Demo/.env` 的 `IMMICH_API_KEY` 字段
 3. 注册 immich 工具：
    ```bash
    cd ~/NAS-Demo
    ./oc.sh tools-immich-setup
    ```
-4. 验证语义搜索：`./oc.sh immich-sync-jobs`（触发 CLIP smart search 后台任务）
+4. 验证语义搜索：`./oc.sh immich-sync-jobs`
 
 ### 4. 首次配置 Jellyfin
 
@@ -253,8 +242,12 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 
 > 想快速试「照片分类/滤镜」但没有自己的照片？
 > 仓库内置 10 张公有领域/CC0 测试照片（`assets/sample_photos/`），
-> 安装/`./oc.sh tools-photos-setup` 时会自动同步到 `家庭相册/测试样例/`，可直接对它说：
+> 安装 Immich MCP 时会自动导入到 Immich，`./oc.sh tools-photos-setup` 也会同步到 `家庭相册/测试样例/` 并补导入到 Immich，可直接对它说：
 > “帮我把家庭相册测试样例的照片分类” / “把家庭相册测试样例的照片处理成复古风格”。
+>
+> 想快速试「文档问答」但没有自己的资料？
+> 仓库内置测试住房合同（`assets/sample_docs/住房合同-示例.md`），安装时会随 `./oc.sh tools-kb-setup` 自动同步到 `~/nas_share/文档/`，可直接问：
+> “住房合同在哪” / “押金多少” / “租金多少”。
 
 ---
 
@@ -269,6 +262,7 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 ./oc.sh url                   # 打印控制台访问地址（含 token）
 ./oc.sh casaos-url            # 打印 CasaOS 首页地址（可选）
 ./oc.sh model                 # 查看当前模型配置
+./oc.sh model-apply           # 改完 .env 的模型配置后立即生效（免跑完整 install.sh）
 ./oc.sh pair-list             # 待配对设备列表
 ./oc.sh pair-approve <id>     # 批准设备配对
 ```
@@ -278,15 +272,15 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 ```bash
 ./oc.sh tools-nas-setup       # 文件操作工具（nas_files）
 ./oc.sh tools-media-setup     # 媒体下载工具（download_media）
-./oc.sh tools-kb-setup        # 知识库工具（kb_search）
-./oc.sh tools-immich-setup    # 智能相册 MCP（immich）
+./oc.sh tools-kb-setup        # 知识库工具（kb_search，并自动同步内置测试合同到 文档/）
+./oc.sh tools-immich-setup    # 智能相册 MCP（immich，配置后自动导入内置测试照片）
 ./oc.sh openclaw-app-deploy   # 补装 OpenClaw 网页入口（CasaOS 应用）
 ./oc.sh immich-apply          # 部署/修复 Immich（CasaOS 应用）
 ./oc.sh jellyfin-deploy       # 部署 Jellyfin 家庭影院
 ./oc.sh nas-files-deploy      # 部署 NAS 文件浏览
 ./oc.sh voice-assistant-deploy  # 部署网页对话助手
 ./oc.sh tools-sync            # 同步源码 → 容器运行副本
-./oc.sh tools-photos-setup    # 同步样例照片 → 家庭相册/测试样例（幂等，可重复执行）
+./oc.sh tools-photos-setup    # 同步样例照片 → 家庭相册/测试样例，并自动导入 Immich（幂等）
 ```
 
 > **唯一源码约定**：运行脚本的唯一源码在本仓库 `NAS-Demo/`（进 git）；
@@ -358,6 +352,7 @@ NAS-Demo/
 | `bash ./oc.sh casaos-url` 打不开 | 先看命令是否提示“未检测到 CasaOS Web 服务（80/443）”。若有，执行 `curl -fsSL https://get.casaos.io \| sudo bash`；若 `curl` 超时/失败，先 `sudo apt install wget -y` 再重试安装 |
 | CasaOS 页面里看不到 OpenClaw/Immich/Jellyfin，或点击应用打不开 | 运行 `./oc.sh openclaw-app-deploy`、`./oc.sh immich-apply`、`./oc.sh jellyfin-deploy` 重新注册应用入口；若提示端口占用，新脚本会自动迁移同名容器后重试 |
 | 照片分类卡死 | `immich-machine-learning` 可能退出：`sudo docker start immich-machine-learning` |
+| 改了 `.env` 的模型配置（Base URL/API Key/Model ID）不生效 | 执行 `./oc.sh model-apply`（读 .env 立即应用并重启，约 10 秒）；或重跑 `bash install.sh`（幂等，但耗时较长） |
 | 改了代码不生效 | 只改了源码没同步副本：`./oc.sh tools-sync` |
 | Immich 首次打开显示管理员注册 | 正常，表示尚未初始化；按页面创建管理员账号和密码（建议邮箱 `admin@immich.app`） |
 | 忘记 Immich 管理员密码 | 若存在初始密码文件可先 `sudo cat /DATA/AppData/immich-admin-password.txt`；若文件不存在，说明不是自动初始化路径，请在 Immich 页面按已创建账号进行重置 |

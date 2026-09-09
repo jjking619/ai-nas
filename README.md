@@ -20,14 +20,16 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh health
 /home/pi/NAS-Demo/oc.sh url
 /home/pi/NAS-Demo/oc.sh model
+/home/pi/NAS-Demo/oc.sh model-apply       # 改完 .env 的模型配置后立即生效（免跑完整 install.sh）
 /home/pi/NAS-Demo/oc.sh tools-nas-setup
 /home/pi/NAS-Demo/oc.sh tools-nas-show
 /home/pi/NAS-Demo/oc.sh tools-media-setup
 /home/pi/NAS-Demo/oc.sh tools-media-show
-/home/pi/NAS-Demo/oc.sh tools-kb-setup     # 配置知识库搜索（kb_search MCP）
+/home/pi/NAS-Demo/oc.sh tools-kb-setup     # Configure kb_search and sync built-in sample document(s) into ~/nas_share/文档
 /home/pi/NAS-Demo/oc.sh tools-kb-show       # 查看知识库搜索 MCP 配置
 /home/pi/NAS-Demo/oc.sh tools-sync          # 统一同步源码→运行副本（改完代码后执行）
-/home/pi/NAS-Demo/oc.sh tools-photos-setup  # 同步内置测试照片 → 家庭相册/测试样例（幂等）
+/home/pi/NAS-Demo/oc.sh tools-immich-setup  # Configure Immich MCP and auto-import built-in sample photos
+/home/pi/NAS-Demo/oc.sh tools-photos-setup  # Sync built-in sample photos → 家庭相册/测试样例 and auto-import into Immich (idempotent)
 /home/pi/NAS-Demo/oc.sh pair-list
 /home/pi/NAS-Demo/oc.sh pair-approve <request_id>
 /home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）

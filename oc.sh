@@ -37,6 +37,7 @@ Usage:
   ./oc.sh url
   ./oc.sh casaos-url
   ./oc.sh model
+  ./oc.sh model-apply     Apply .env model config (base URL/API key/model id) without full install
   ./oc.sh tools-nas-setup
   ./oc.sh tools-nas-show
   ./oc.sh tools-media-setup
@@ -46,7 +47,7 @@ Usage:
   ./oc.sh tools-kb-setup
   ./oc.sh tools-kb-show
   ./oc.sh tools-sync         Sync NAS-Demo sources -> nas_share/tools (runtime copy)
-  ./oc.sh tools-photos-setup  Sync sample photos (assets/sample_photos) -> NAS album 家庭相册/测试样例
+  ./oc.sh tools-photos-setup  Sync sample photos -> 家庭相册/测试样例，并自动导入 Immich
   ./oc.sh pair-list
   ./oc.sh pair-approve <request_id>
   ./oc.sh openclaw-app-deploy  Install OpenClaw launcher (CasaOS web app)
@@ -95,6 +96,111 @@ remove_containers_if_exist() {
 
 escape_sed_replacement() {
   printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+apply_model_from_env() {
+  local env_file="$APP_DIR/.env"
+  local base_url api_key model_id provider_json
+  local run data_dir cfg backup_file
+
+  if [[ ! -f "$env_file" ]]; then
+    echo "ERROR: 缺少 $env_file（请先执行 bash install.sh 完成初始化）" >&2
+    return 1
+  fi
+
+  # 显式重读 .env，避免沿用过期/未导出的环境变量
+  base_url="$(grep -E '^OPENCLAW_MODEL_BASE_URL=' "$env_file" | tail -1 | sed 's/^OPENCLAW_MODEL_BASE_URL=//' | tr -d '"' | xargs)"
+  api_key="$(grep -E '^OPENCLAW_MODEL_API_KEY=' "$env_file" | tail -1 | sed 's/^OPENCLAW_MODEL_API_KEY=//' | tr -d '"' | xargs)"
+  model_id="$(grep -E '^OPENCLAW_MODEL_ID=' "$env_file" | tail -1 | sed 's/^OPENCLAW_MODEL_ID=//' | tr -d '"' | xargs)"
+  model_id="${model_id:-deepseek-chat}"
+
+  if [[ -z "$base_url" ]]; then
+    echo "ERROR: .env 未配置 OPENCLAW_MODEL_BASE_URL" >&2
+    return 1
+  fi
+  if [[ -z "$api_key" ]]; then
+    echo "ERROR: .env 未配置 OPENCLAW_MODEL_API_KEY" >&2
+    return 1
+  fi
+  # 终端粘贴 API Key 常见污染（重复粘贴/ESC 序列混入），提前告警便于自检
+  if ! printf '%s' "$api_key" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+    echo "WARN: OPENCLAW_MODEL_API_KEY 含非常见字符（可能粘贴污染）: $api_key" >&2
+  fi
+
+  if ! docker_cmd ps --format '{{.Names}}' | grep -qx openclaw; then
+    echo "ERROR: openclaw 容器未运行，请先执行 bash install.sh 部署" >&2
+    return 1
+  fi
+
+  echo "将从 .env 应用模型配置:"
+  echo "  baseUrl = $base_url"
+  echo "  modelId = $model_id"
+  echo "  apiKey  = ${api_key:0:6}... (共 ${#api_key} 字符)"
+
+  provider_json="$(python3 - "$base_url" "$api_key" "$model_id" <<'PY'
+import json, sys
+base_url, api_key, model_id = sys.argv[1], sys.argv[2], sys.argv[3]
+payload = {
+    "baseUrl": base_url,
+    "apiKey": api_key,
+    "api": "openai-completions",
+    "models": [{
+        "id": model_id,
+        "name": model_id,
+        "input": ["text", "image"],
+        "contextWindow": 64000,
+        "maxTokens": 8192,
+    }],
+}
+print(json.dumps(payload, ensure_ascii=False))
+PY
+)"
+
+  if docker_cmd exec openclaw node dist/index.js config set models.providers.custom "$provider_json" --strict-json \
+     && docker_cmd exec openclaw node dist/index.js config set agents.defaults.model.primary "custom/${model_id}"; then
+    echo "已通过 OpenClaw config set 更新模型配置。"
+    return 0
+  fi
+
+  # config set 在旧配置残留 ${VAR} 环境引用时会被保护性拦截；回退直接编辑 openclaw.json
+  echo "WARN: config set 被拦截（通常因旧配置残留环境引用），回退直接写入 openclaw.json ..."
+  data_dir="/DATA/AppData/openclaw"
+  cfg="$data_dir/openclaw.json"
+  if [[ ! -f "$cfg" ]]; then
+    echo "ERROR: 找不到 $cfg" >&2
+    return 1
+  fi
+  backup_file="$cfg.bak-$(date +%Y%m%d%H%M%S)"
+  run=""
+  if [[ "${EUID}" -ne 0 ]]; then
+    run="sudo"
+  fi
+  $run cp "$cfg" "$backup_file"
+  $run python3 - "$cfg" "$base_url" "$api_key" "$model_id" <<'PY'
+import json, sys
+path, base_url, api_key, model_id = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+data = json.load(open(path, encoding="utf-8"))
+custom = {
+    "baseUrl": base_url,
+    "apiKey": api_key,
+    "api": "openai-completions",
+    "models": [{
+        "id": model_id,
+        "name": model_id,
+        "input": ["text", "image"],
+        "contextWindow": 64000,
+        "maxTokens": 8192,
+    }],
+}
+data.setdefault("models", {}).setdefault("providers", {})["custom"] = custom
+data.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = "custom/%s" % model_id
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, ensure_ascii=False, indent=2)
+print("openclaw.json 已更新")
+PY
+  $run chown -R 1000:1000 "$data_dir" 2>/dev/null || true
+  echo "已直接写入 openclaw.json（备份: $backup_file）"
+  return 0
 }
 
 render_template_file() {
@@ -168,7 +274,171 @@ immich_api_key() {
     printf '%s' "$IMMICH_API_KEY"
     return 0
   fi
-  docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || true
+  # 容器 env 兜底；历史部署曾写入坏值（如 "-}"），仅接受不含 '{'/'}' 的干净值
+  local raw
+  raw="$(docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || true)"
+  if [[ -n "$raw" ]] && ! printf '%s' "$raw" | grep -qE '[{}]'; then
+    printf '%s' "$raw"
+  fi
+}
+
+# Immich 服务地址：优先宿主 .env（IMMICH_URL），回退容器 env，最后用默认容器名。
+# 历史部署曾把容器 env 写成裸端口 "2283"（无协议前缀），必须校验 http(s):// 后才可用。
+immich_server_url() {
+  if [[ -n "${IMMICH_URL:-}" ]] && [[ "$IMMICH_URL" == http://* || "$IMMICH_URL" == https://* ]]; then
+    printf '%s' "$IMMICH_URL"
+    return 0
+  fi
+  local raw
+  raw="$(docker_cmd exec openclaw printenv IMMICH_URL 2>/dev/null || true)"
+  if [[ "$raw" == http://* || "$raw" == https://* ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "http://immich-server:2283"
+}
+
+# 宿主机侧访问 Immich API 统一走本机映射端口；.env 里的 IMMICH_URL 主要给容器内 MCP 使用。
+immich_host_url() {
+  printf '%s' "http://127.0.0.1:2283"
+}
+
+import_sample_photos_to_immich() {
+  local src_dir="$APP_DIR/assets/sample_photos"
+  local api_base api_key src name ts resp
+
+  IMMICH_SAMPLE_CREATED=0
+  IMMICH_SAMPLE_DUPLICATE=0
+  IMMICH_SAMPLE_FAILED=0
+
+  if [[ ! -d "$src_dir" ]]; then
+    echo "SKIP  sample_photos 源目录不存在: $src_dir"
+    return 0
+  fi
+
+  api_base="$(immich_host_url)/api"
+  api_key="$(immich_api_key)"
+
+  if [[ -z "$api_key" ]]; then
+    echo "SKIP  Immich 样例照片导入：IMMICH_API_KEY 未配置"
+    return 0
+  fi
+
+  if ! curl -fsS --max-time 5 "${api_base}/server/ping" >/dev/null 2>&1; then
+    echo "SKIP  Immich 样例照片导入：服务未就绪 ($(immich_host_url))"
+    return 0
+  fi
+
+  for src in "$src_dir"/*.jpg "$src_dir"/*.jpeg; do
+    [[ -f "$src" ]] || continue
+    name="$(basename "$src")"
+    ts="$(date -u -r "$src" '+%Y-%m-%dT%H:%M:%S.000Z' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%S.000Z')"
+    if ! resp="$(curl -fsS -X POST "${api_base}/assets" \
+      -H "x-api-key: ${api_key}" \
+      -F "assetData=@${src};type=image/jpeg" \
+      -F "fileCreatedAt=${ts}" \
+      -F "fileModifiedAt=${ts}" \
+      -F "deviceId=nas-demo-samples" \
+      -F "deviceAssetId=sample-${name}" 2>/dev/null)"; then
+      echo "WARN  Immich 导入失败: $name"
+      IMMICH_SAMPLE_FAILED=$((IMMICH_SAMPLE_FAILED + 1))
+      continue
+    fi
+
+    if printf '%s' "$resp" | grep -qE '"status"[[:space:]]*:[[:space:]]*"duplicate"'; then
+      echo "SAME  $name (Immich)"
+      IMMICH_SAMPLE_DUPLICATE=$((IMMICH_SAMPLE_DUPLICATE + 1))
+    elif printf '%s' "$resp" | grep -qE '"status"[[:space:]]*:[[:space:]]*"created"|"id"[[:space:]]*:[[:space:]]*"'; then
+      echo "IMPORTED  $name -> Immich"
+      IMMICH_SAMPLE_CREATED=$((IMMICH_SAMPLE_CREATED + 1))
+    else
+      echo "WARN  Immich 返回异常: $name"
+      IMMICH_SAMPLE_FAILED=$((IMMICH_SAMPLE_FAILED + 1))
+    fi
+  done
+
+  echo "Immich sample import: created=$IMMICH_SAMPLE_CREATED duplicate=$IMMICH_SAMPLE_DUPLICATE failed=$IMMICH_SAMPLE_FAILED"
+}
+
+sync_sample_docs() {
+  local src_dir="$APP_DIR/assets/sample_docs"
+  local doc_root="$NAS_ROOT/文档"
+  local src name dst
+
+  SAMPLE_DOCS_CHANGED=0
+  SAMPLE_DOCS_TOTAL=0
+
+  if [[ ! -d "$src_dir" ]]; then
+    echo "SKIP  sample_docs 源目录不存在: $src_dir"
+    return 0
+  fi
+
+  mkdir -p "$doc_root"
+  for src in "$src_dir"/*.md "$src_dir"/*.txt; do
+    [[ -f "$src" ]] || continue
+    SAMPLE_DOCS_TOTAL=$((SAMPLE_DOCS_TOTAL + 1))
+    name="$(basename "$src")"
+    dst="$doc_root/$name"
+    if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+      echo "SAME  $name"
+      continue
+    fi
+    cp "$src" "$dst"
+    echo "SYNC  $name -> 文档/"
+    SAMPLE_DOCS_CHANGED=$((SAMPLE_DOCS_CHANGED + 1))
+  done
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    chown -R "$(id -u):$(id -g)" "$doc_root" 2>/dev/null || true
+  else
+    sudo chown -R "$(id -u):$(id -g)" "$doc_root" 2>/dev/null || true
+  fi
+
+  echo "Sample docs sync: total=$SAMPLE_DOCS_TOTAL changed=$SAMPLE_DOCS_CHANGED"
+}
+
+trigger_immich_jobs() {
+  local api key job resp summary http_code body_file
+
+  api="$(immich_host_url)/api"
+  key="$(immich_api_key)"
+
+  if [[ -z "$key" ]]; then
+    echo "SKIP  Immich jobs：IMMICH_API_KEY 未配置"
+    return 0
+  fi
+
+  if ! curl -fsS --max-time 5 "${api}/server/ping" >/dev/null 2>&1; then
+    echo "SKIP  Immich jobs：服务未就绪 ($(immich_host_url))"
+    return 0
+  fi
+
+  body_file="$(mktemp)"
+  for job in faceDetection smartSearch; do
+    http_code="$(curl -sS -o "$body_file" -w '%{http_code}' -X PUT "${api}/jobs/${job}" \
+      -H "x-api-key: ${key}" \
+      -H "Content-Type: application/json" \
+      -d '{"command":"start","force":false}' 2>/dev/null || true)"
+    resp="$(cat "$body_file" 2>/dev/null || true)"
+
+    if [[ "$http_code" == "400" ]] && printf '%s' "$resp" | grep -q 'Job is already running'; then
+      echo "$job: already running"
+      continue
+    fi
+
+    if [[ "$http_code" != "200" ]]; then
+      echo "WARN  触发 Immich job 失败: $job"
+      continue
+    fi
+
+    summary="$(printf '%s' "$resp" | python3 -c 'import json,sys; d=json.load(sys.stdin); q=d.get("queueStatus", {}); c=d.get("jobCounts", {}); print(f"isActive={q.get('"'"'isActive'"'"')} active={c.get('"'"'active'"'"')} waiting={c.get('"'"'waiting'"'"')} failed={c.get('"'"'failed'"'"')}")' 2>/dev/null || true)"
+    if [[ -n "$summary" ]]; then
+      echo "$job: $summary"
+    else
+      echo "$job: $resp"
+    fi
+  done
+  rm -f "$body_file"
 }
 
 case "${1:-}" in
@@ -214,6 +484,11 @@ case "${1:-}" in
   model)
     docker_cmd exec -it -e TERM=xterm-256color openclaw node dist/index.js config --section model
     ;;
+  model-apply)
+    apply_model_from_env
+    docker_cmd restart openclaw
+    echo "openclaw 已重启，模型配置已生效（可执行 ./oc.sh model 核对）。"
+    ;;
   tools-nas-setup)
     # Restrict filesystem tools to NAS mount only.
     docker_cmd exec openclaw node dist/index.js mcp set nas_files '{"enabled":true,"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/nas_share"],"toolFilter":{"include":["move_file","list_directory","create_directory","search_files","get_file_info","read_file","write_file","edit_file"]}}'
@@ -247,10 +522,10 @@ case "${1:-}" in
       fi
     fi
     # 让 openclaw 能按容器名直接访问下载服务（host.docker.internal 在本机不可达）
-    if docker_cmd network inspect big-bear-immich_big_bear-immich_network >/dev/null 2>&1; then
-      if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
+    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' media_downloader'; then
-        docker_cmd network connect big-bear-immich_big_bear-immich_network media_downloader
+        docker_cmd network connect big-bear-immich_big_bear_immich_network media_downloader
       fi
     fi
 
@@ -266,7 +541,7 @@ case "${1:-}" in
   tools-immich-setup)
     ensure_openclaw_on_immich_network
     # Read env vars: prefer host .env, fallback to container (set in docker-compose.yml)
-    IMMICH_URL_VAL="$(docker_cmd exec openclaw printenv IMMICH_URL 2>/dev/null || echo 'http://immich-server:2283')"
+    IMMICH_URL_VAL="$(immich_server_url)"
     IMMICH_KEY_VAL="$(immich_api_key)"
     if [[ -z "${IMMICH_KEY_VAL}" ]]; then
       echo "ERROR: IMMICH_API_KEY 未配置。"
@@ -280,6 +555,12 @@ case "${1:-}" in
     docker_cmd restart openclaw
     echo "Immich MCP tools configured."
     echo "  IMMICH_BASE_URL: ${IMMICH_URL_VAL}/api"
+    echo "Seeding built-in sample photos into Immich..."
+    import_sample_photos_to_immich
+    if [[ "${IMMICH_SAMPLE_CREATED:-0}" -gt 0 || "${IMMICH_SAMPLE_DUPLICATE:-0}" -gt 0 ]]; then
+      echo "Triggering Immich indexing jobs..."
+      trigger_immich_jobs
+    fi
     echo "You can now ask OpenClaw: 找出所有有海的照片放入旅行相册"
     ;;
   tools-immich-show)
@@ -288,6 +569,7 @@ case "${1:-}" in
   tools-kb-setup)
     mkdir -p $NAS_ROOT/tools
     mkdir -p $NAS_ROOT/knowledge_base_data
+    sync_sample_docs
     cp "$APP_DIR/knowledge_base/kb_mcp.js" $NAS_ROOT/tools/kb_mcp.js
 
     if ! docker_cmd ps --format '{{.Names}}' | grep -qx knowledge_base; then
@@ -309,24 +591,28 @@ case "${1:-}" in
     fi
 
     # 让 openclaw 能按容器名直接访问 KB 服务（host.docker.internal 在本机不可达）
-    if docker_cmd network inspect big-bear-immich_big_bear-immich_network >/dev/null 2>&1; then
-      if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
+    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' knowledge_base'; then
-        docker_cmd network connect big-bear-immich_big_bear-immich_network knowledge_base
+        docker_cmd network connect big-bear-immich_big_bear_immich_network knowledge_base
       fi
     fi
 
-    IMMICH_URL_VAL="$(docker_cmd exec openclaw printenv IMMICH_URL 2>/dev/null || echo 'http://immich-server:2283')"
-    IMMICH_KEY_VAL="$(docker_cmd exec openclaw printenv IMMICH_API_KEY 2>/dev/null || echo '')"
+    IMMICH_URL_VAL="$(immich_server_url)"
+    IMMICH_KEY_VAL="$(immich_api_key)"
 
     docker_cmd exec openclaw node dist/index.js mcp set kb_search \
       "{\"enabled\":true,\"command\":\"node\",\"args\":[\"/nas_share/tools/kb_mcp.js\"],\"env\":{\"KB_API_URL\":\"http://knowledge_base:8084\",\"IMMICH_BASE_URL\":\"${IMMICH_URL_VAL}\",\"IMMICH_API_KEY\":\"${IMMICH_KEY_VAL}\"}}"
     docker_cmd exec openclaw node dist/index.js mcp reload
     docker_cmd restart openclaw
+    if [[ "${SAMPLE_DOCS_CHANGED:-0}" -gt 0 ]]; then
+      curl -fsS -X POST http://127.0.0.1:28084/rescan >/dev/null 2>&1 || true
+    fi
     echo "Knowledge base configured."
     echo "  KB API:   http://knowledge_base:8084"
     echo "  Indexed:  /nas_share (excludes tools/ Immich上传/)"
     echo "  Photos:   Immich CLIP (${IMMICH_URL_VAL})"
+    echo "  Sample docs: /nas_share/文档"
     ;;
   tools-kb-show)
     docker_cmd exec openclaw node dist/index.js mcp show kb_search --json
@@ -379,7 +665,7 @@ case "${1:-}" in
     echo "tools-sync done: $synced file(s) synced"
     ;;
   tools-photos-setup)
-    # 同步仓库内置样例照片到 NAS 相册，方便测试照片分类/滤镜功能。
+    # 同步仓库内置样例照片到 NAS 相册，并尽量自动导入 Immich，方便直接试照片语义能力。
     # 目标：$NAS_ROOT/家庭相册/测试样例（语音指令可命中"家庭相册"路由）
     src_dir="$APP_DIR/assets/sample_photos"
     album_root="$NAS_ROOT/家庭相册"
@@ -407,6 +693,12 @@ case "${1:-}" in
       chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
     else
       sudo chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+    fi
+    echo "Importing sample photos into Immich..."
+    import_sample_photos_to_immich
+    if [[ "${IMMICH_SAMPLE_CREATED:-0}" -gt 0 || "${IMMICH_SAMPLE_DUPLICATE:-0}" -gt 0 ]]; then
+      echo "Triggering Immich indexing jobs..."
+      trigger_immich_jobs
     fi
     echo "tools-photos-setup done: $photos_copied photo(s) synced to 家庭相册/测试样例"
     ;;
@@ -506,20 +798,8 @@ case "${1:-}" in
     casaos-cli app-management show local big-bear-immich --yaml 2>&1
     ;;
   immich-sync-jobs)
-    API="http://127.0.0.1:2283/api"
-    KEY="$(grep -o 'IMMICH_API_KEY[^,]*' "${BASH_SOURCE%/*}/docker-compose.yml" | cut -d: -f2 | tr -d ' "' | head -1 2>/dev/null || echo '')"
-    if [[ -z "${KEY}" ]]; then
-      echo "ERROR: cannot read IMMICH_API_KEY from docker-compose.yml"
-      exit 1
-    fi
-    echo "Triggering faceDetection..."
-    curl -s -X PUT "${API}/jobs/faceDetection" \
-      -H "x-api-key: ${KEY}" -H "Content-Type: application/json" \
-      -d '{"command":"start","force":false}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('faceDetection active:',d.get('queueStatus',{}).get('isActive'))"
-    echo "Triggering smartSearch (CLIP)..."
-    curl -s -X PUT "${API}/jobs/smartSearch" \
-      -H "x-api-key: ${KEY}" -H "Content-Type: application/json" \
-      -d '{"command":"start","force":false}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('smartSearch active:',d.get('queueStatus',{}).get('isActive'))"
+    echo "Triggering Immich indexing jobs..."
+    trigger_immich_jobs
     echo "Jobs triggered. New photos will be indexed shortly."
     ;;
   jellyfin-deploy)
