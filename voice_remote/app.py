@@ -405,7 +405,12 @@ def _index_html():
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *values):
-        _log(f"[voice-remote] {self.address_string()} - {fmt % values}")
+        line = fmt % values
+        # 前端页面每秒轮询 /api/status 等会产生大量 200 访问噪音且无诊断价值，
+        # 关键事件（trigger/task 结果/错误）均已单独 _log，故跳过所有成功响应。
+        if " 200 " in line:
+            return
+        _log(f"[voice-remote] {self.address_string()} - {line}")
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
