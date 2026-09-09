@@ -23,6 +23,7 @@ CHECK_ONLY=0
 RESET=0
 SKIP_FIREWALL=0
 ARG_FIREWALL_ONLY=0
+ARG_UI_FIX_ONLY=0
 
 # NAS-Demo 需要放行的 TCP 端口（INPUT 链，宿主机/局域网访问）。
 # 可用环境变量 FIREWALL_PORTS 覆盖，例如:
@@ -46,6 +47,7 @@ usage() {
   bash install.sh --check
   bash install.sh reset            # 重置 OpenClaw 配置为 bootstrap 并重启容器
   bash install.sh firewall         # 仅放行 NAS-Demo 所需端口（幂等 + 持久化）
+  bash install.sh ui-fix           # 仅修复 CasaOS Legacy 卡片显示（幂等）
 
 说明:
   - 交互模式下只会询问 OpenClaw API 相关配置
@@ -114,6 +116,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     reset) RESET=1 ;;
     firewall) RESET=0; CHECK_ONLY=0; ARG_FIREWALL_ONLY=1 ;;
+    ui-fix) RESET=0; CHECK_ONLY=0; ARG_FIREWALL_ONLY=0; ARG_UI_FIX_ONLY=1 ;;
     -h|--help|help) usage; exit 0 ;;
     *)
       echo "未知参数: $1" >&2
@@ -650,15 +653,15 @@ summary() {
 #     filebrowser 28085、对话助手 28083 等）需要显式放行才能局域网访问。
 #   - 幂等：已存在的规则自动跳过，重复执行安全。
 #   - 持久化：先备份 /etc/iptables/rules.v4 再写入，重启后仍生效。
-#   - 需要 root；本机 sudo 可免密执行 docker，因此优先用 docker+nsenter
-#     进入宿主机网络命名空间执行 iptables，避免 sudo 密码交互。
+#   - 需要 root；脚本直接调用宿主机 iptables，避免创建临时 alpine 容器
+#     造成 CasaOS Legacy 区出现随机条目。
 # =============================================================================
 _ipt_in_host() {
-  # 在宿主机 network namespace 执行 iptables（通过 privileged 容器 nsenter）
-  docker run --rm --privileged --net=host --pid=host \
-    alpine:3.20 sh -lc \
-    'apk add --no-cache iptables >/dev/null 2>&1; nsenter -t 1 -n iptables "$@"' \
-    _ "$@"
+  if [[ "${EUID}" -eq 0 ]]; then
+    iptables "$@"
+  else
+    sudo iptables "$@"
+  fi
 }
 
 _rule_exists() {
@@ -684,19 +687,139 @@ cmd_firewall() {
   done
   if [[ "$changed" -eq 1 ]]; then
     log "持久化规则到 /etc/iptables/rules.v4（先备份）..."
-    docker run --rm --privileged --net=host --pid=host \
-      -v /etc/iptables:/etc/iptables \
-      alpine:3.20 sh -lc '
-        apk add --no-cache iptables >/dev/null 2>&1
-        ts=$(date +%Y%m%d_%H%M%S)
-        cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak.${ts} 2>/dev/null || true
-        nsenter -t 1 -n iptables-save > /etc/iptables/rules.v4
-        echo "已写入 rules.v4（备份 rules.v4.bak.${ts}）"
-      ' || warn "持久化失败，规则仅当前生效；请手动执行 sudo sh -c 'iptables-save > /etc/iptables/rules.v4'"
+    local ts rules_file backup_file
+    ts="$(date +%Y%m%d_%H%M%S)"
+    rules_file="/etc/iptables/rules.v4"
+    backup_file="${rules_file}.bak.${ts}"
+    if [[ "${EUID}" -eq 0 ]]; then
+      mkdir -p /etc/iptables
+      [[ -f "$rules_file" ]] && cp "$rules_file" "$backup_file" || true
+      iptables-save > "$rules_file"
+    else
+      sudo mkdir -p /etc/iptables
+      sudo test -f "$rules_file" && sudo cp "$rules_file" "$backup_file" || true
+      sudo sh -c "iptables-save > '$rules_file'"
+    fi
+    log "已写入 rules.v4（备份 ${backup_file}）"
   else
     log "无新增规则，跳过持久化"
   fi
   log "防火墙放行完成"
+}
+
+cleanup_firewall_helper_containers() {
+  # 仅清理旧版本 install.sh 产生的临时 iptables helper 容器。
+  local ids id cmd name
+  ids="$(docker_cmd ps -a --filter ancestor=alpine:3.20 --format '{{.ID}}' 2>/dev/null || true)"
+  [[ -n "$ids" ]] || return 0
+
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    cmd="$(docker_cmd inspect "$id" --format '{{.Config.Cmd}}' 2>/dev/null || true)"
+    if [[ "$cmd" != *"nsenter -t 1 -n iptables"* ]]; then
+      continue
+    fi
+    name="$(docker_cmd inspect "$id" --format '{{.Name}}' 2>/dev/null | sed 's#^/##' || true)"
+    docker_cmd rm -f "$id" >/dev/null 2>&1 || true
+    log "已清理遗留临时容器: ${name:-$id}"
+  done <<< "$ids"
+}
+
+apply_casaos_legacy_hide_patch() {
+  # 按 README 约定：Legacy 容器条目按 title(en_us/en_US) 黑名单过滤。
+  local home_bundle tmp_file backup_file
+  local replacement
+
+  home_bundle="$(ls /var/lib/casaos/www/src_views_Home_vue.*.js 2>/dev/null | head -1 || true)"
+  if [[ -z "$home_bundle" ]]; then
+    warn "未找到 CasaOS Home 前端 bundle，跳过 Legacy 卡片过滤补丁"
+    return 0
+  fi
+
+  tmp_file="$(mktemp /tmp/casaos-home.XXXXXX.js)"
+  cp "$home_bundle" "$tmp_file"
+
+  if grep -q "nasDemoLegacyHideBlacklist" "$tmp_file"; then
+    rm -f "$tmp_file"
+    log "CasaOS Legacy 卡片过滤补丁已存在，跳过"
+    return 0
+  fi
+
+  replacement="const nasDemoLegacyHideBlacklist=['openclaw','media_downloader','knowledge_base','immich-server','immich-machine-learning','immich-postgres','immich-redis'];this.oldAppList = orgOldAppList.filter(item => { const titleObj=(item && item.title) || {}; const title=((titleObj.en_us || titleObj.en_US || '') + '').toLowerCase(); return nasDemoLegacyHideBlacklist.indexOf(title) === -1; });"
+  sed -i "0,/this.oldAppList = orgOldAppList;/s#this.oldAppList = orgOldAppList;#${replacement}#" "$tmp_file"
+
+  if ! grep -q "nasDemoLegacyHideBlacklist" "$tmp_file"; then
+    rm -f "$tmp_file"
+    warn "Legacy 卡片过滤补丁注入失败，保持原状"
+    return 0
+  fi
+
+  if cmp -s "$tmp_file" "$home_bundle"; then
+    rm -f "$tmp_file"
+    log "CasaOS Home bundle 无需变更"
+    return 0
+  fi
+
+  backup_file="${home_bundle}.nasdemo.bak"
+  if [[ "${EUID}" -eq 0 ]]; then
+    [[ -f "$backup_file" ]] || cp "$home_bundle" "$backup_file"
+    cp "$tmp_file" "$home_bundle"
+    systemctl restart casaos-gateway || warn "重启 casaos-gateway 失败，请手动执行: sudo systemctl restart casaos-gateway"
+  else
+    sudo test -f "$backup_file" || sudo cp "$home_bundle" "$backup_file"
+    sudo cp "$tmp_file" "$home_bundle"
+    sudo systemctl restart casaos-gateway || warn "重启 casaos-gateway 失败，请手动执行: sudo systemctl restart casaos-gateway"
+  fi
+  rm -f "$tmp_file"
+  log "已应用 CasaOS Legacy 卡片过滤补丁并重启网关"
+}
+
+ensure_casaos_custom_js_legacy_filter() {
+  # 更稳妥的兜底：在 custom.js 请求层过滤 appgrid 返回的 Legacy 容器卡片。
+  # 该方式不依赖 hash bundle 文件名，CasaOS 升级后仍更容易保持生效。
+  local custom_js template_js tmp_in tmp_out
+  local begin_mark end_mark
+
+  custom_js="/var/lib/casaos/www/js/custom.js"
+  template_js="$APP_DIR/casaos/casaos-legacy-hide.custom.js"
+  begin_mark="NAS_DEMO_LEGACY_HIDE_BEGIN"
+  end_mark="NAS_DEMO_LEGACY_HIDE_END"
+  tmp_in="$(mktemp /tmp/casaos-customjs.in.XXXXXX.js)"
+  tmp_out="$(mktemp /tmp/casaos-customjs.out.XXXXXX.js)"
+
+  if [[ -f "$custom_js" ]]; then
+    cat "$custom_js" > "$tmp_in"
+  else
+    printf '%s\n' "// Add your custom scripts here" > "$tmp_in"
+  fi
+
+  # 先删除旧块，确保幂等更新。
+  sed "/${begin_mark}/,/${end_mark}/d" "$tmp_in" > "$tmp_out"
+
+  if [[ -f "$template_js" ]]; then
+    cat "$template_js" >> "$tmp_out"
+  else
+    warn "未找到模板文件: $template_js，跳过 custom.js Legacy 过滤规则写入"
+    rm -f "$tmp_in" "$tmp_out"
+    return 0
+  fi
+
+  if cmp -s "$tmp_in" "$tmp_out"; then
+    rm -f "$tmp_in" "$tmp_out"
+    log "CasaOS custom.js Legacy 过滤规则已是最新"
+    return 0
+  fi
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    mkdir -p /var/lib/casaos/www/js
+    cp "$tmp_out" "$custom_js"
+  else
+    sudo mkdir -p /var/lib/casaos/www/js
+    sudo cp "$tmp_out" "$custom_js"
+  fi
+
+  rm -f "$tmp_in" "$tmp_out"
+  log "已写入 CasaOS custom.js Legacy 过滤规则"
 }
 
 # =============================================================================
@@ -744,6 +867,13 @@ bootstrap_if_needed() {
 
 main() {
   bootstrap_if_needed "$@"
+  if [[ "$ARG_UI_FIX_ONLY" -eq 1 ]]; then
+    cleanup_firewall_helper_containers || warn "清理遗留临时容器失败，可稍后手动执行 docker rm -f <container>"
+    ensure_casaos_custom_js_legacy_filter || warn "写入 CasaOS custom.js 过滤规则失败，可稍后手动处理"
+    apply_casaos_legacy_hide_patch || warn "应用 CasaOS Legacy 卡片过滤补丁失败，可稍后手动按 README 0.2.1 处理"
+    log "ui-fix 完成"
+    exit 0
+  fi
   if [[ "$RESET" -eq 1 ]]; then
     cmd_reset
     exit 0
@@ -764,6 +894,9 @@ main() {
     log "已按 --skip-firewall 跳过防火墙放行"
   fi
   deploy_all
+  cleanup_firewall_helper_containers || warn "清理遗留临时容器失败，可稍后手动执行 docker rm -f <container>"
+  ensure_casaos_custom_js_legacy_filter || warn "写入 CasaOS custom.js 过滤规则失败，可稍后手动处理"
+  apply_casaos_legacy_hide_patch || warn "应用 CasaOS Legacy 卡片过滤补丁失败，可稍后手动按 README 0.2.1 处理"
   start_pairing_auto_approve_window
   summary
 }

@@ -29,6 +29,7 @@ usage() {
   cat <<'EOF'
 Usage:
   ./oc.sh deploy
+  ./oc.sh ui-fix            Re-apply CasaOS Legacy card filtering only
   ./oc.sh reset
   ./oc.sh status
   ./oc.sh logs [N]
@@ -174,6 +175,11 @@ case "${1:-}" in
   deploy)
     "$APP_DIR/deploy.sh"
     ensure_openclaw_on_immich_network
+    # 重新部署后也自动重应用 Legacy 卡片过滤，避免 CasaOS 资源更新后回退。
+    bash "$APP_DIR/install.sh" ui-fix || true
+    ;;
+  ui-fix)
+    bash "$APP_DIR/install.sh" ui-fix
     ;;
   reset)
     bash "$APP_DIR/install.sh" reset

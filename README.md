@@ -14,6 +14,7 @@
 ```bash
 chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh deploy
+/home/pi/NAS-Demo/oc.sh ui-fix            # 仅重应用 CasaOS Legacy 卡片过滤（幂等）
 /home/pi/NAS-Demo/oc.sh status
 /home/pi/NAS-Demo/oc.sh logs
 /home/pi/NAS-Demo/oc.sh health
@@ -488,6 +489,19 @@ CasaOS 图标点击
 - 浏览器强刷：`Ctrl+F5`
 
 说明：该方案只隐藏卡片显示，不会停止或删除容器。
+
+#### 0.2.1.1 install 已自动处理（2026-09-09）
+
+`install.sh` 已内置上述修复，后续用户执行安装时会自动完成：
+
+1. 先将仓库内模板 `casaos/casaos-legacy-hide.custom.js` 同步到 `/var/lib/casaos/www/js/custom.js`（请求层过滤 appgrid，按 `title.en_us/en_US` 隐藏 `openclaw`、`media_downloader`、`knowledge_base`、`immich-*` 后台容器条目），该方式不依赖 hash bundle，升级后更稳。
+2. 同时保留 Home bundle 补丁兜底，并自动重启 `casaos-gateway`（备份：`/var/lib/casaos/www/src_views_Home_vue.*.js.nasdemo.bak`）。
+3. 防火墙步骤改为直接调用宿主机 `iptables`，不再通过临时 `alpine` 容器执行，避免再出现随机 Legacy 卡片（如 `amazing_heyrovsky` / `kind_franklin`）。
+4. 安装流程会自动清理历史遗留的临时 `alpine:3.20 + nsenter iptables` 容器。
+
+补充：`./oc.sh deploy` 现在会在部署结束后自动执行一次 `ui-fix`；若你只想单独修复卡片显示，可直接运行 `./oc.sh ui-fix`。
+
+如果卡片仍显示，通常是浏览器缓存，执行一次 `Ctrl+F5` 即可。
 
 ## 0.3 Jellyfin 家庭影院（播放下载的视频）
 
