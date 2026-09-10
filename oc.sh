@@ -67,6 +67,7 @@ Usage:
   ./oc.sh immich-sync-jobs   Trigger Immich ML jobs (faceDetection + smartSearch)
   ./oc.sh jellyfin-deploy    Start Jellyfin (jellyfin-compose.yml)
   ./oc.sh jellyfin-show      Show Jellyfin container status
+  ./oc.sh jellyfin-key-check [URL]  Verify Jellyfin API key in .env and runtime state
   ./oc.sh voice-assistant-deploy  Install Voice Assistant (CasaOS web app)
   ./oc.sh voice-assistant-show    Show Voice Assistant container status
   ./oc.sh nas-files-deploy        Install NAS file browser (read-only nas_share)
@@ -142,6 +143,114 @@ remove_containers_if_exist() {
 
 escape_sed_replacement() {
   printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+short_fingerprint() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print substr($1,1,10)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print substr($1,1,10)}'
+  else
+    printf '%s' "na"
+  fi
+}
+
+jellyfin_api_key_from_env() {
+  local env_file="$APP_DIR/.env"
+  if [[ ! -f "$env_file" ]]; then
+    printf '%s' ""
+    return 0
+  fi
+  grep -E '^JELLYFIN_API_KEY=' "$env_file" | tail -1 | sed 's/^JELLYFIN_API_KEY=//' | tr -d '"' | xargs
+}
+
+check_jellyfin_api_key() {
+  local jellyfin_url api_key code code2 body_file pid runtime_key
+  local env_fp run_fp
+
+  jellyfin_url="${2:-${JELLYFIN_URL:-http://127.0.0.1:8096}}"
+  jellyfin_url="${jellyfin_url%/}"
+  api_key="$(jellyfin_api_key_from_env)"
+
+  if [[ -z "$api_key" ]]; then
+    echo "ERROR: .env 未配置 JELLYFIN_API_KEY"
+    echo "请先在 Jellyfin 后台创建 API 密钥并写入 $APP_DIR/.env"
+    return 1
+  fi
+
+  env_fp="$(short_fingerprint "$api_key")"
+  echo "Jellyfin key source: $APP_DIR/.env"
+  echo "  key length=${#api_key}, fp=${env_fp}"
+
+  if ! curl -fsS --max-time 5 "${jellyfin_url}/System/Info/Public" >/dev/null 2>&1; then
+    echo "ERROR: Jellyfin 不可达: ${jellyfin_url}"
+    return 1
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet voice-bridge 2>/dev/null; then
+    pid="$(systemctl show -p MainPID --value voice-bridge 2>/dev/null || true)"
+    if [[ -n "$pid" && "$pid" != "0" && -r "/proc/$pid/environ" ]]; then
+      runtime_key="$(tr '\0' '\n' < "/proc/$pid/environ" | grep -E '^JELLYFIN_API_KEY=' | tail -1 | cut -d= -f2- || true)"
+      if [[ -n "$runtime_key" ]]; then
+        run_fp="$(short_fingerprint "$runtime_key")"
+        if [[ "$runtime_key" == "$api_key" ]]; then
+          echo "voice-bridge runtime key: 已加载当前 .env（fp=${run_fp}）"
+        else
+          echo "WARN: voice-bridge 仍在使用旧 key（runtime fp=${run_fp}, env fp=${env_fp}）"
+          echo "      请执行: sudo systemctl restart voice-bridge"
+        fi
+      else
+        echo "WARN: 未在 voice-bridge 进程环境中读取到 JELLYFIN_API_KEY（请确认 service 的 EnvironmentFile 配置）"
+      fi
+    fi
+  else
+    echo "WARN: voice-bridge 未运行，建议先执行: sudo systemctl start voice-bridge"
+  fi
+
+  body_file="$(mktemp)"
+  code="$(curl -sS -o "$body_file" -w '%{http_code}' -H "Authorization: MediaBrowser Token=${api_key}" "${jellyfin_url}/ScheduledTasks" || true)"
+  case "$code" in
+    200)
+      echo "OK: Jellyfin API key 校验通过（/ScheduledTasks -> 200）"
+      ;;
+    401)
+      echo "ERROR: Jellyfin API key 无效或未授权（/ScheduledTasks -> 401）"
+      rm -f "$body_file"
+      return 2
+      ;;
+    403)
+      echo "WARN: key 可用但权限不足（/ScheduledTasks -> 403），自动扫库/自动播放可能失败"
+      ;;
+    000)
+      echo "ERROR: 请求 Jellyfin 失败（网络或服务不可达）"
+      rm -f "$body_file"
+      return 1
+      ;;
+    *)
+      echo "WARN: /ScheduledTasks 返回 HTTP $code"
+      head -c 200 "$body_file" | tr '\n' ' '
+      echo
+      ;;
+  esac
+
+  code2="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: MediaBrowser Token=${api_key}" "${jellyfin_url}/Sessions" || true)"
+  if [[ "$code2" == "200" ]]; then
+    echo "OK: 会话接口可访问（/Sessions -> 200）"
+  elif [[ "$code2" == "401" ]]; then
+    echo "WARN: 会话接口未授权（/Sessions -> 401），远程播放可能不可用"
+  else
+    echo "INFO: /Sessions -> HTTP $code2"
+  fi
+
+  if command -v journalctl >/dev/null 2>&1 && systemctl is-active --quiet voice-bridge 2>/dev/null; then
+    if journalctl -u voice-bridge -n 200 --no-pager 2>/dev/null | grep -Eqi 'Jellyfin.*(401|unauthorized)|401 Unauthorized'; then
+      echo "WARN: 最近日志出现 Jellyfin 401/unauthorized，建议重启 voice-bridge 后复测"
+    else
+      echo "OK: 最近 200 行 voice-bridge 日志未发现 Jellyfin 401"
+    fi
+  fi
+
+  rm -f "$body_file"
 }
 
 apply_model_from_env() {
@@ -655,7 +764,7 @@ case "${1:-}" in
       echo "Triggering Immich indexing jobs..."
       trigger_immich_jobs
     fi
-    echo "You can now ask OpenClaw: 找出所有有海的照片放入旅行相册"
+    echo "Completed: Immich Finished"
     ;;
   tools-immich-show)
     docker_cmd exec openclaw node dist/index.js mcp show immich --json
@@ -935,6 +1044,9 @@ case "${1:-}" in
     ;;
   jellyfin-show)
     docker_cmd ps -a --filter name=jellyfin --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    ;;
+  jellyfin-key-check)
+    check_jellyfin_api_key "${2:-}"
     ;;
   voice-assistant-deploy)
     VOICE_COMPOSE="${APP_DIR}/voice-assistant-compose.yml"
