@@ -24,6 +24,14 @@ fi
 
 OPENCLAW_IMAGE="openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b"
 
+# 网络：compose 模式下由 docker-compose.yml 声明；plain docker run 兜底时需手动挂载，
+# 否则 openclaw 无法按容器名访问 media_downloader / knowledge_base / immich（MCP 工具全废）。
+NAS_NET="${NAS_NET:-nas-demo_nas-net}"
+IMMICH_NET="${IMMICH_NET:-big-bear-immich_big_bear_immich_network}"
+
+# 内存上限：与 docker-compose.yml 的 mem_limit 保持一致（docker run 不会读取 compose 配置）
+OPENCLAW_MEM_LIMIT="${OPENCLAW_MEM_LIMIT:-1024m}"
+
 OPENCLAW_MODEL_ID="${OPENCLAW_MODEL_ID:-deepseek-chat}"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-casaos}"
 export OPENCLAW_MODEL_ID OPENCLAW_GATEWAY_TOKEN
@@ -103,11 +111,19 @@ elif [[ "$HAS_DOCKER_COMPOSE_LEGACY" == "true" ]]; then
   "${SUDO_CMD[@]}" docker-compose -f "$COMPOSE_FILE" up -d
 else
   echo "Compose command not found, fallback to plain docker run"
+
+  # 1) 确保主网络存在（与 docker-compose.yml 的 nas-net 等价）
+  if ! "${DOCKER_CMD[@]}" network inspect "$NAS_NET" >/dev/null 2>&1; then
+    "${DOCKER_CMD[@]}" network create "$NAS_NET" >/dev/null 2>&1 || true
+  fi
+
   "${DOCKER_CMD[@]}" run -d \
     --name openclaw \
     --restart unless-stopped \
     --init \
     --platform linux/arm64 \
+    --network "$NAS_NET" \
+    --memory "$OPENCLAW_MEM_LIMIT" \
     --add-host host.docker.internal:host-gateway \
     -e HOME=/home/node \
     -e OPENCLAW_HOME=/home/node \
@@ -125,6 +141,15 @@ else
     -v "$NAS_ROOT":/nas_share \
     "$OPENCLAW_IMAGE" \
     /bin/bash -lc 'node dist/index.js gateway --bind lan --allow-unconfigured --port 18789'
+
+  # 2) 追加加入 Immich 网络（docker run 不支持多 --network，需事后 connect）
+  if "${DOCKER_CMD[@]}" network inspect "$IMMICH_NET" >/dev/null 2>&1; then
+    if ! "${DOCKER_CMD[@]}" inspect openclaw --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | tr ' ' '\n' | grep -qx "$IMMICH_NET"; then
+      "${DOCKER_CMD[@]}" network connect "$IMMICH_NET" openclaw >/dev/null 2>&1 \
+        && echo "Connected openclaw to $IMMICH_NET" \
+        || echo "WARN: 无法将 openclaw 接入 $IMMICH_NET（Immich/知识库访问可能受限）"
+    fi
+  fi
 fi
 
 echo "Done. Check status with: sudo docker ps | grep -i openclaw"

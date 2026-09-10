@@ -75,6 +75,18 @@ ${HOME}/nas_share  downloads/Movies,TV Shows  Immich (:2283)
 
 > 整个安装只需要你提供 **OpenClaw 的模型 API**（Base URL + API Key），其余全自动。
 
+### 前置要求
+
+安装脚本会用到 `sudo`（创建数据目录、改属主、放行端口、装 systemd 服务）。请先确认：
+
+| 项目 | 要求 | 说明 |
+|------|------|------|
+| 权限 | 当前用户在 `sudo` 组 | 脚本会调用 `sudo mkdir/chown/systemctl/iptables`，过程中会提示输密码 |
+| 网络 | 可访问容器镜像仓库 | 若机器已装过，镜像可复用，无需重下 |
+| 依赖 | `curl` `openssl` `python3` `docker` | 缺失时脚本会提示安装命令 |
+
+> 内存/磁盘不足时脚本会**主动告警或中止**（见 `check_resources()`），避免装到一半 OOM 或写满。
+
 ### 执行
 
 ```bash

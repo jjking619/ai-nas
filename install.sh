@@ -296,6 +296,74 @@ mask_key() {
   fi
 }
 
+# =============================================================================
+# 资源前置检查
+#
+# 背景：NAS-Demo 全家桶常驻内存约 3GB（实测 immich-server 首次启动导入 geodata
+# 时峰值近 1GB，openclaw 约 650MB，immich-machine-learning 约 430MB），
+# 首次安装镜像约 10GB。内存/磁盘不足时若不在开始时提示，往往装到一半才 OOM
+# 或写满，排查成本高。
+#
+# 环境变量 NAS_SKIP_RESOURCE_CHECK=1 可跳过本检查（自动化/受控环境用）。
+# =============================================================================
+_meminfo_kb() {
+  local key="$1" default="${2:-0}" v
+  v="$(awk -v k="$key" '$1==k{print $2; exit}' /proc/meminfo 2>/dev/null)"
+  [[ "$v" =~ ^[0-9]+$ ]] || v="$default"
+  echo "$v"
+}
+
+check_resources() {
+  if [[ "${NAS_SKIP_RESOURCE_CHECK:-0}" == "1" ]]; then
+    warn "已跳过资源检查（NAS_SKIP_RESOURCE_CHECK=1）"
+    return 0
+  fi
+
+  local mem_total_mb mem_avail_mb swap_total_mb swap_free_mb
+  local disk_avail_gb docker_root
+  mem_total_mb=$(( $(_meminfo_kb MemTotal:) / 1024 ))
+  mem_avail_mb=$(( $(_meminfo_kb MemAvailable: "$(_meminfo_kb MemFree:)") / 1024 ))
+  swap_total_mb=$(( $(_meminfo_kb SwapTotal:) / 1024 ))
+  swap_free_mb=$(( $(_meminfo_kb SwapFree:) / 1024 ))
+
+  docker_root="$(docker_cmd info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+  disk_avail_gb="$(df -Pk "$docker_root" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}')"
+  [[ "$disk_avail_gb" =~ ^[0-9]+$ ]] || disk_avail_gb=0
+
+  log "资源检查：总内存 ${mem_total_mb}MB / 可用 ${mem_avail_mb}MB / Swap 可用 ${swap_free_mb}MB；Docker 所在盘剩余 ${disk_avail_gb}GB"
+
+  # ── 磁盘：镜像约 10GB，加数据/日志留余量 ──
+  if [[ "$disk_avail_gb" -lt 8 ]]; then
+    die "磁盘空间不足：Docker 目录（$docker_root）仅剩 ${disk_avail_gb}GB，至少需要 8GB。可先执行: docker system prune -af"
+  elif [[ "$disk_avail_gb" -lt 15 ]]; then
+    warn "磁盘偏紧：仅剩 ${disk_avail_gb}GB（推荐 ≥15GB）。可执行 docker system prune -af 回收未使用镜像后重试"
+  fi
+
+  # ── 内存：全家桶峰值约 2.5~3GB ──
+  if [[ "$mem_total_mb" -lt 4096 ]]; then
+    warn "总内存仅 ${mem_total_mb}MB（推荐 ≥4GB）。Immich 机器学习可能被 OOM Killer 终止，"
+    warn "  表现：照片分类卡死 / 语义搜索无结果。若出现可执行: sudo docker start immich-machine-learning"
+  fi
+
+  if [[ "$mem_avail_mb" -lt 1200 ]]; then
+    if [[ "$swap_free_mb" -ge 2048 ]]; then
+      warn "可用内存仅 ${mem_avail_mb}MB，将依赖 Swap（可用 ${swap_free_mb}MB），首次安装会明显变慢"
+    else
+      die "可用内存不足：仅 ${mem_avail_mb}MB，且 Swap 可用不足 2GB。请先释放内存或扩容 Swap 后重试；确需继续可执行: NAS_SKIP_RESOURCE_CHECK=1 bash install.sh"
+    fi
+  elif [[ "$mem_avail_mb" -lt 2000 ]]; then
+    warn "可用内存偏低（${mem_avail_mb}MB），安装期间请避免其它重负载任务"
+  fi
+
+  # ── 交换空间：内存受限设备的兜底，缺失时明确提示 ──
+  if [[ "$swap_total_mb" -eq 0 && "$mem_total_mb" -lt 8192 ]]; then
+    warn "未启用 Swap 且总内存 <8GB，建议配置 2~4GB Swap 以降低 OOM 风险："
+    warn "  sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile"
+  fi
+
+  log "资源检查通过"
+}
+
 check_env() {
   log "环境检查中..."
   require_cmd bash
@@ -303,6 +371,7 @@ check_env() {
   require_cmd openssl
   require_cmd python3
   ensure_docker_via_casaos
+  check_resources
   ensure_casaos_web_if_missing
   if ! docker_cmd ps >/dev/null 2>&1; then
     die "docker 无法访问，请确认当前用户有 sudo docker 权限"

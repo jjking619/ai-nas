@@ -34,17 +34,30 @@ fi
 
 env_ensure() {
   local key="$1" value="$2"
-  local cur=""
-  if grep -qE "^[[:space:]]*${key}=" "$APP_DIR/.env" 2>/dev/null; then
-    cur="$(grep -E "^[[:space:]]*${key}=" "$APP_DIR/.env" | tail -1 | cut -d= -f2-)"
-    # 用户显式配置过（非默认占位值）则尊重用户，不覆盖
-    if [[ -n "$cur" && "$cur" != "auto" && "$cur" != "default" ]]; then
-      return 0
-    fi
-    sed -i "s#^[[:space:]]*${key}=.*#${key}=${value}#" "$APP_DIR/.env"
+  local cur new_line
+
+  # 取最后一次出现的生效值（与 shell source 语义一致：后者覆盖前者）
+  cur="$(grep -E "^[[:space:]]*${key}=" "$APP_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+
+  # 用户已显式配置过（非默认占位值）则尊重用户，仅做去重不改值
+  if [[ -n "$cur" && "$cur" != "auto" && "$cur" != "default" ]]; then
+    new_line="${key}=${cur}"
   else
-    printf '%s=%s\n' "$key" "$value" >> "$APP_DIR/.env"
+    new_line="${key}=${value}"
   fi
+
+  # 原地替换「首个占位」（含注释形式），并丢弃其余重复项；
+  # 全部不存在时追加到末尾。这样避免反复追加造成同名键重复。
+  awk -v k="$key" -v nl="$new_line" '
+    {
+      if ($0 ~ "^[[:space:]]*" k "=" || $0 ~ "^[[:space:]]*#[[:space:]]*" k "=") {
+        if (!done) { print nl; done = 1 }
+        next
+      }
+      print
+    }
+    END { if (!done) print nl }
+  ' "$APP_DIR/.env" > "$APP_DIR/.env.tmp" && mv "$APP_DIR/.env.tmp" "$APP_DIR/.env"
 }
 # 仅当未配置或仍为默认占位时写入 USB 直连配置
 env_ensure VOICE_RECORD_BACKEND "alsa"

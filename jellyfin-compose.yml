@@ -4,6 +4,8 @@ services:
     image: jellyfin/jellyfin:12.0@sha256:baba630419915985442f315f08b0cf46d9f4c8a0cc4bd38e94a6d35751dd5ef5
     container_name: jellyfin
     restart: unless-stopped
+    # 与 docker-compose.yml 保持一致（CasaOS 应用模式走本文件，否则限制不生效）
+    mem_limit: 512m
     environment:
       TZ: Asia/Shanghai
     volumes:
