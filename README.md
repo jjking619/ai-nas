@@ -34,7 +34,7 @@ chmod +x /home/pi/NAS-Demo/oc.sh
 /home/pi/NAS-Demo/oc.sh pair-approve <request_id>
 /home/pi/NAS-Demo/oc.sh jellyfin-deploy   # 部署 Jellyfin（家庭影院播放）
 /home/pi/NAS-Demo/oc.sh jellyfin-show     # 查看 Jellyfin 容器状态
-/home/pi/NAS-Demo/oc.sh nas-files-deploy   # 部署 NAS 文件浏览（只读 nas_share）
+/home/pi/NAS-Demo/oc.sh nas-files-deploy   # 部署 NAS Files（只读 nas_share）
 /home/pi/NAS-Demo/oc.sh nas-files-show     # 查看文件浏览容器状态
 ```
 
@@ -553,9 +553,9 @@ cd /home/pi/NAS-Demo
 2. `Error: 404 Not Found - compose app 'jellyfin' not found`
    → 首次部署要用 `install` 而不是 `apply`（`apply` 只对已安装的 app 生效）。
 
-## 0.4 NAS 文件浏览（FileBrowser）
+## 0.4 NAS Files（FileBrowser）
 
-目标：在 CasaOS 加一个「NAS 文件」磁贴，点击直接进入 `/home/pi/nas_share` 的文件浏览器，
+目标：在 CasaOS 加一个「NAS Files」磁贴，点击直接进入 `/home/pi/nas_share` 的文件浏览器，
 方便查看、上传、重命名和删除（照片分类、媒体下载等）。
 
 实现文件（最小改动）：
@@ -702,6 +702,12 @@ python3 voice_bridge.py --openclaw-dry-run
 
 ### 6.2 开机自启（systemd）
 
+> `install.sh` 会在安装流程末尾自动完成本节：检查依赖（`numpy` / `sherpa_onnx`）、预下载 ASR/TTS 模型、写入并启动服务。
+> 幂等：服务已在运行则跳过；非交互环境且无免密 sudo 时安全跳过并提示手动命令。
+> 跳过自动安装：`bash install.sh --skip-voice`（或 `SKIP_VOICE_BRIDGE=1`）。
+
+手动安装 / 重装：
+
 ```bash
 cd /home/pi/NAS-Demo/local_voice_chat
 chmod +x install_voice_bridge_service.sh
@@ -780,9 +786,9 @@ sudo ss -lntp | grep -E "24190|18790|18789"
 curl -k -I --max-time 5 https://127.0.0.1:24190/healthz
 ```
 
-### 6.5 网页端对话助手（CasaOS App，端口 28083）
+### 6.5 Voice Assistant（CasaOS App，端口 28083）
 
-目标：在 CasaOS 加一个「对话助手」磁贴，网页端通过按钮/文本触发语音桥（`voice_bridge`），并实时显示唤醒对话状态。
+目标：在 CasaOS 加一个「Voice Assistant」磁贴，网页端通过按钮/文本触发语音桥（`voice_bridge`），并实时显示唤醒对话状态。
 
 实现文件（最小改动）：
 - [voice-assistant-compose.yml](voice-assistant-compose.yml) — CasaOS 应用定义
