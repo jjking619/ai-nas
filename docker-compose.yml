@@ -44,6 +44,12 @@ services:
     volumes:
       - /DATA/AppData/openclaw:/home/node/.openclaw
       - ${NAS_ROOT:-/home/pi/nas_share}:/nas_share
+      - ./logs:/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ── 媒体下载器 ───────────────────────────────────────────────────────────
   media_downloader:
@@ -59,10 +65,19 @@ services:
       YTDLP_TIMEOUT_SEC: 1800
       TTS_WEBHOOK_URL: ""
       DOWNLOAD_TTS_TEXT: 下载已完成
+      LOG_FILE: /logs/media_downloader.log
+      LOG_MAX_BYTES: "5242880"
+      LOG_BACKUPS: "3"
     volumes:
       - ${NAS_ROOT:-/home/pi/nas_share}/downloads:/downloads
+      - ./logs:/logs
     ports:
       - "28081:8081"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ── 知识库 ───────────────────────────────────────────────────────────────
   knowledge_base:
@@ -76,11 +91,20 @@ services:
       NAS_ROOT: /nas_share
       PORT: 8084
       SCAN_INTERVAL: 60
+      LOG_FILE: /logs/knowledge_base.log
+      LOG_MAX_BYTES: "5242880"
+      LOG_BACKUPS: "3"
     volumes:
       - ${NAS_ROOT:-/home/pi/nas_share}:/nas_share:ro
       - ${NAS_ROOT:-/home/pi/nas_share}/knowledge_base_data:/data
+      - ./logs:/logs
     ports:
       - "28084:8084"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ── Immich 智能相册（数据库/Redis/服务/机器学习）────────────────────────
   immich-postgres:
@@ -95,6 +119,11 @@ services:
       POSTGRES_DB: immich
     volumes:
       - /DATA/AppData/big-bear-immich/pgdata:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   immich-redis:
     container_name: immich-redis
@@ -102,6 +131,11 @@ services:
     restart: always
     networks:
       - nas-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   immich-server:
     container_name: immich-server
@@ -130,6 +164,11 @@ services:
       - ${NAS_ROOT:-/home/pi/nas_share}:/nas_share
     ports:
       - "2283:2283"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   immich-machine-learning:
     container_name: immich-machine-learning
@@ -149,6 +188,11 @@ services:
       MACHINE_LEARNING_MODEL_TTL: "0"
     volumes:
       - /DATA/AppData/big-bear-immich/model-cache:/cache
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   # ── Jellyfin 家庭影院 ────────────────────────────────────────────────────
   jellyfin:
@@ -166,6 +210,11 @@ services:
       - ${NAS_ROOT:-/home/pi/nas_share}/downloads:/media:ro
     ports:
       - "8096:8096"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
 networks:
   nas-net:

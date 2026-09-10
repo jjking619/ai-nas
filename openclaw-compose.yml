@@ -23,6 +23,11 @@ services:
         target: 28086
         published: "28086"
         protocol: tcp
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
     x-casaos:
       ports:
         - container: "28086"

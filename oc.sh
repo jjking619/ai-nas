@@ -22,9 +22,18 @@ export NAS_ROOT
 docker_cmd() {
   if [[ "${EUID}" -eq 0 ]]; then
     docker "$@"
+    return
+  fi
+  if docker info >/dev/null 2>&1; then
+    docker "$@"
   else
     sudo docker "$@"
   fi
+}
+
+ensure_repo_logs_dir_writable() {
+  mkdir -p "$APP_DIR/logs"
+  chmod 777 "$APP_DIR/logs" 2>/dev/null || sudo chmod 777 "$APP_DIR/logs" 2>/dev/null || true
 }
 
 usage() {
@@ -34,7 +43,7 @@ Usage:
   ./oc.sh ui-fix            Re-apply CasaOS Legacy card filtering only
   ./oc.sh reset
   ./oc.sh status
-  ./oc.sh logs [N]
+  ./oc.sh logs [SERVICE|all] [N] [--follow] [--level=info|warn|error]
   ./oc.sh health
   ./oc.sh url
   ./oc.sh casaos-url
@@ -67,6 +76,41 @@ EOF
 
 clean_request_id() {
   printf '%s' "$1" | tr -d '[:space:]' | sed 's/[。．，,；;：:]$//'
+}
+
+log_level_pattern() {
+  case "${1:-info}" in
+    error)
+      echo 'error|err|failed|exception|traceback|panic'
+      ;;
+    warn)
+      echo 'warn|warning|error|err|failed|exception|traceback|panic'
+      ;;
+    info|*)
+      echo ''
+      ;;
+  esac
+}
+
+show_one_service_logs() {
+  local service="$1"
+  local tail_n="$2"
+  local follow_flag="$3"
+  local level="$4"
+  local pattern
+  local cmd=(logs --tail "$tail_n")
+
+  if [[ "$follow_flag" == "1" ]]; then
+    cmd+=(--follow)
+  fi
+  cmd+=("$service")
+
+  pattern="$(log_level_pattern "$level")"
+  if [[ -n "$pattern" ]]; then
+    docker_cmd "${cmd[@]}" 2>&1 | grep -Ei "$pattern" || true
+  else
+    docker_cmd "${cmd[@]}" 2>&1 || true
+  fi
 }
 
 has_casaos_cli() {
@@ -460,7 +504,50 @@ case "${1:-}" in
     docker_cmd ps -a | grep -i openclaw || true
     ;;
   logs)
-    docker_cmd logs --tail "${2:-120}" openclaw
+    log_service="openclaw"
+    log_tail="120"
+    log_follow="0"
+    log_level="info"
+    args=("${@:2}")
+
+    if [[ ${#args[@]} -gt 0 ]]; then
+      if [[ "${args[0]}" =~ ^[0-9]+$ ]]; then
+        log_tail="${args[0]}"
+        args=("${args[@]:1}")
+      elif [[ "${args[0]}" != -* ]]; then
+        log_service="${args[0]}"
+        args=("${args[@]:1}")
+      fi
+    fi
+
+    if [[ ${#args[@]} -gt 0 && "${args[0]}" =~ ^[0-9]+$ ]]; then
+      log_tail="${args[0]}"
+      args=("${args[@]:1}")
+    fi
+
+    for arg in "${args[@]}"; do
+      case "$arg" in
+        -f|--follow)
+          log_follow="1"
+          ;;
+        --level=*)
+          log_level="${arg#*=}"
+          ;;
+      esac
+    done
+
+    if [[ "$log_service" == "all" ]]; then
+      if [[ "$log_follow" == "1" ]]; then
+        echo "ERROR: logs all 暂不支持 --follow，请改为指定单个服务"
+        exit 1
+      fi
+      for svc in openclaw voice_assistant media_downloader knowledge_base immich-server immich-machine-learning jellyfin filebrowser openclaw_portal; do
+        echo "===== ${svc} (tail=${log_tail}, level=${log_level}) ====="
+        show_one_service_logs "$svc" "$log_tail" "0" "$log_level"
+      done
+    else
+      show_one_service_logs "$log_service" "$log_tail" "$log_follow" "$log_level"
+    fi
     ;;
   health)
     if curl -k -I --max-time 5 https://127.0.0.1:24190/healthz >/dev/null 2>&1; then
@@ -502,6 +589,7 @@ case "${1:-}" in
     docker_cmd exec openclaw node dist/index.js mcp show nas_files --json
     ;;
   tools-media-setup)
+    ensure_repo_logs_dir_writable
     mkdir -p "$NAS_ROOT/downloads/Movies" "$NAS_ROOT/downloads/TV Shows"
     mkdir -p "$NAS_ROOT/tools"
     cp "$APP_DIR/local_voice_chat/download_media_mcp.js" "$NAS_ROOT/tools/download_media_mcp.js"
@@ -518,7 +606,11 @@ case "${1:-}" in
           -e PORT=8081 \
           -e YTDLP_TIMEOUT_SEC=1800 \
           -e DOWNLOAD_TTS_TEXT="下载已完成" \
+          -e LOG_FILE=/logs/media_downloader.log \
+          -e LOG_MAX_BYTES=5242880 \
+          -e LOG_BACKUPS=3 \
           -v $NAS_ROOT/downloads:/downloads \
+          -v $APP_DIR/logs:/logs \
           -p 28081:8081 \
           nas-media-downloader:local >/dev/null
       fi
@@ -531,7 +623,7 @@ case "${1:-}" in
       fi
     fi
 
-    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://media_downloader:8081/download","DOWNLOAD_ROOT_LABEL":"'"$NAS_ROOT"'/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成"}}'
+    docker_cmd exec openclaw node dist/index.js mcp set download_media '{"enabled":true,"command":"node","args":["/nas_share/tools/download_media_mcp.js"],"env":{"DOWNLOAD_API_URL":"http://media_downloader:8081/download","DOWNLOAD_ROOT_LABEL":"'"$NAS_ROOT"'/downloads","DOWNLOAD_NOTIFY_TEXT":"下载已完成","MCP_LOG_FILE":"/logs/mcp_download_media.log","LOG_MAX_BYTES":"5242880","LOG_BACKUPS":"3"}}'
     docker_cmd exec openclaw node dist/index.js mcp reload
     docker_cmd restart openclaw
     echo "Media download tool configured."
@@ -569,6 +661,7 @@ case "${1:-}" in
     docker_cmd exec openclaw node dist/index.js mcp show immich --json
     ;;
   tools-kb-setup)
+    ensure_repo_logs_dir_writable
     mkdir -p $NAS_ROOT/tools
     mkdir -p $NAS_ROOT/knowledge_base_data
     sync_sample_docs
@@ -585,8 +678,12 @@ case "${1:-}" in
           -e NAS_ROOT=/nas_share \
           -e PORT=8084 \
           -e SCAN_INTERVAL=60 \
+          -e LOG_FILE=/logs/knowledge_base.log \
+          -e LOG_MAX_BYTES=5242880 \
+          -e LOG_BACKUPS=3 \
           -v $NAS_ROOT:/nas_share:ro \
           -v $NAS_ROOT/knowledge_base_data:/data \
+          -v $APP_DIR/logs:/logs \
           -p 28084:8084 \
           nas-knowledge-base:local >/dev/null
       fi
@@ -604,7 +701,7 @@ case "${1:-}" in
     IMMICH_KEY_VAL="$(immich_api_key)"
 
     docker_cmd exec openclaw node dist/index.js mcp set kb_search \
-      "{\"enabled\":true,\"command\":\"node\",\"args\":[\"/nas_share/tools/kb_mcp.js\"],\"env\":{\"KB_API_URL\":\"http://knowledge_base:8084\",\"IMMICH_BASE_URL\":\"${IMMICH_URL_VAL}\",\"IMMICH_API_KEY\":\"${IMMICH_KEY_VAL}\"}}"
+      "{\"enabled\":true,\"command\":\"node\",\"args\":[\"/nas_share/tools/kb_mcp.js\"],\"env\":{\"KB_API_URL\":\"http://knowledge_base:8084\",\"IMMICH_BASE_URL\":\"${IMMICH_URL_VAL}\",\"IMMICH_API_KEY\":\"${IMMICH_KEY_VAL}\",\"MCP_LOG_FILE\":\"/logs/mcp_kb_search.log\",\"LOG_MAX_BYTES\":\"5242880\",\"LOG_BACKUPS\":\"3\"}}"
     docker_cmd exec openclaw node dist/index.js mcp reload
     docker_cmd restart openclaw
     if [[ "${SAMPLE_DOCS_CHANGED:-0}" -gt 0 ]]; then

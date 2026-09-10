@@ -36,6 +36,11 @@ OPENCLAW_MODEL_ID="${OPENCLAW_MODEL_ID:-deepseek-chat}"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-casaos}"
 export OPENCLAW_MODEL_ID OPENCLAW_GATEWAY_TOKEN
 
+# MCP JS 在 openclaw 容器内以非 root 用户写 /logs；默认 775 在某些 UID 映射下不可写。
+# 统一放宽到 777，保证 logs/ 内文件日志可落盘（仓库内仅本地开发使用）。
+mkdir -p "$APP_DIR/logs"
+chmod 777 "$APP_DIR/logs" 2>/dev/null || true
+
 if [[ -z "${OPENCLAW_MODEL_BASE_URL:-}" || -z "${OPENCLAW_MODEL_API_KEY:-}" ]]; then
   echo "WARN: OPENCLAW_MODEL_BASE_URL / OPENCLAW_MODEL_API_KEY 未完整配置，OpenClaw 可能无法调用模型。"
   echo "WARN: 请先检查 $ENV_FILE 或重新执行: bash install.sh"
@@ -138,6 +143,7 @@ else
     -p 24190:18789 \
     -p 18790:18790 \
     -v /DATA/AppData/openclaw:/home/node/.openclaw \
+    -v "$APP_DIR/logs":/logs \
     -v "$NAS_ROOT":/nas_share \
     "$OPENCLAW_IMAGE" \
     /bin/bash -lc 'node dist/index.js gateway --bind lan --allow-unconfigured --port 18789'

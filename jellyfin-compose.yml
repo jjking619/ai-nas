@@ -30,6 +30,11 @@ services:
         target: 8096
         published: "8096"
         protocol: tcp
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
     x-casaos:
       envs:
         - container: TZ

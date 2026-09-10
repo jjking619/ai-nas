@@ -23,6 +23,9 @@ PORT = int(os.getenv("PORT", "8084"))
 DB_PATH = Path(os.getenv("DB_PATH", "/data/kb.db"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
+LOG_FILE = os.getenv("LOG_FILE", "/logs/knowledge_base.log").strip()
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_BACKUPS = int(os.getenv("LOG_BACKUPS", "3"))
 
 # Directories to skip (inside nas_share)
 # knowledge_base_data 是索引库自身所在目录（挂到 /data），排除可避免自索引抖动
@@ -40,6 +43,41 @@ PDF_EXTRACT_TIMEOUT_SEC = int(os.getenv("PDF_EXTRACT_TIMEOUT_SEC", "30"))
 CONTENT_MAX_CHARS = int(os.getenv("CONTENT_MAX_CHARS", "8000"))
 
 _db_lock = threading.Lock()
+_log_lock = threading.Lock()
+
+
+def _now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _rotate_log_file(path: Path) -> None:
+    try:
+        if not path.exists() or path.stat().st_size < LOG_MAX_BYTES:
+            return
+        for i in range(LOG_BACKUPS - 1, 0, -1):
+            src = Path(f"{path}.{i}")
+            if src.exists():
+                src.replace(Path(f"{path}.{i + 1}"))
+        path.replace(Path(f"{path}.1"))
+    except Exception:
+        pass
+
+
+def _log(msg: str) -> None:
+    line = f"[{_now_str()}] {msg}"
+    print(line, flush=True)
+    if not LOG_FILE:
+        return
+    try:
+        path = Path(LOG_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _log_lock:
+            _rotate_log_file(path)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            _rotate_log_file(path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +229,7 @@ def scan(db: sqlite3.Connection) -> int:
         db.commit()
         total = db.execute("SELECT COUNT(*) FROM meta").fetchone()[0]
 
-    print(f"[kb] scan done: total={total} changed={changed}")
+    _log(f"[kb] scan done: total={total} changed={changed}")
     return total
 
 
@@ -201,7 +239,7 @@ def _scan_loop(db: sqlite3.Connection):
         try:
             scan(db)
         except Exception as e:
-            print(f"[kb] scan error: {e}")
+            _log(f"[kb] scan error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +427,11 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         if path == "/search":
             q = body.get("query", body.get("q", ""))
-            _json(self, 200, {"ok": True, "query": q, "results": search(self.db, q)})
+            results = search(self.db, q)
+            _log(f"[kb] search query_len={len(str(q))} result_count={len(results)}")
+            _json(self, 200, {"ok": True, "query": q, "results": results})
         elif path == "/rescan":
+            _log("[kb] rescan triggered")
             threading.Thread(target=scan, args=(self.db,), daemon=True).start()
             _json(self, 200, {"ok": True, "message": "rescan triggered"})
         else:
@@ -405,13 +446,14 @@ def main():
     db = open_db()
     Handler.db = db
 
-    print(f"[kb] starting – NAS_ROOT={NAS_ROOT}  port={PORT}")
+    _log(f"[kb] log file: {LOG_FILE or '(disabled)'}")
+    _log(f"[kb] starting - NAS_ROOT={NAS_ROOT} port={PORT}")
     scan(db)
 
     threading.Thread(target=_scan_loop, args=(db,), daemon=True).start()
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[kb] ready on :{PORT}")
+    _log(f"[kb] ready on :{PORT}")
     server.serve_forever()
 
 

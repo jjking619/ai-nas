@@ -19,6 +19,11 @@ services:
               target: /var/lib/postgresql/data
               bind:
                 create_host_path: true
+        logging:
+            driver: json-file
+            options:
+                max-size: "5m"
+                max-file: "3"
         x-casaos:
             envs:
                 - container: POSTGRES_PASSWORD
@@ -61,6 +66,11 @@ services:
               target: /cache
               bind:
                 create_host_path: true
+        logging:
+            driver: json-file
+            options:
+                max-size: "5m"
+                max-file: "3"
         x-casaos:
             envs:
                 - container: DB_HOSTNAME
@@ -135,6 +145,11 @@ services:
               target: /nas_share
               bind:
                 create_host_path: true
+        logging:
+            driver: json-file
+            options:
+                max-size: "5m"
+                max-file: "3"
         x-casaos:
             envs:
                 - container: DB_HOSTNAME
@@ -177,6 +192,11 @@ services:
         networks:
             big_bear_immich_network: null
         restart: always
+        logging:
+          driver: json-file
+          options:
+            max-size: "5m"
+            max-file: "3"
 networks:
     big_bear_immich_network:
         name: big-bear-immich_big_bear_immich_network

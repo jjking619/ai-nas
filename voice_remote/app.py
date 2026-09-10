@@ -19,6 +19,8 @@ TRIGGER_TIMEOUT_SEC = int(os.getenv("TRIGGER_TIMEOUT_SEC", "300"))
 APP_TITLE = os.getenv("APP_TITLE", "对话助手").strip() or "对话助手"
 UI_VERSION = os.getenv("UI_VERSION", str(int(time.time())))
 LOG_FILE = os.getenv("LOG_FILE", "/logs/voice_remote.log").strip()
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_BACKUPS = int(os.getenv("LOG_BACKUPS", "3"))
 MAX_TASKS = int(os.getenv("MAX_TASKS", "120"))
 STATIC_DIR = Path(__file__).with_name("static")
 APP_JS_FILE = STATIC_DIR / "app.js"
@@ -34,6 +36,19 @@ def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
+def _rotate_log_file(path: Path) -> None:
+    try:
+        if not path.exists() or path.stat().st_size < LOG_MAX_BYTES:
+            return
+        for i in range(LOG_BACKUPS - 1, 0, -1):
+            src = Path(f"{path}.{i}")
+            if src.exists():
+                src.replace(Path(f"{path}.{i + 1}"))
+        path.replace(Path(f"{path}.1"))
+    except Exception:
+        pass
+
+
 def _log(msg: str) -> None:
     line = f"[{_now_str()}] {msg}"
     print(line, flush=True)
@@ -43,8 +58,10 @@ def _log(msg: str) -> None:
         path = Path(LOG_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
         with _LOG_LOCK:
+            _rotate_log_file(path)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+            _rotate_log_file(path)
     except Exception:
         pass
 
