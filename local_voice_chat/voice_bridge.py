@@ -25,6 +25,11 @@ from local_voice_chat import (
     wav_level_dbfs,
 )
 
+try:
+    from local_voice_chat.log_runtime import append_line, setup_stdout_stderr_tee
+except Exception:  # noqa: BLE001
+    from log_runtime import append_line, setup_stdout_stderr_tee
+
 
 def load_runtime_env(env_file: str | Path | None = None) -> dict[str, str]:
     """Load repo-level .env values without overriding already-exported process env.
@@ -282,6 +287,7 @@ _VOICE_TURNS: list = []
 _VOICE_TURNS_LOCK = threading.Lock()
 _TURNS_FILE: Path | None = None
 _TURNS_MAX = 100
+_TURNS_FILE_LOCK = threading.Lock()
 
 _BRIDGE_STATE: dict = {"state": "idle", "ts": 0.0, "last_text": ""}
 _BRIDGE_STATE_LOCK = threading.Lock()
@@ -310,69 +316,13 @@ def _record_voice_turn(source: str, text: str, reply: str, cost_ms: int) -> None
             del _VOICE_TURNS[:-_TURNS_MAX]
     if _TURNS_FILE is not None:
         try:
-            with _TURNS_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(turn, ensure_ascii=False) + "\n")
+            append_line(
+                _TURNS_FILE,
+                json.dumps(turn, ensure_ascii=False) + "\n",
+                lock=_TURNS_FILE_LOCK,
+            )
         except Exception as e:  # noqa: BLE001
             print(f"[TURNS] write failed: {e}")
-
-
-class _TeeStream:
-    """按文件名每次写入时追加打开，日志轮转（rename）后自动写到新文件。"""
-
-    def __init__(self, stream, log_path):
-        self._stream = stream
-        self._log_path = log_path
-        self._write_count = 0
-
-    def write(self, data):
-        self._stream.write(data)
-        try:
-            with self._log_path.open("a", encoding="utf-8") as fh:
-                fh.write(data)
-        except Exception:
-            pass
-        self._write_count += 1
-        if self._write_count % 200 == 0:
-            _maybe_rotate_log(str(self._log_path))
-
-    def flush(self):
-        self._stream.flush()
-
-    def isatty(self):
-        return self._stream.isatty()
-
-
-_LOG_MAX_BYTES = 5 * 1024 * 1024
-_LOG_BACKUPS = 3
-
-
-def _maybe_rotate_log(log_file: str) -> None:
-    """简单轮转：超过 5MB 时 .log -> .log.1（最多保留 3 份），无需外部 logrotate。"""
-    try:
-        p = Path(log_file)
-        if not p.exists() or p.stat().st_size < _LOG_MAX_BYTES:
-            return
-        for i in range(_LOG_BACKUPS - 1, 0, -1):
-            src = Path(f"{p}.{i}")
-            if src.exists():
-                src.replace(Path(f"{p}.{i + 1}"))
-        p.replace(Path(f"{p}.1"))
-    except Exception:
-        pass
-
-
-def _setup_file_logging(log_file: str) -> None:
-    if not log_file:
-        return
-    try:
-        path = Path(log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _maybe_rotate_log(log_file)
-        sys.stdout = _TeeStream(sys.stdout, path)
-        sys.stderr = _TeeStream(sys.stderr, path)
-        print(f"[LOG] file logging enabled: {path}")
-    except Exception as e:  # noqa: BLE001
-        print(f"[LOG] file logging setup failed: {e}")
 
 
 def _ensure_audio_runtime_env() -> None:
@@ -2975,7 +2925,11 @@ def _run_http_server(args) -> None:
 
 def main():
     args = parse_args()
-    _setup_file_logging(args.log_file)
+    path = setup_stdout_stderr_tee(args.log_file)
+    if path is not None:
+        print(f"[LOG] file logging enabled: {path}")
+    elif args.log_file:
+        print("[LOG] file logging setup failed")
     _ensure_audio_runtime_env()
 
     use_http_mode = args.http_mode or (not args.wake_mode and not os.isatty(0))

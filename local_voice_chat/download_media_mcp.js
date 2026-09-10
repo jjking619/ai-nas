@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 
+const fs = require("fs");
+const path = require("path");
+
 const DEFAULT_API_URL = process.env.DOWNLOAD_API_URL || "http://media_downloader:8081/download";
 const DOWNLOAD_ROOT_LABEL = process.env.DOWNLOAD_ROOT_LABEL || "/home/pi/nas_share/downloads";
 const DEFAULT_NOTIFY_TEXT = process.env.DOWNLOAD_NOTIFY_TEXT || "下载已完成";
 const REQUEST_TIMEOUT_MS = Number(process.env.DOWNLOAD_API_TIMEOUT_MS || 15 * 60 * 1000);
+const MCP_LOG_FILE = (process.env.MCP_LOG_FILE || "/logs/mcp_download_media.log").trim();
+const LOG_MAX_BYTES = Number(process.env.LOG_MAX_BYTES || 5 * 1024 * 1024);
+const LOG_BACKUPS = Number(process.env.LOG_BACKUPS || 3);
 
 // 视频关键词库：用户可说关键词而不是URL
 const MEDIA_LIBRARY = {
@@ -74,6 +80,49 @@ const TOOL = {
     additionalProperties: false,
   },
 };
+
+function rotateLogFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    const maxBytes = Number.isFinite(LOG_MAX_BYTES) && LOG_MAX_BYTES > 0 ? LOG_MAX_BYTES : 5 * 1024 * 1024;
+    const backups = Number.isFinite(LOG_BACKUPS) && LOG_BACKUPS > 0 ? Math.floor(LOG_BACKUPS) : 3;
+    if (fs.statSync(filePath).size < maxBytes) return;
+    for (let i = backups - 1; i >= 1; i--) {
+      const src = `${filePath}.${i}`;
+      const dst = `${filePath}.${i + 1}`;
+      if (fs.existsSync(src)) fs.renameSync(src, dst);
+    }
+    fs.renameSync(filePath, `${filePath}.1`);
+  } catch {
+    // Keep MCP stdio clean even if file logging fails.
+  }
+}
+
+function logEvent(level, event, fields = {}) {
+  if (!MCP_LOG_FILE) return;
+  try {
+    fs.mkdirSync(path.dirname(MCP_LOG_FILE), { recursive: true });
+    rotateLogFile(MCP_LOG_FILE);
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      level,
+      event,
+      ...fields,
+    });
+    fs.appendFileSync(MCP_LOG_FILE, `${line}\n`, { encoding: "utf8" });
+    rotateLogFile(MCP_LOG_FILE);
+  } catch {
+    // Keep MCP stdio clean even if file logging fails.
+  }
+}
+
+function safeHostFromUrl(value) {
+  try {
+    return new URL(value).host;
+  } catch {
+    return "";
+  }
+}
 
 const shortMap = [
   ["tvshows", "TV Shows"],
@@ -239,6 +288,7 @@ async function onToolCall(id, params) {
   const args = (params && params.arguments) || {};
 
   if (name !== TOOL.name) {
+    logEvent("warn", "tool_unknown", { id, name: String(name || "") });
     ok(id, {
       content: [{ type: "text", text: `未知工具: ${name}` }],
       isError: true,
@@ -246,9 +296,25 @@ async function onToolCall(id, params) {
     return;
   }
 
+  logEvent("info", "tool_call_start", {
+    id,
+    name,
+    has_url: !!String(args.url || "").trim(),
+    url_host: safeHostFromUrl(String(args.url || "").trim()),
+    query: String(args.query || "").trim().slice(0, 80),
+    keyword: String(args.keyword || "").trim().slice(0, 40),
+    target_folder: String(args.target_folder || "").trim().slice(0, 80),
+    notify_tts: args.notify_tts !== false,
+  });
+
   const ret = await callDownloadApi(args);
   if (!ret.ok) {
     const msg = ret.data && ret.data.error ? ret.data.error : ret.error || "下载失败";
+    logEvent("error", "tool_call_failed", {
+      id,
+      status: ret.status,
+      error: String(msg).slice(0, 240),
+    });
     ok(id, {
       content: [
         {
@@ -267,7 +333,18 @@ async function onToolCall(id, params) {
     return;
   }
 
-  ok(id, renderSuccess(ret.data || {}));
+  const successData = ret.data || {};
+  logEvent("info", "tool_call_done", {
+    id,
+    status: ret.status,
+    ok: true,
+    safe_subdir: String(successData.safe_subdir || "").slice(0, 120),
+    files_count: Array.isArray(successData.files) ? successData.files.length : 0,
+    notify_tts: !!successData.notify_tts,
+    notify_status: String(successData.notify_status || ""),
+  });
+
+  ok(id, renderSuccess(successData));
 }
 
 async function handle(msg) {

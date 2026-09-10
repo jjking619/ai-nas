@@ -11,10 +11,16 @@
 
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
+
 const KB_API_URL      = process.env.KB_API_URL      || "http://knowledge_base:8084";
 const IMMICH_BASE_URL = process.env.IMMICH_BASE_URL  || "http://immich-server:2283";
 const IMMICH_API_KEY  = process.env.IMMICH_API_KEY   || "";
 const TIMEOUT_MS      = 15_000;
+const MCP_LOG_FILE    = (process.env.MCP_LOG_FILE || "/logs/mcp_kb_search.log").trim();
+const LOG_MAX_BYTES   = Number(process.env.LOG_MAX_BYTES || 5 * 1024 * 1024);
+const LOG_BACKUPS     = Number(process.env.LOG_BACKUPS || 3);
 
 // 照片意图关键词 → 走 Immich CLIP，其余走 KB FTS5
 const PHOTO_KW = ["照片", "图片", "相册", "风景", "动物", "人物", "美食", "植物", "旅行", "photo", "image"];
@@ -22,6 +28,41 @@ const PHOTO_KW = ["照片", "图片", "相册", "风景", "动物", "人物", "�
 function isPhotoQuery(q) {
   const lower = q.toLowerCase();
   return PHOTO_KW.some(k => lower.includes(k));
+}
+
+function rotateLogFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    const maxBytes = Number.isFinite(LOG_MAX_BYTES) && LOG_MAX_BYTES > 0 ? LOG_MAX_BYTES : 5 * 1024 * 1024;
+    const backups = Number.isFinite(LOG_BACKUPS) && LOG_BACKUPS > 0 ? Math.floor(LOG_BACKUPS) : 3;
+    if (fs.statSync(filePath).size < maxBytes) return;
+    for (let i = backups - 1; i >= 1; i--) {
+      const src = `${filePath}.${i}`;
+      const dst = `${filePath}.${i + 1}`;
+      if (fs.existsSync(src)) fs.renameSync(src, dst);
+    }
+    fs.renameSync(filePath, `${filePath}.1`);
+  } catch {
+    // Keep MCP stdio clean even if file logging fails.
+  }
+}
+
+function logEvent(level, event, fields = {}) {
+  if (!MCP_LOG_FILE) return;
+  try {
+    fs.mkdirSync(path.dirname(MCP_LOG_FILE), { recursive: true });
+    rotateLogFile(MCP_LOG_FILE);
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      level,
+      event,
+      ...fields,
+    });
+    fs.appendFileSync(MCP_LOG_FILE, `${line}\n`, { encoding: "utf8" });
+    rotateLogFile(MCP_LOG_FILE);
+  } catch {
+    // Keep MCP stdio clean even if file logging fails.
+  }
 }
 
 // ── MCP tool 定义 ───────────────────────────────────────────────────────────
@@ -105,22 +146,31 @@ async function searchImmich(query) {
 async function onToolCall(id, params) {
   const { name, arguments: args = {} } = params || {};
   if (name !== "kb_search") {
+    logEvent("warn", "tool_unknown", { id, name: String(name || "") });
     ok(id, { content: [{ type: "text", text: `未知工具: ${name}` }], isError: true });
     return;
   }
 
   const query = String(args.query || "").trim();
   if (!query) {
+    logEvent("warn", "tool_bad_request", { id, reason: "empty_query" });
     ok(id, { content: [{ type: "text", text: "请提供搜索词" }], isError: true });
     return;
   }
 
   const type = args.type || "auto";
   let results = [];
+  const usePhotoIntent = type === "photo" || (type === "auto" && isPhotoQuery(query));
+  logEvent("info", "tool_call_start", {
+    id,
+    name,
+    type,
+    use_photo_intent: usePhotoIntent,
+    query: query.slice(0, 120),
+  });
 
   try {
-    const usePhoto = type === "photo" || (type === "auto" && isPhotoQuery(query));
-    if (usePhoto) {
+    if (usePhotoIntent) {
       results = await searchImmich(query).catch(() => []);
       if (results.length === 0) {
         results = await searchKB(query);   // fallback to FTS5
@@ -129,11 +179,22 @@ async function onToolCall(id, params) {
       results = await searchKB(query);
     }
   } catch (err) {
+    logEvent("error", "tool_call_failed", {
+      id,
+      type,
+      error: String(err && (err.message || err)).slice(0, 240),
+    });
     ok(id, { content: [{ type: "text", text: `搜索失败: ${err.message || err}` }], isError: true });
     return;
   }
 
   if (results.length === 0) {
+    logEvent("info", "tool_call_done", {
+      id,
+      type,
+      result_count: 0,
+      fallback_to_kb: usePhotoIntent,
+    });
     ok(id, { content: [{ type: "text", text: `未找到与"${query}"相关的内容` }] });
     return;
   }
@@ -146,6 +207,12 @@ async function onToolCall(id, params) {
   ok(id, {
     content: [{ type: "text", text: `找到 ${results.length} 条结果：\n${lines.join("\n")}` }],
     structuredContent: { ok: true, query, results },
+  });
+  logEvent("info", "tool_call_done", {
+    id,
+    type,
+    result_count: results.length,
+    fallback_to_kb: usePhotoIntent,
   });
 }
 
