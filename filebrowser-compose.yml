@@ -1,7 +1,7 @@
 name: nas-filebrowser
 services:
   filebrowser:
-    image: filebrowser/filebrowser:latest
+    image: filebrowser/filebrowser:2.63.23@sha256:a469ea076d4a1b4b1d86a41d130f2f536cd9da996a2b1fb39c0d7635f9d89b9a
     container_name: filebrowser
     user: "__NAS_PUID__:__NAS_PGID__"
     restart: unless-stopped

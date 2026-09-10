@@ -1,5 +1,3 @@
-version: "3.8"
-
 # =============================================================================
 # NAS-Demo 全家桶 compose
 # 用户只需在 .env 填写 OPENCLAW_MODEL_BASE_URL / OPENCLAW_MODEL_API_KEY
@@ -9,10 +7,11 @@ version: "3.8"
 services:
   # ── AI 核心 ──────────────────────────────────────────────────────────────
   openclaw:
-    image: openclaw/openclaw:latest
+    image: openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b
     platform: linux/arm64
     container_name: openclaw
     restart: unless-stopped
+    mem_limit: 768m
     init: true
     env_file:
       - ./.env
@@ -85,7 +84,7 @@ services:
   # ── Immich 智能相册（数据库/Redis/服务/机器学习）────────────────────────
   immich-postgres:
     container_name: immich-postgres
-    image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0@sha256:c570d9e1c2494f65d2a0a379a7f6df66e8441964254a30aa62cc58e8ebf1dee0
     restart: unless-stopped
     networks:
       - nas-net
@@ -105,8 +104,9 @@ services:
 
   immich-server:
     container_name: immich-server
-    image: ghcr.io/immich-app/immich-server:v3.1.0
+    image: ghcr.io/immich-app/immich-server:v3.1.0@sha256:b434cb9287eea1471c9974845914d4dd328c9c2d652e446ed4930f99944f0ceb
     restart: unless-stopped
+    mem_limit: 512m
     depends_on:
       - immich-postgres
       - immich-redis
@@ -130,8 +130,9 @@ services:
 
   immich-machine-learning:
     container_name: immich-machine-learning
-    image: ghcr.io/immich-app/immich-machine-learning:v3.1.0
+    image: ghcr.io/immich-app/immich-machine-learning:v3.1.0@sha256:5a0839dc5303cd7215bcd2180a26aed3af41675aefb3e75e5157e9f10ad16e6e
     restart: unless-stopped
+    mem_limit: 768m
     networks:
       - nas-net
     environment:
@@ -147,9 +148,10 @@ services:
 
   # ── Jellyfin 家庭影院 ────────────────────────────────────────────────────
   jellyfin:
-    image: jellyfin/jellyfin:latest
+    image: jellyfin/jellyfin:12.0@sha256:baba630419915985442f315f08b0cf46d9f4c8a0cc4bd38e94a6d35751dd5ef5
     container_name: jellyfin
     restart: unless-stopped
+    mem_limit: 512m
     networks:
       - nas-net
     environment:

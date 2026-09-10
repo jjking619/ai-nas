@@ -13,6 +13,8 @@ if [[ -f "$APP_DIR/.env" ]]; then
   set +a
 fi
 
+FILEBROWSER_IMAGE="filebrowser/filebrowser:2.63.23@sha256:a469ea076d4a1b4b1d86a41d130f2f536cd9da996a2b1fb39c0d7635f9d89b9a"
+
 # NAS 共享目录：可从 .env / 环境变量覆盖，默认当前用户主目录（用户名无关）
 NAS_ROOT="${NAS_ROOT:-$HOME/nas_share}"
 export NAS_ROOT
@@ -944,7 +946,7 @@ case "${1:-}" in
         docker_cmd stop filebrowser >/dev/null 2>&1 || true
         docker_cmd run --rm --user 1001:1001 --entrypoint /bin/filebrowser \
           -v /DATA/AppData/filebrowser/database:/database \
-          filebrowser/filebrowser:latest \
+          "$FILEBROWSER_IMAGE" \
           -d /database/filebrowser.db config set --auth.method=noauth >/dev/null 2>&1 || true
         docker_cmd start filebrowser >/dev/null 2>&1 || true
         echo "Auth disabled (no login)."

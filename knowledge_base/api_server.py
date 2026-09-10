@@ -25,9 +25,13 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
 
 # Directories to skip (inside nas_share)
-EXCLUDE_DIRS = frozenset(["tools", "Immich上传", ".git", "__pycache__"])
-# File suffixes to skip
-SKIP_EXTS = frozenset([".immich", ".pyc", ".db", ".js", ".sh", ".service", ".bin", ".so"])
+# knowledge_base_data 是索引库自身所在目录（挂到 /data），排除可避免自索引抖动
+EXCLUDE_DIRS = frozenset(["tools", "Immich上传", "knowledge_base_data", ".git", "__pycache__"])
+# File suffixes to skip（含 SQLite WAL/SHM，避免被当成待索引文件反复入库）
+SKIP_EXTS = frozenset([
+    ".immich", ".pyc", ".db", ".db-wal", ".db-shm",
+    ".js", ".sh", ".service", ".bin", ".so",
+])
 # Extensions whose text content can be read directly
 TEXT_EXTS = frozenset([".txt", ".md", ".csv", ".log"])
 # PDF 内容提取：用系统 pdftotext（poppler-utils），避免引入额外 Python 依赖
@@ -126,15 +130,29 @@ def _extract_content(fp: Path) -> str:
     return ""
 
 
+def _iter_indexable_files():
+    """遍历可索引文件，并就地剪枝被排除目录。
+
+    原先用 NAS_ROOT.rglob("*")：它会先进入被排除目录、再逐个文件跳过。
+    Immich上传 是 Immich 资产库的挂载点，会随照片增长到数万条，每 SCAN_INTERVAL
+    秒全量遍历一次纯属浪费。改为 os.walk + dirnames 剪枝后不再进入这些目录。
+    """
+    for dirpath, dirnames, filenames in os.walk(NAS_ROOT):
+        dirnames[:] = [
+            d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")
+        ]
+        for name in filenames:
+            fp = Path(dirpath) / name
+            rel = fp.relative_to(NAS_ROOT)
+            if _should_skip(rel):
+                continue
+            yield fp, rel
+
+
 def scan(db: sqlite3.Connection) -> int:
     """Incremental scan: insert new/changed, remove deleted files."""
     current: dict[str, float] = {}
-    for fp in NAS_ROOT.rglob("*"):
-        if not fp.is_file():
-            continue
-        rel = fp.relative_to(NAS_ROOT)
-        if _should_skip(rel):
-            continue
+    for fp, rel in _iter_indexable_files():
         try:
             current[str(rel)] = fp.stat().st_mtime
         except OSError:

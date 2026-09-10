@@ -29,6 +29,13 @@ _ML_READY_CHECKED = False
 
 ARCHIVE_ROOT_HINTS = ("家庭相册", "手机相册", "旅行", "备份")
 
+# 滤镜产物目录名（与 image_batch.py 的 _STYLE_DIR_NAMES 保持一致）。
+# 分类递归遍历时需跳过这些目录：滤镜产物是派生图，不应被再次归档移动，
+# 否则会把 家庭相册/复古风格/ 等目录掏空，或产生 类别/复古风格/ 套娃。
+STYLE_DIR_NAMES = ("复古风格", "日系风格", "胶片风格")
+
+_SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
 # 交通工具类在“旅行街景/路景”里易与风景、美食重叠，做一个保守回退：
 # 仅当交通工具置信度不高且与候选类分差很小时，才把首类切到候选类。
 _VEHICLE_AMBIGUOUS_MAX = 0.26
@@ -257,6 +264,26 @@ def _move_file(src: Path, dst: Path, dry_run: bool) -> None:
     shutil.move(str(src), str(dst))
 
 
+def _iter_images(root: Path, recursive: bool):
+    """遍历 root 下待分类的图片，跳过滤镜产物目录。
+
+    仅按“相对 root 的路径”判断，因此当 root 本身就是风格目录（如用户显式对
+    `家庭相册/复古风格` 分类）时，其中文件仍会被处理——显式指定即视为有意为之。
+    """
+    iterator = root.rglob("*") if recursive else root.glob("*")
+    for f in iterator:
+        if not f.is_file() or f.suffix.lower() not in _SUPPORTED_EXTS:
+            continue
+        try:
+            rel_parent = f.relative_to(root).parent
+        except ValueError:
+            rel_parent = f.parent
+        if any(part in STYLE_DIR_NAMES for part in rel_parent.parts):
+            # 处于风格目录内部：属滤镜派生产物，跳过以免被再次归档移动。
+            continue
+        yield f
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("paths", nargs="*", help="图片路径")
@@ -270,9 +297,7 @@ def main():
 
     files = [Path(p) for p in args.paths]
     if args.dir:
-        d = Path(args.dir)
-        it = d.rglob("*") if args.recursive else d.glob("*")
-        files += [f for f in it if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")]
+        files += list(_iter_images(Path(args.dir), args.recursive))
 
     if not files:
         print("没有找到图片", file=sys.stderr)

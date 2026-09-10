@@ -46,7 +46,8 @@ services:
             DB_PORT: "5432"
             DB_USERNAME: casaos
             REDIS_HOSTNAME: immich-redis
-            MACHINE_LEARNING_MODEL_TTL: "0"
+            MACHINE_LEARNING_MODEL_TTL: "600"
+        mem_limit: 768m
         image: ghcr.io/immich-app/immich-machine-learning:v3.1.0@sha256:5a0839dc5303cd7215bcd2180a26aed3af41675aefb3e75e5157e9f10ad16e6e
         labels:
             icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
@@ -95,6 +96,7 @@ services:
             redis:
                 condition: service_started
                 required: true
+        mem_limit: 512m
         environment:
             DB_DATABASE_NAME: immich
             DB_HOSTNAME: immich-postgres

@@ -9,7 +9,7 @@
 - [一键安装](#一键安装)
 - [首次使用](#首次使用)
 - [日常维护](#日常维护)
-- [语音助手](#服务管理）)
+- [语音助手](#语音助手)
 - [项目结构](#项目结构)
 - [常见问题](#常见问题)
 
@@ -20,11 +20,11 @@
 | 能力 | 说明 | 示例指令 |
 |------|------|----------|
 | 📁 文件管理 | 在 NAS 内移动/整理/搜索文件 | “把xxx照片移到家庭相册” |
-| 🖼️ 照片分类 | 按内容自动分类归档（可预览/执行） | “帮我把手机相册的照片分类” |
+| 🖼️ 照片分类 | 按内容自动分类归档 | “帮我把家庭相册下的照片分类” |
 | 🎬 媒体下载 | 说一句话下载视频，自动进 Jellyfin 媒体库 | “下载测试视频，放到 Movies 文件夹” |
 | 🔍 知识库问答 | 文档全文检索 + 照片语义搜索 | “住房合同在哪”  |
-| 📺 家庭影院 | Jellyfin 海报墙、多端播放 | “播放xxx视频” |
-| 🗣️ 语音助手 | 系统核心入口：网页对话开箱即用，带麦克风可加唤醒词对话、离线 ASR/TTS | 对小远同学说“合同在哪” |
+| 🎨 图片滤镜 | 一键套用复古 / 日系 / 胶片风格，输出到原目录的风格子目录，不覆盖原图，支持先预览 | “把旅行照片加复古滤镜” |
+| 🗣️ 语音助手 | 系统核心入口：网页对话开箱即用，带麦克风可加唤醒词对话、离线 ASR/TTS | 使用小远同学唤醒对话 |
 
 模型接入使用 **OpenAI 兼容接口**（DeepSeek、通义、OpenAI 等均可），只需一个 API Key。
 
@@ -96,9 +96,9 @@ bash install.sh
 然后脚本会自动完成：
 
 1. 生成/补齐 `.env` 配置
-2. 启动容器全家桶（openclaw / media_downloader / knowledge_base / Immich / Jellyfin / filebrowser / 网页对话助手 voice_assistant）
+2. 启动核心容器（openclaw / media_downloader / knowledge_base / Immich / Jellyfin），并部署 filebrowser、网页对话助手（由 `oc.sh` 渲染各自的 compose 后启动）
 3. 配置 OpenClaw 模型 Provider
-4. 注册 4 个 MCP 工具：`nas_files`、`download_media`、`kb_search`、`immich`
+4. 注册 MCP 工具：`nas_files`、`download_media`、`kb_search`（`immich` 需先配置 `IMMICH_API_KEY` 才会注册，见[首次使用第 3 步](#3-登录-immich-相册)）
 5. 输出各服务访问地址
 
 > 直接编辑 `~/NAS-Demo/.env` 里的 `OPENCLAW_MODEL_BASE_URL` / `OPENCLAW_MODEL_API_KEY` / `OPENCLAW_MODEL_ID`，
@@ -193,62 +193,68 @@ bash ./oc.sh url
 **向导完成后，创建一个 API 密钥**（语音说“播放 / 下载后自动播放”时，语音桥需调用 Jellyfin API 自动扫库、搜索与远程播放；不配置只影响自动播放，不影响下载与唤醒）：
 
 1. 在 Jellyfin：管理后台 → 高级 → API 密钥 → 新增 API 密钥
-2. 把生成的密钥写入 `~/NAS-Demo/.env`文件`JELLYFIN_API_KEY`中
-3. 重启语音桥使其生效：`cd ~/NAS-Demo/local_voice_chat && sudo systemctl restart voice-bridge`
-4. 验证：`journalctl -u voice-bridge | grep Jellyfin` 不再出现 `401 Unauthorized`
+2. 把生成的密钥写入 `~/NAS-Demo/.env` 文件中的 `JELLYFIN_API_KEY` 字段
+3. 让配置生效：
+   - 若语音桥**尚未安装**（还没做第 5 步）：到此即可，第 5 步安装语音桥时会自动读取，无需重启
+   - 若语音桥**已在运行**：重启后生效
+     ```bash
+     sudo systemctl restart voice-bridge
+     journalctl -u voice-bridge | grep Jellyfin   # 不再出现 401 Unauthorized 即成功
+     ```
 
 以后 media_downloader 下载的视频放入 `~/nas_share/downloads/Movies` 或 `~/nas_share/downloads/TV Shows`，Jellyfin 会自动扫描入库。
 
 ### 5. 启用语音入口（必做）
 
-本系统主打「一句话搞定」，语音/网页对话是**默认交互入口**，首次使用必须启用：
+本系统主打「一句话搞定」，语音/网页对话是**默认交互入口**，首次使用必须启用。
+
+> ⚠️ **网页对话助手（28083）与语音桥（28082）是同一套服务**：28083 只是网页界面，对话实际转发给 28082 处理。
+> 因此**必须先安装并运行语音桥**，否则 28083 看似能打开，但一发送消息就报错（502）。
+
+#### a) 安装语音桥（含依赖）
+
+语音桥依赖 `numpy` + `sherpa_onnx`（离线 ASR/TTS），并要求当前用户有**免密 docker 权限**（语音桥通过 `docker exec openclaw` 调用智能体）：
 
 ```bash
-# a) 网页对话助手（一键安装已自动部署，无需操作，仅验证）
-#    浏览器打开 http://<IP>:28083，能看到对话界面即成功
+# 1) 安装 Python 依赖（已装可跳过；也可用 run_local_voice_chat.sh 自动安装）
+python3 -m pip install --user sherpa-onnx numpy
 
-# b) 语音唤醒（对小远同学说话）：执行一次即可安装为 systemd 服务并启动
+# 2) 配置免密 docker（若 `sudo -n docker ps` 或 `docker ps` 已免密可跳过）
+USER_NAME="$(id -un)"
+echo "${USER_NAME} ALL=(ALL) NOPASSWD: /usr/bin/docker" | sudo tee "/etc/sudoers.d/${USER_NAME}-docker"
+sudo chmod 440 "/etc/sudoers.d/${USER_NAME}-docker"
+
+# 3) 安装为 systemd 服务并启动（首次会预下载 ASR/TTS 模型，视网络需数分钟）
 cd ~/NAS-Demo/local_voice_chat
 ./install_voice_bridge_service.sh
 ```
 
-启用后两者都可用：
+#### b) 验证两个入口
+
+```bash
+systemctl is-active voice-bridge          # 输出 active 即正常
+curl -sS http://127.0.0.1:28082/healthz   # 语音桥就绪
+journalctl -u voice-bridge -f             # 实时日志（边说边看）
+```
 
 | 入口 | 地址/方式 | 说明 |
 |------|-----------|------|
-| 网页对话助手 | `http://<IP>:28083` | 浏览器文字/语音输入，已随安装自动启用 |
-| 语音桥 | 唤醒词「小远同学」 | 需要 USB/板载麦克风 + 本地语音 SDK（离线 ASR/TTS） |
+| 语音桥 | `http://<IP>:28082`（后端） | 对话处理核心，支持唤醒词「小远同学」（离线 ASR/TTS） |
+| 网页对话助手 | `http://<IP>:28083` | 浏览器文字/语音输入，转发给 28082，**依赖语音桥运行** |
 
-验证语音桥是否在运行：
-
-```bash
-systemctl is-active voice-bridge     # 输出 active 即正常
-journalctl -u voice-bridge -f        # 实时日志（边说边看）
-```
-
-> 若机器没有麦克风：至少保留网页对话助手（28083）作为入口，语音唤醒可跳过；
-> 但不建议整个语音服务都不启用——其余能力（文件管理/相册/下载）在网页对话里一样可用。
+> 若机器没有麦克风：仍需让语音桥进程保持运行（否则 28083 不可用），只是跳过唤醒环节，
+> 直接用网页对话助手（28083）打字，即可使用文件管理/相册/下载等全部能力。
 
 ### 6. 试试说一句话
 
-在 OpenClaw 控制台 / 对话助手 / 语音助手里输入（或说出唤醒词“小远同学”）：
+在对话助手应用中输入文本/语音进行对话（或说出唤醒词“小远同学”）：
 
 ```text
-把周末派对照片移到家庭相册
-下载测试视频，放到 Movies 文件夹并播放
-帮我把手机相册的照片分类
+下载测试视频并播放
+帮我把家庭相册的照片分类
+把家庭相册下的照片复古滤镜
 住房合同在哪
 ```
-
-> 想快速试「照片分类/滤镜」但没有自己的照片？
-> 仓库内置 10 张公有领域/CC0 测试照片（`assets/sample_photos/`），
-> 安装 Immich MCP 时会自动导入到 Immich，`./oc.sh tools-photos-setup` 也会同步到 `家庭相册/测试样例/` 并补导入到 Immich，可直接对它说：
-> “帮我把家庭相册测试样例的照片分类” / “把家庭相册测试样例的照片处理成复古风格”。
->
-> 想快速试「文档问答」但没有自己的资料？
-> 仓库内置测试住房合同（`assets/sample_docs/住房合同-示例.md`），安装时会随 `./oc.sh tools-kb-setup` 自动同步到 `~/nas_share/文档/`，可直接问：
-> “住房合同在哪” / “押金多少” / “租金多少”。
-
 ---
 
 ## 日常维护
@@ -283,6 +289,9 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 ./oc.sh tools-photos-setup    # 同步样例照片 → 家庭相册/测试样例，并自动导入 Immich（幂等）
 ```
 
+> `./oc.sh nas-files-deploy` 会先渲染 [filebrowser-compose.yml](filebrowser-compose.yml) 里的 `__NAS_ROOT__`、`__NAS_PUID__`、`__NAS_PGID__` 占位符；
+> 不要直接执行 `docker compose -f filebrowser-compose.yml up -d`，否则会因占位符未替换导致启动失败。
+
 > **唯一源码约定**：运行脚本的唯一源码在本仓库 `NAS-Demo/`（进 git）；
 > `${HOME}/nas_share/tools/` 只是容器可见的运行副本，**不要手动改**。
 > 改完源码后执行 `./oc.sh tools-sync` 同步并自动重启受影响服务。
@@ -293,11 +302,16 @@ journalctl -u voice-bridge -f        # 实时日志（边说边看）
 
 > **服务管理**：启用（必做）见[首次使用第 5 步](#5-启用语音入口必做)，此处为安装原理与日常管理补充。
 
-**依赖**：USB/板载麦克风 + 本地语音 SDK（唤醒词“小远同学”，离线 ASR/TTS）。
+**依赖**：`numpy` + `sherpa_onnx`（离线 ASR/TTS 模型，安装脚本自动预下载）+ 免密 docker 权限；
+如需语音唤醒还需 USB/板载麦克风（唤醒词“小远同学”）。
+> 网页对话助手（28083）转发到语音桥（28082），因此**即使没有麦克风也让语音桥运行**，否则网页对话不可用。
 
 **重装 / 修复**（若服务未运行或代码有更新后需重装）：
 
 ```bash
+# 缺依赖时先补装
+python3 -m pip install --user sherpa-onnx numpy
+
 cd ~/NAS-Demo/local_voice_chat
 ./install_voice_bridge_service.sh      # 重新安装为 systemd 服务并启动
 ```
@@ -313,7 +327,7 @@ systemctl is-active voice-bridge       # 查看是否 active
 前台调试：`python3 local_voice_chat/voice_bridge.py --wake-duration 5`
 
 > 默认唤醒词：**小远同学**。语音与网页对话共用 28082/28083 通道。
-> 麦克风后端、唤醒词等高级配置见 [local_voice_chat/README.md](local_voice_chat/README.md)。
+> 麦克风后端、唤醒词等高级配置见 [README.md](README.md) 第 6 节「语音交互桥接」（含 6.7 进阶用法与常见问题）。
 
 ---
 
@@ -321,7 +335,7 @@ systemctl is-active voice-bridge       # 查看是否 active
 
 ```text
 NAS-Demo/
-├── install.sh                 # ★ 一键安装/配置入口（唯一需要维护的脚本）
+├── install.sh                 # 一键安装/配置入口（唯一需要维护的脚本）
 ├── oc.sh                      # 维护命令封装（status/logs/tools-*/deploy...）
 ├── docker-compose.yml         # 核心服务全家桶编排
 ├── .env(.example)             # 配置（模型 API、网关 token）
@@ -343,18 +357,17 @@ NAS-Demo/
 
 | 现象 | 处理 |
 |------|------|
-| 容器启动报 `Exec format error` | 用了 amd64 镜像。`./oc.sh deploy` 已强制 `--platform linux/arm64`，重建即可 |
-| 容器能 ping 通宿主但访问 28081/28084 超时 | 宿主机 iptables INPUT 默认 DROP。服务间应走共享网络 + 容器名（本仓库已如此配置），勿走宿主端口 |
 | openclaw 状态显示 `unhealthy` | 镜像健康检查用 HTTP 探测 HTTPS 端口所致，网关实际正常（HTTPS 探活返回 200），无需处理 |
-| OpenClaw 容器反复重启并提示 `EACCES ... /home/node/.openclaw/state` | 目录权限问题。新版本 `install.sh` 已自动修复 `/DATA/AppData/openclaw` 属主；若是历史环境，重跑一次 `bash install.sh` 即可 |
 | 语音识别全单字/无反应 | systemd 缺 PulseAudio 环境。确认 `voice-bridge.service` 含 `LD_PRELOAD` + `PULSE_SERVER` 后 `sudo systemctl restart voice-bridge` |
-| 安装 CasaOS 报 `wget: unrecognized option '--show-progress'` | 系统使用 BusyBox wget（不支持该参数）。先 `sudo apt install wget -y` 安装 GNU wget，再重试 `./install.sh`（新脚本会自动检测并处理） |
 | `bash ./oc.sh casaos-url` 打不开 | 先看命令是否提示“未检测到 CasaOS Web 服务（80/443）”。若有，执行 `curl -fsSL https://get.casaos.io \| sudo bash`；若 `curl` 超时/失败，先 `sudo apt install wget -y` 再重试安装 |
 | CasaOS 页面里看不到 OpenClaw/Immich/Jellyfin，或点击应用打不开 | 运行 `./oc.sh openclaw-app-deploy`、`./oc.sh immich-apply`、`./oc.sh jellyfin-deploy` 重新注册应用入口；若提示端口占用，新脚本会自动迁移同名容器后重试 |
 | 照片分类卡死 | `immich-machine-learning` 可能退出：`sudo docker start immich-machine-learning` |
-| 改了 `.env` 的模型配置（Base URL/API Key/Model ID）不生效 | 执行 `./oc.sh model-apply`（读 .env 立即应用并重启，约 10 秒）；或重跑 `bash install.sh`（幂等，但耗时较长） |
+| 改了 `.env` 的模型配置（Base URL/API Key/Model ID）不生效 | 执行 `./oc.sh model-apply`（读 .env 立即应用并重启，约 10 秒） |
 | 改了代码不生效 | 只改了源码没同步副本：`./oc.sh tools-sync` |
+| `docker compose -f filebrowser-compose.yml up -d` 启动 filebrowser 失败，报 `unable to find user __NAS_PUID__` | 该 compose 含 `__NAS_ROOT__` / `__NAS_PUID__` / `__NAS_PGID__` 占位符，必须走 `./oc.sh nas-files-deploy` 先渲染后再部署；若手动调试，请先把占位符替换成当前机器的实际路径与 uid/gid |
 | Immich 首次打开显示管理员注册 | 正常，表示尚未初始化；按页面创建管理员账号和密码（建议邮箱 `admin@immich.app`） |
-| 忘记 Immich 管理员密码 | 若存在初始密码文件可先 `sudo cat /DATA/AppData/immich-admin-password.txt`；若文件不存在，说明不是自动初始化路径，请在 Immich 页面按已创建账号进行重置 |
 | Immich 照片搜不到 | 后台 CLIP 任务未完成：管理界面触发 Smart Search，或 `./oc.sh immich-sync-jobs` |
+| 网页对话助手（28083）发消息报 502 / connection refused | 语音桥（28082）未运行。28083 依赖 28082：先装依赖再执行 `cd ~/NAS-Demo/local_voice_chat && ./install_voice_bridge_service.sh` 启动语音桥 |
+| 语音桥安装报“找不到装有 numpy/sherpa_onnx 的 python3” | 依赖未装：`python3 -m pip install --user sherpa-onnx numpy` 后重试（或先跑 `./run_local_voice_chat.sh` 自动安装） |
+| 网页对话助手播放被拦（Chrome/Edge 提示 Block Audio） | 浏览器自动播放策略所致，非服务故障。点击地址栏左侧锁/权限图标 → 选择 **Permissions** → 把 **Autoplay** 改成 **Audio and Video**即可放行 |
 

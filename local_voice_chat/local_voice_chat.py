@@ -30,6 +30,7 @@ VOCODER_16KHZ_URL = (
 OFFICIAL_MATCHA_DIRNAME = "matcha-icefall-zh-en"
 
 DEFAULT_HOTWORDS = [
+    "小远同学", "xiaoyuan",
     "家庭相册", "手机相册", "工作文档", "备份", "旅行",
     "图片", "照片", "文件夹", "文件", "视频",
     "分类", "移动到", "新建", "删除", "重命名",
@@ -234,6 +235,25 @@ def convert_to_wav_16k_mono(src: Path, dst: Path) -> None:
 		raise RuntimeError(p.stderr.strip() or p.stdout.strip() or "ffmpeg convert failed")
 
 
+def write_wav_mono_16k(path: Path, samples: np.ndarray) -> None:
+	"""Write float32 audio samples as 16kHz mono WAV.
+
+	This helper is used by speech capture logic when concatenating chunk files into a
+	final recording. Keeping it separate avoids repeating the WAV-writing boilerplate
+	while preserving the same 16-bit PCM format the ASR pipeline expects.
+	"""
+	import wave
+
+	samples = np.asarray(samples, dtype=np.float32)
+	samples = np.clip(samples, -1.0, 1.0)
+	pcm16 = (samples * 32767.0).astype(np.int16)
+	with wave.open(str(path), "wb") as wf:
+		wf.setnchannels(1)
+		wf.setsampwidth(2)
+		wf.setframerate(16000)
+		wf.writeframes(pcm16.tobytes())
+
+
 def load_wav_mono_16k_float(path: Path):
 	import wave
 
@@ -267,16 +287,61 @@ def wav_level_dbfs(path: Path) -> float:
 	return dbfs_from_samples(samples)
 
 
-def write_wav_mono_16k(path: Path, samples: np.ndarray) -> None:
-	import wave
+def _runtime_float_env(primary_name: str, default: float, *aliases: str) -> float:
+	for name in (primary_name, *aliases):
+		value = os.getenv(name)
+		if value is None:
+			continue
+		try:
+			return float(value)
+		except ValueError:
+			continue
+	return float(default)
 
-	samples = np.clip(samples, -1.0, 1.0)
-	pcm16 = (samples * 32767.0).astype(np.int16)
-	with wave.open(str(path), "wb") as wf:
-		wf.setnchannels(1)
-		wf.setsampwidth(2)
-		wf.setframerate(16000)
-		wf.writeframes(pcm16.tobytes())
+
+def normalize_audio_gain(
+	samples: np.ndarray,
+	target_rms_dbfs: float | None = None,
+	max_gain_db: float | None = None,
+	peak_ceiling_dbfs: float | None = None,
+) -> tuple[np.ndarray, float]:
+	"""把低电平录音提升到适合 ASR 的响度，返回 (新采样, 实际增益dB)。
+
+	部分 USB 麦克风即使把硬件采集增益拉到 100%，近距离说话也只有
+	-65~-70 dBFS，直接送 ASR 会严重误识。这里按 RMS 做数字增益补偿，
+	同时用峰值预留 headroom，避免削波。只做提升、不做衰减。
+	"""
+	if target_rms_dbfs is None:
+		target_rms_dbfs = _runtime_float_env(
+			"VOICE_ASR_GAIN_TARGET_DBFS",
+			-20.0,
+			"VOICE_ASR_TARGET_RMS_DBFS",
+		)
+	if max_gain_db is None:
+		max_gain_db = _runtime_float_env("VOICE_ASR_MAX_GAIN_DB", 40.0)
+	if peak_ceiling_dbfs is None:
+		peak_ceiling_dbfs = _runtime_float_env("VOICE_ASR_PEAK_CEILING_DBFS", -1.0)
+
+	if samples.size == 0:
+		return samples, 0.0
+
+	rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
+	if rms <= 1e-9:
+		return samples, 0.0
+
+	peak = float(np.max(np.abs(samples)))
+	rms_db = 20.0 * math.log10(rms)
+	peak_db = 20.0 * math.log10(max(peak, 1e-9))
+
+	gain_db = target_rms_dbfs - rms_db
+	gain_db = min(gain_db, peak_ceiling_dbfs - peak_db)
+	gain_db = max(0.0, min(gain_db, max_gain_db))
+	if gain_db <= 0.05:
+		return samples, 0.0
+
+	boosted = samples.astype(np.float32) * float(10.0 ** (gain_db / 20.0))
+	boosted = np.clip(boosted, -1.0, 1.0)
+	return boosted, gain_db
 
 
 def record_speech_until_silence(
@@ -557,6 +622,10 @@ def build_asr_recognizer(
 def asr_transcribe(recognizer, wav_path: Path, engine: str = "sensevoice") -> str:
 	sample_rate, samples = load_wav_mono_16k_float(wav_path)
 
+	# 麦克风原始电平可能极低（实测近距离仅 -65~-70 dBFS），先做增益补偿再识别，
+	# 否则唤醒词与指令都会被严重误识。
+	samples, _gain_db = normalize_audio_gain(samples)
+
 	stream = recognizer.create_stream()
 	stream.accept_waveform(sample_rate, samples)
 	recognizer.decode_stream(stream)
@@ -721,7 +790,7 @@ def parse_args():
 		help="sensevoice=ASR 文本唤醒(默认)；conformer=离线ASR+热词支持",
 	)
 	parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
-	parser.add_argument("--hotwords-score", type=float, default=2.5, help="热词增益分数")
+	parser.add_argument("--hotwords-score", type=float, default=3.0, help="热词增益分数；唤醒词已加入热词表，3.0 左右均衡")
 
 	parser.add_argument("--once", action="store_true", help="Run one dialog turn and exit")
 	parser.add_argument("--no-play", action="store_true", help="Do not play TTS audio")

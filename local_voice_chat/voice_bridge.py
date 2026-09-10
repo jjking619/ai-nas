@@ -137,19 +137,20 @@ def parse_args():
     parser.add_argument(
         "--wake-min-level-dbfs",
         type=float,
-        default=float(os.getenv("VOICE_WAKE_MIN_LEVEL_DBFS", "-45.0")),
-        help="忽略低于该音量阈值的唤醒片段，避免底噪/环境噪声持续触发 ASR",
+        default=float(os.getenv("VOICE_WAKE_MIN_LEVEL_DBFS", "-68.0")),
+        help="忽略低于该音量阈值的唤醒片段；该值越低越灵敏。"
+        "本机实测环境底噪约 -73dBFS、近距离语音约 -64dBFS，故默认 -68",
     )
     parser.add_argument(
         "--wake-low-level-dbfs",
         type=float,
-        default=-43.0,
+        default=float(os.getenv("VOICE_WAKE_LOW_LEVEL_DBFS", "-40.0")),
         help="Wake录音低于该电平且首次未命中时，触发一次增益重试",
     )
     parser.add_argument(
         "--wake-boost-db",
         type=float,
-        default=6.0,
+        default=float(os.getenv("VOICE_WAKE_BOOST_DB", "6.0")),
         help="低电平重试时的增益(dB)，设为0可关闭",
     )
     parser.add_argument(
@@ -174,7 +175,7 @@ def parse_args():
         help="sensevoice=不支持热词；conformer=离线大模型+热词",
     )
     parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
-    parser.add_argument("--hotwords-score", type=float, default=2.5, help="热词增益分数")
+    parser.add_argument("--hotwords-score", type=float, default=3.0, help="热词增益分数；唤醒词已加入热词表，3.0 左右均衡")
 
     parser.add_argument("--session-idle-rounds", type=int, default=3)
 
@@ -870,6 +871,16 @@ def _looks_like_image_filter_request(user_text: str) -> bool:
     return has_filter_intent and has_photo_object
 
 
+def _is_style_only_phrase(text: str) -> bool:
+    s = re.sub(r"\s+", "", (text or "").strip())
+    s = s.strip("，。！？,.!?；;：:")
+    if not s:
+        return False
+    if s.lower() in {"vintage", "japanese", "film"}:
+        return True
+    return s in {"复古", "日系", "胶片", "复古风格", "日系风格", "胶片风格", "滤镜", "风格", "调色"}
+
+
 def _detect_image_filter_target(user_text: str):
     roots = ("手机相册", "家庭相册", "旅行", "备份")
     return next((r for r in roots if r in user_text), None)
@@ -963,12 +974,17 @@ def _consume_pending_image_filter(text: str, pending: dict | None):
     if not pending:
         return None, pending
 
-    target = pending.get("target")
-    style = pending.get("style")
-    if target is None:
-        target = _detect_image_filter_target(text)
-    if style is None:
-        style = _detect_image_style(text)
+    explicit_target = _detect_image_filter_target(text)
+    explicit_style = _detect_image_style(text)
+    if explicit_target is None and explicit_style is None and not _looks_like_image_filter_request(text):
+        return "我还在等你说清楚要处理哪个目录和风格。", None
+
+    target = explicit_target or pending.get("target")
+    style = explicit_style
+    if style is None and explicit_target is not None:
+        style = None
+    elif style is None:
+        style = pending.get("style")
 
     if target is not None and style is not None:
         return _run_image_batch_reply(target, style, bool(pending.get("dry"))), None
@@ -1067,6 +1083,47 @@ DOWNLOAD_MEDIA_LIBRARY = {
 _DOWNLOAD_MEDIA_LIBRARY = DOWNLOAD_MEDIA_LIBRARY
 
 
+def _host_side_service_url(raw_url: str | None, fallback: str) -> str:
+    """宿主机进程访问容器服务时，优先使用端口映射地址。"""
+    url = (raw_url or "").strip()
+    if not url:
+        return fallback
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return fallback
+
+    host = (parsed.hostname or "").lower()
+    mapped_port = {
+        "knowledge_base": 28084,
+        "media_downloader": 28081,
+    }.get(host)
+    if mapped_port is None:
+        return url
+
+    path = parsed.path or ""
+    if host == "media_downloader" and not path:
+        path = "/download"
+    if path == "/":
+        path = ""
+
+    netloc = f"127.0.0.1:{mapped_port}"
+    return urllib.parse.urlunparse(("http", netloc, path, "", parsed.query, ""))
+
+
+def _sanitize_download_filename(name: str) -> str:
+    """去掉常见后缀/括号标记，只保留可读文件名。"""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s*\[[^\]]*\]", "", s)
+    s = re.sub(r"\s*\([^)]*\)", "", s)
+    s = re.sub(r"\s*\{[^}]*\}", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _fast_local_download_reply(args, user_text: str):
     """命中下载指令时，直连 media_downloader API，避免走 agent 长链路。"""
     user_text_lower = user_text.lower()
@@ -1111,7 +1168,10 @@ def _fast_local_download_reply(args, user_text: str):
     import json as _json
     import urllib.request as _ur
 
-    api_url = (os.getenv("DOWNLOAD_API_URL") or "http://127.0.0.1:28081/download").strip()
+    api_url = _host_side_service_url(
+        os.getenv("DOWNLOAD_API_URL"),
+        "http://127.0.0.1:28081/download",
+    )
     payload = {
         "url": matched.get("url", "") if matched else "",
         "query": "" if matched else term,
@@ -1138,9 +1198,9 @@ def _fast_local_download_reply(args, user_text: str):
         files = data.get("files") if isinstance(data.get("files"), list) else []
         safe_subdir = str(data.get("safe_subdir") or target_subdir)
         if files:
-            first_name = Path(files[0]).name
+            first_name = _sanitize_download_filename(Path(files[0]).name)
             print(f"[DL] local download success key={matched_key or '(query)'} file={first_name}")
-            return f"下载已完成，文件名{first_name}，已保存到{safe_subdir}。"
+            return f"下载已完成，已保存到{safe_subdir}，文件名{first_name}。"
         print(f"[DL] local download success key={matched_key or '(query)'}")
         return f"下载已完成，已保存到{safe_subdir}。"
     except Exception as e:  # noqa: BLE001
@@ -1334,8 +1394,8 @@ def _fast_local_play_reply(args, user_text: str):
     import urllib.request as _ur
 
     base = args.jellyfin_url.rstrip("/")
-    hdrs_json = {"X-MediaBrowser-Token": args.jellyfin_api_key, "Content-Type": "application/json"}
-    hdrs_get  = {"X-MediaBrowser-Token": args.jellyfin_api_key}
+    hdrs_json = {"Authorization": f"MediaBrowser Token={args.jellyfin_api_key}", "Content-Type": "application/json"}
+    hdrs_get  = {"Authorization": f"MediaBrowser Token={args.jellyfin_api_key}"}
 
     def _req(method, path, body=None, timeout=8):
         url  = base + path
@@ -1506,7 +1566,10 @@ _KB_INTENT_WORDS = re.compile(
 _KB_OBJECT_WORDS = re.compile(
     r"文件|文档|合同|报告|表格|表|记录|照片|图片|相册|视频|电影|音乐|资料|方案|说明|计划|协议"
 )
-_KB_API_URL = os.getenv("KB_API_URL") or "http://127.0.0.1:28084"
+_KB_API_URL = _host_side_service_url(
+    os.getenv("KB_API_URL"),
+    "http://127.0.0.1:28084",
+).rstrip("/")
 
 _KB_EXT_SPOKEN_MAP = {
     ".pdf": "PDF文件",
@@ -1592,6 +1655,34 @@ def _format_kb_spoken_reply(results):
     return f"找到{total}条，第一个是{file_spoken}。"
 
 
+def _fast_local_directory_listing_reply(_args, user_text: str):
+    """本地目录列举：把“哪些文件/里有哪些文件”作为 NAS 目录查询而不是 Immich 语义搜图。"""
+    text = (user_text or "").strip()
+    if not text:
+        return None
+    if not re.search(r"(有哪些|有的|列出|列举|文件|目录|文件夹)", text):
+        return None
+    if not re.search(r"(家庭相册|手机相册|旅行|备份|目录|文件夹)", text):
+        return None
+
+    roots = {
+        "家庭相册": "/home/pi/nas_share/家庭相册",
+        "手机相册": "/home/pi/nas_share/手机相册",
+        "旅行": "/home/pi/nas_share/旅行",
+        "备份": "/home/pi/nas_share/备份",
+    }
+    matched = next((k for k in roots if k in text), None)
+    if matched is None:
+        return None
+    base = Path(roots[matched])
+    if not base.exists():
+        return f"{matched}目录还没创建，先确认路径后再列文件。"
+    entries = sorted(p.name for p in base.iterdir() if p.exists())[:8]
+    if not entries:
+        return f"{matched}目录里还没有文件。"
+    return f"{matched}里有这些文件：{ '、'.join(entries[:6]) }。"
+
+
 def _fast_local_kb_reply(_args, user_text: str):
     """命中知识库查询时，直连 KB API 搜索，避免走 agent 长链路。"""
     if not (_KB_INTENT_WORDS.search(user_text) and _KB_OBJECT_WORDS.search(user_text)):
@@ -1629,9 +1720,9 @@ _IMMICH_API_KEY = os.getenv("IMMICH_API_KEY") or ""
 
 _IMMICH_INTENT_RE = re.compile(r"找|搜|查找|搜索|有哪些")
 _IMMICH_OBJECT_RE = re.compile(r"照片|图片|相册")
-# 位置/管理类意图不走语义搜索
+# 位置/管理类意图不走语义搜索；文件/目录查询也不应误判为相册语义搜索
 _IMMICH_EXCLUDE_RE = re.compile(
-    r"在哪|哪里|哪个|位置|文件夹|分类|归档|整理|下载|播放|删除|移动|滤镜|处理|备份"
+    r"在哪|哪里|哪个|位置|文件夹|文件|目录|路径|分类|归档|整理|下载|播放|删除|移动|滤镜|处理|备份"
 )
 _IMMICH_STRIP_RE = re.compile(
     r"帮我|请|找|查找|搜索|搜|所有|全部|有的|有|照片|图片|相册|包含|带|的|里|中"
@@ -1710,6 +1801,7 @@ def _is_dangerous_command(text: str) -> bool:
 LOCAL_FAST_CHANNELS = (
     ("filter", _fast_local_image_filter_reply),
     ("classify", _fast_local_classify_reply),
+    ("directory", _fast_local_directory_listing_reply),
     ("download", _fast_local_download_reply_with_args),
     ("play", _fast_local_play_reply),
     ("immich", _fast_local_immich_reply),
@@ -1786,7 +1878,7 @@ def ask_openclaw(args, user_text):
         "agent",
         "--session-key",
         f"voice-turn:{int(time.time() * 1000)}",  # 每轮独立会话，防止跨轮上下文误确认
-        "--thinking", "minimal",  # 降低推理深度，减少首响应延迟
+        "--thinking", "off",  # 非推理模型(deepseek 等)不支持 minimal；off 最稳且首响应最快
         "--message",
         bridge_prompt,
         "--json",
@@ -1909,6 +2001,8 @@ def _looks_like_incomplete_command(text: str) -> bool:
     s = s.strip("，。！？,.!?；;：:")
     if not s:
         return False
+    if _is_style_only_phrase(s):
+        return True
     if len(s) <= 2:
         return True
     if _COMPLETE_QUESTION_RE.search(s):
@@ -2008,6 +2102,8 @@ def _is_irrelevant_speech(text: str) -> bool:
     # L2
     if s in _SOCIAL_IRRELEVANT:
         return True
+    if _is_style_only_phrase(s):
+        return True
     # L3
     if len(s) <= 8 and not any(k in s for k in _TASK_KEYWORDS):
         return True
@@ -2046,6 +2142,27 @@ def _first_sentence(text: str) -> str:
     return text[: m.end()].strip()
 
 
+def _truncate_tts_text(reply: str, max_chars: int) -> str:
+    text = (reply or "").strip()
+    if not text:
+        return ""
+    max_chars = max(12, int(max_chars))
+    if len(text) <= max_chars:
+        return text
+
+    cut = max_chars
+    for idx in range(max_chars, 10, -1):
+        if text[idx - 1] in "，。！？；;:：、 ":
+            cut = idx
+            break
+    truncated = text[:cut].rstrip("，、；:： .!?,?）)")
+    if not truncated:
+        truncated = text[:max_chars].rstrip("，、；:： .!?,?）)")
+    if not truncated.endswith(("。", "！", "？")):
+        truncated += "。"
+    return truncated
+
+
 def _adaptive_tts_reply(user_text: str, reply: str, max_chars: int, brief_max_chars: int, brief_user_len: int):
     """根据用户话轮长度动态压缩播报内容，并保留可恢复详情。"""
     if not reply:
@@ -2060,13 +2177,13 @@ def _adaptive_tts_reply(user_text: str, reply: str, max_chars: int, brief_max_ch
 
     if short_cmd and (not important):
         first = _first_sentence(reply)
-        spoken = first if len(first) <= brief_max_chars else (first[:brief_max_chars].rstrip("，、；:： ") + "。")
+        spoken = first if len(first) <= brief_max_chars else _truncate_tts_text(first, brief_max_chars)
         if spoken != reply:
             return spoken, reply
         return spoken, ""
 
     if len(reply) > max_chars:
-        spoken = reply[:max_chars].rstrip("，、；:： ") + "。"
+        spoken = _truncate_tts_text(reply, max_chars)
         return spoken, reply
 
     return reply, ""
@@ -2098,8 +2215,8 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
     import urllib.request as _ur
 
     base = jellyfin_url.rstrip("/")
-    hdrs_json = {"X-MediaBrowser-Token": api_key, "Content-Type": "application/json"}
-    hdrs_get  = {"X-MediaBrowser-Token": api_key}
+    hdrs_json = {"Authorization": f"MediaBrowser Token={api_key}", "Content-Type": "application/json"}
+    hdrs_get  = {"Authorization": f"MediaBrowser Token={api_key}"}
 
     def _req(method, path, body=None, timeout=8):
         url = base + path

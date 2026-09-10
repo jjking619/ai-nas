@@ -560,7 +560,7 @@ cd /home/pi/NAS-Demo
 
 实现文件（最小改动）：
 
-- [filebrowser-compose.yml](filebrowser-compose.yml) — 官方 `filebrowser/filebrowser:latest`（arm64 可用）
+- [filebrowser-compose.yml](filebrowser-compose.yml) — 固定到 `filebrowser/filebrowser:2.63.23`（arm64 可用）
 - `oc.sh` 新增 `nas-files-deploy` / `nas-files-show` 两条命令
 
 部署：
@@ -569,6 +569,8 @@ cd /home/pi/NAS-Demo
 cd /home/pi/NAS-Demo
 ./oc.sh nas-files-deploy
 ```
+
+Do not run `docker compose -f filebrowser-compose.yml up -d` directly. That compose file contains the placeholders `__NAS_ROOT__`, `__NAS_PUID__`, and `__NAS_PGID__`, and `./oc.sh nas-files-deploy` renders them before deployment.
 
 路径映射：
 
@@ -584,6 +586,7 @@ cd /home/pi/NAS-Demo
 - 部署脚本会在数据库初始化后：停止容器 → `config set --auth.method=noauth` 关闭登录（免密）→ 再启动；
   免登录后按 `admin` 身份自动登录，具备增删改查权限。
 - 点击磁贴直接打开 `http://<CasaOS主机IP>:28085`；图标为内置 SVG data URI，无需外链图片。
+- Upstream File Browser was archived on 2026-09-01 and no longer receives security fixes. Keep it LAN-only, run it unprivileged, and do not expose it directly to the public internet.
 
 ## 1. 在 CasaOS 中导入 Compose
 
@@ -831,6 +834,69 @@ curl -s http://127.0.0.1:28083/api/healthz   # 返回 proxy_ok: true 即桥接�
 ```bash
 sudo systemctl daemon-reload && sudo systemctl restart voice-bridge
 ```
+
+### 6.7 进阶用法与常见问题
+
+> 本节由原 `local_voice_chat/README.md` 合并而来（该文件已删除，内容并入此处）。
+
+**离线文件测试（无麦克风时验证整条链路）**
+
+```bash
+./run_local_voice_chat.sh \
+	--once \
+	--no-play \
+	--wake-audio-file /path/to/wake.wav \
+	--speech-audio-file /path/to/speech.wav
+```
+
+**更多可用参数**
+
+```bash
+# 单轮模式
+./run_local_voice_chat.sh --once
+
+# 关闭首次自动下载 ASR 模型
+./run_local_voice_chat.sh --no-auto-download-asr
+
+# 旧行为：每轮都要先说唤醒词
+./run_local_voice_chat.sh --wake-any-keyword --require-wake-each-turn
+
+# 连续空识别 N 轮后自动休眠
+./run_local_voice_chat.sh --session-idle-rounds 5
+
+# 只识别不播报
+./run_local_voice_chat.sh --no-play
+
+# 前台 bridge 模式自定义唤醒词
+python3 voice_bridge.py --wake-words "小远同学,xiaoyuan"
+```
+
+**HTTP 服务模式补充**（systemd 默认进入）
+
+- 页面 `http://<NAS-IP>:28082/`：点击按钮 → 宿主麦克风录音 → 处理 → 播报
+- 接口 `POST /trigger`：`{"text":"..."}` 传文本指令 / 空 body 触发一次语音
+- 页面底部「对话历史」：每轮结束写一条 JSONL → `voice_turns.jsonl` → `voice_remote` 容器（:28083）读同一文件 → `/api/turns` → 页面每 1.5s 增量轮询
+
+**唤醒一直失败怎么办**
+
+- 每轮录音后看这行：`[MIC] wake clip level: -xx.x dBFS`
+- 低于 `-45 dBFS` 说明音量太低：靠近麦克风或提高输入增益
+- 先试 `--wake-any-keyword`，然后依次念：小创小创 / 小燕小燕 / 云铃云铃 / 小远同学
+- 加大唤醒窗口：`./run_local_voice_chat.sh --wake-any-keyword --wake-duration 5`
+- 怀疑 PulseAudio 源不对，改走 ALSA：`./run_local_voice_chat.sh --wake-any-keyword --record-backend alsa`
+
+**安全防护**
+
+- **危险指令二次确认**：含「删除/清空/移除/格式化」等词的指令先拦截，必须再说「确认」才执行，其余话术一律取消
+- **每轮独立会话**：OpenClaw 使用 `voice-turn:<时间戳>` session-key，无跨轮上下文，杜绝「上一轮待确认被下一轮无关语音误触发」
+- **滤镜权限诊断**：批处理遇 `Permission denied` 时明确提示修复目录归属
+
+**已知问题**
+
+- **目录归属错乱**（已修复过）：容器进程曾以 `pulse` 用户创建 NAS 目录，导致当前登录用户无法写入（表现为滤镜「失败 N 张」）。若复现：
+	`sudo find "${HOME}/nas_share" -user pulse -exec chown "$(id -un)":"$(id -gn)" {} +`
+- **唤醒词识别依赖麦克风电平**：本机 USB 麦克风硬件增益已顶格（`amixer -c 0 sget Mic` = 255/100%），但实测底噪约 **-73dBFS**、近距离说话也仅约 **-64dBFS**。因此 ASR 前已内置数字增益补偿（`normalize_audio_gain`，最多 +40dB，带峰值保护不削波），唤醒门槛 `--wake-min-level-dbfs` 默认放宽到 **-68**。
+- 若仍偏不灵敏，优先从采集端提升：`pactl set-source-volume @DEFAULT_SOURCE@ 150%`，或换用灵敏度更高的麦克风（另见第 8 节）。
 
 ## 6. 清理旧的错误容器（如果之前装过商店版）
 

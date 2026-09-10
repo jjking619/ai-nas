@@ -22,6 +22,8 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
+OPENCLAW_IMAGE="openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b"
+
 OPENCLAW_MODEL_ID="${OPENCLAW_MODEL_ID:-deepseek-chat}"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-casaos}"
 export OPENCLAW_MODEL_ID OPENCLAW_GATEWAY_TOKEN
@@ -72,7 +74,7 @@ echo "[2/4] Remove incompatible image tag if exists"
 "${DOCKER_CMD[@]}" rmi icewhaletech/openclaw:2026.5.7 >/dev/null 2>&1 || true
 
 echo "[3/4] Pull arm64-capable upstream image"
-"${DOCKER_CMD[@]}" pull --platform linux/arm64 openclaw/openclaw:latest
+"${DOCKER_CMD[@]}" pull --platform linux/arm64 "$OPENCLAW_IMAGE"
 
 echo "[3.5/4] Seed initial OpenClaw gateway config if missing"
 "${SUDO_CMD[@]}" mkdir -p "$DATA_DIR"
@@ -121,7 +123,7 @@ else
     -p 18790:18790 \
     -v /DATA/AppData/openclaw:/home/node/.openclaw \
     -v "$NAS_ROOT":/nas_share \
-    openclaw/openclaw:latest \
+    "$OPENCLAW_IMAGE" \
     /bin/bash -lc 'node dist/index.js gateway --bind lan --allow-unconfigured --port 18789'
 fi
 
