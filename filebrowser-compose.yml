@@ -57,7 +57,7 @@ x-casaos:
   port_map: "28085"
   store_app_id: nas-filebrowser
   tagline:
-    en_US: 管理 nas_share
+    en_US: Browse nas_share
   thumbnail: ""
   title:
-    en_US: NAS 文件
+    en_US: NAS Files

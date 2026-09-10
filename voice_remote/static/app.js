@@ -183,7 +183,7 @@ function _applyBridgeState(state, busy) {
   textBtn.disabled = active;
   textInput.disabled = active;
   if (state !== 'idle') {
-    setStatusText(STATE_LABELS[state] || ('对话助手状态：' + state));
+    setStatusText(STATE_LABELS[state] || ('Voice Assistant status: ' + state));
   } else if (_lastBridgeState !== 'idle') {
     setStatusText('待机中。请选择语音或文本模式。');
   }
