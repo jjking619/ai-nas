@@ -22,6 +22,8 @@ MODEL_ID_ARG=""
 CHECK_ONLY=0
 RESET=0
 SKIP_FIREWALL=0
+# 默认安装语音桥（宿主机 systemd 服务）；可用 --skip-voice 或 SKIP_VOICE_BRIDGE=1 跳过
+SKIP_VOICE="${SKIP_VOICE_BRIDGE:-0}"
 ARG_FIREWALL_ONLY=0
 ARG_UI_FIX_ONLY=0
 
@@ -48,12 +50,14 @@ usage() {
   bash install.sh reset            # 重置 OpenClaw 配置为 bootstrap 并重启容器
   bash install.sh firewall         # 仅放行 NAS-Demo 所需端口（幂等 + 持久化）
   bash install.sh ui-fix           # 仅修复 CasaOS Legacy 卡片显示（幂等）
+  bash install.sh --skip-voice     # 安装时跳过语音桥（宿主机 systemd 服务）
 
 说明:
   - 交互模式下只会询问 OpenClaw API 相关配置
   - 非交互可通过参数传入，便于远程或自动化
   - --check 仅做环境检查，不会改动系统
   - --skip-firewall 在正常安装时跳过自动放行端口
+  - 默认自动安装语音桥（Voice Assistant 后端，端口 28082），--skip-voice 可跳过
   - 若在“还没有 NAS-Demo 代码”的目录运行，会自动 git clone（可用 --repo 换地址）
 EOF
 }
@@ -101,6 +105,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --check) CHECK_ONLY=1 ;;
     --skip-firewall) SKIP_FIREWALL=1 ;;
+    --skip-voice) SKIP_VOICE=1 ;;
     --repo=*)
       INSTALL_REPO="${1#*=}"
       if [[ -z "$INSTALL_REPO" && $# -ge 2 && "$2" != -* ]]; then
@@ -548,6 +553,75 @@ sync_immich_key_to_env_if_exists() {
   fi
 }
 
+# =============================================================================
+# 语音桥（宿主机 systemd 服务，端口 28082）
+#
+# Voice Assistant 网页（28083）只是前端，对话由语音桥处理后端转发，因此语音桥
+# 属于「必装」组件；这里在部署流程末尾自动完成，避免用户漏装导致 28083 报 502。
+#
+# 注：
+#   - 需要 root 写 /etc/systemd/system/voice-bridge.service 并启用服务；非交互
+#     环境且无免密 sudo 时安全跳过，不阻塞自动化安装。
+#   - 首次安装会预下载 ASR/TTS 模型（数百 MB），视网络需数分钟。
+#   - 幂等：已在运行则跳过；需要重装时手动执行安装脚本。
+# =============================================================================
+setup_voice_bridge() {
+  local installer="$APP_DIR/local_voice_chat/install_voice_bridge_service.sh"
+
+  if [[ "${SKIP_VOICE:-0}" -eq 1 ]]; then
+    log "已按 --skip-voice 跳过语音桥安装"
+    log "  需要时手动执行: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh"
+    return 0
+  fi
+
+  if [[ ! -f "$installer" ]]; then
+    warn "未找到语音桥安装脚本: $installer，跳过"
+    return 0
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "未检测到 systemd，跳过语音桥安装（可前台调试: python3 local_voice_chat/voice_bridge.py）"
+    return 0
+  fi
+
+  if systemctl is-active --quiet voice-bridge 2>/dev/null; then
+    log "语音桥已在运行，跳过安装（重装: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh）"
+    return 0
+  fi
+
+  # 离线 ASR/TTS 依赖：numpy + sherpa_onnx（用户级 pip）
+  if ! python3 -c 'import numpy, sherpa_onnx' >/dev/null 2>&1; then
+    log "安装语音桥依赖（numpy / sherpa-onnx，首次较慢）..."
+    if ! python3 -m pip install --user numpy sherpa-onnx >/dev/null 2>&1; then
+      # Debian 12+ / Ubuntu 24+ 标记为 externally-managed，需显式放行
+      python3 -m pip install --user --break-system-packages numpy sherpa-onnx >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! python3 -c 'import numpy, sherpa_onnx' >/dev/null 2>&1; then
+    warn "仍缺少 numpy/sherpa_onnx，跳过语音桥安装"
+    warn "  手动安装依赖: python3 -m pip install --user sherpa-onnx numpy"
+    return 0
+  fi
+
+  # 安装 systemd 服务需要 root：非交互环境不弹密码提示，直接给出手动命令
+  if [[ "${EUID}" -ne 0 ]] && ! sudo -n true >/dev/null 2>&1; then
+    if [[ ! -t 0 ]]; then
+      warn "非交互环境且无免密 sudo，跳过语音桥安装"
+      warn "  手动安装: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh"
+      return 0
+    fi
+    log "安装语音桥需要 sudo 权限，稍后会提示输入密码"
+  fi
+
+  log "安装并启动语音桥（首次会预下载 ASR/TTS 模型，视网络需数分钟）..."
+  if bash "$installer"; then
+    log "语音桥已就绪（端口 28082）"
+  else
+    warn "语音桥安装失败，可稍后手动执行:"
+    warn "  cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh"
+  fi
+}
+
 deploy_all() {
   log "开始执行一键安装流程..."
   local has_casaos_cli=0
@@ -658,6 +732,9 @@ EOF
     fi
   fi
 
+  # 自动安装语音桥（Voice Assistant 的后端依赖），失败不阻断主流程
+  setup_voice_bridge
+
   docker_cmd restart openclaw >/dev/null 2>&1 || true
 }
 
@@ -680,7 +757,7 @@ summary() {
   if [[ -n "$casaos_url" ]]; then
     echo "1) 先打开 CasaOS 管理入口"
     echo "   ${casaos_url}"
-    echo "2) 在 CasaOS 中确认/配置其它应用（Immich / Jellyfin / 文件浏览 / 对话助手）"
+    echo "2) 在 CasaOS 中确认/配置其它应用（Immich / Jellyfin / NAS Files / Voice Assistant）"
     echo "3) 再打开 OpenClaw 控制台"
   else
     echo "1) 先安装/修复 CasaOS 管理服务"
@@ -704,8 +781,13 @@ summary() {
   echo "OpenClaw : ${openclaw_url}"
   echo "Immich   : http://${ip:-<IP>}:2283"
   echo "Jellyfin : http://${ip:-<IP>}:8096"
-  echo "文件浏览 : http://${ip:-<IP>}:28085"
-  echo "对话助手 : http://${ip:-<IP>}:28083"
+  echo "NAS Files: http://${ip:-<IP>}:28085"
+  echo "Voice Assistant: http://${ip:-<IP>}:28083"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet voice-bridge 2>/dev/null; then
+    echo "语音桥   : http://${ip:-<IP>}:28082 (active)"
+  else
+    echo "语音桥   : 未运行（Voice Assistant 依赖它；安装: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh）"
+  fi
   echo "============================================================"
   echo "常用维护命令:"
   echo "  ./oc.sh status"
