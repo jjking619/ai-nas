@@ -805,6 +805,24 @@ apply_casaos_legacy_hide_patch() {
     return 0
   fi
 
+  backup_file="${home_bundle}.nasdemo.bak"
+
+  # 历史版本缺陷：替换串里未转义的 "&" 会被 sed 展开成整个匹配内容，
+  # 注入出 `(item this.oldAppList = orgOldAppList;...)` 这类非法代码，
+  # 导致 Home 路由编译失败（登录后白屏）。命中该特征时先用备份还原再重打补丁。
+  if grep -q "const titleObj=(item this.oldAppList" "$home_bundle" 2>/dev/null; then
+    if [[ ! -f "$backup_file" ]]; then
+      warn "CasaOS Home bundle 已被旧补丁破坏且无备份，请重装 CasaOS 资源后重试"
+      return 0
+    fi
+    if [[ "${EUID}" -eq 0 ]]; then
+      cp "$backup_file" "$home_bundle"
+    else
+      sudo cp "$backup_file" "$home_bundle"
+    fi
+    warn "检测到 CasaOS Home bundle 曾被旧补丁破坏，已用备份还原"
+  fi
+
   tmp_file="$(mktemp /tmp/casaos-home.XXXXXX.js)"
   cp "$home_bundle" "$tmp_file"
 
@@ -814,7 +832,7 @@ apply_casaos_legacy_hide_patch() {
     return 0
   fi
 
-  replacement="const nasDemoLegacyHideBlacklist=['openclaw','media_downloader','knowledge_base','immich-server','immich-machine-learning','immich-postgres','immich-redis'];this.oldAppList = orgOldAppList.filter(item => { const titleObj=(item && item.title) || {}; const title=((titleObj.en_us || titleObj.en_US || '') + '').toLowerCase(); return nasDemoLegacyHideBlacklist.indexOf(title) === -1; });"
+  replacement="const nasDemoLegacyHideBlacklist=['openclaw','media_downloader','knowledge_base','immich-server','immich-machine-learning','immich-postgres','immich-redis'];this.oldAppList = orgOldAppList.filter(item => { const titleObj=(item \&\& item.title) || {}; const title=((titleObj.en_us || titleObj.en_US || '') + '').toLowerCase(); return nasDemoLegacyHideBlacklist.indexOf(title) === -1; });"
   sed -i "0,/this.oldAppList = orgOldAppList;/s#this.oldAppList = orgOldAppList;#${replacement}#" "$tmp_file"
 
   if ! grep -q "nasDemoLegacyHideBlacklist" "$tmp_file"; then
@@ -829,7 +847,6 @@ apply_casaos_legacy_hide_patch() {
     return 0
   fi
 
-  backup_file="${home_bundle}.nasdemo.bak"
   if [[ "${EUID}" -eq 0 ]]; then
     [[ -f "$backup_file" ]] || cp "$home_bundle" "$backup_file"
     cp "$tmp_file" "$home_bundle"
