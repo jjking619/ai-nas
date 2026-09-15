@@ -67,11 +67,13 @@ Usage:
   ./oc.sh immich-sync-jobs   Trigger Immich ML jobs (faceDetection + smartSearch)
   ./oc.sh jellyfin-deploy    Start Jellyfin (jellyfin-compose.yml)
   ./oc.sh jellyfin-show      Show Jellyfin container status
+  ./oc.sh jellyfin-apply [URL]  Apply Jellyfin .env key/url to voice-bridge and verify
   ./oc.sh jellyfin-key-check [URL]  Verify Jellyfin API key in .env and runtime state
   ./oc.sh voice-assistant-deploy  Install Voice Assistant (CasaOS web app)
   ./oc.sh voice-assistant-show    Show Voice Assistant container status
   ./oc.sh nas-files-deploy        Install NAS file browser (read-only nas_share)
   ./oc.sh nas-files-show          Show NAS file browser container status
+  ./oc.sh docker-mirror       Configure Docker registry mirrors (fix image pull resets/failures)
 EOF
 }
 
@@ -725,10 +727,10 @@ case "${1:-}" in
       fi
     fi
     # 让 openclaw 能按容器名直接访问下载服务（host.docker.internal 在本机不可达）
-    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
-      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
+    if docker_cmd network inspect big-bear-immich_big_bear-immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' media_downloader'; then
-        docker_cmd network connect big-bear-immich_big_bear_immich_network media_downloader
+        docker_cmd network connect big-bear-immich_big_bear-immich_network media_downloader
       fi
     fi
 
@@ -799,10 +801,10 @@ case "${1:-}" in
     fi
 
     # 让 openclaw 能按容器名直接访问 KB 服务（host.docker.internal 在本机不可达）
-    if docker_cmd network inspect big-bear-immich_big_bear_immich_network >/dev/null 2>&1; then
-      if ! docker_cmd network inspect big-bear-immich_big_bear_immich_network \
+    if docker_cmd network inspect big-bear-immich_big_bear-immich_network >/dev/null 2>&1; then
+      if ! docker_cmd network inspect big-bear-immich_big_bear-immich_network \
           --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q ' knowledge_base'; then
-        docker_cmd network connect big-bear-immich_big_bear_immich_network knowledge_base
+        docker_cmd network connect big-bear-immich_big_bear-immich_network knowledge_base
       fi
     fi
 
@@ -1048,6 +1050,19 @@ case "${1:-}" in
   jellyfin-key-check)
     check_jellyfin_api_key "${2:-}"
     ;;
+  jellyfin-apply)
+    echo "Applying Jellyfin config from .env to voice-bridge..."
+    if ! command -v systemctl >/dev/null 2>&1; then
+      echo "ERROR: systemctl not found, please restart voice-bridge manually"
+      exit 1
+    fi
+    if [[ "${EUID}" -eq 0 ]]; then
+      systemctl restart voice-bridge
+    else
+      sudo systemctl restart voice-bridge
+    fi
+    check_jellyfin_api_key "${2:-}"
+    ;;
   voice-assistant-deploy)
     VOICE_COMPOSE="${APP_DIR}/voice-assistant-compose.yml"
     if [[ ! -f "${VOICE_COMPOSE}" ]]; then
@@ -1168,6 +1183,20 @@ case "${1:-}" in
     ;;
   nas-files-show)
     docker_cmd ps -a --filter name=filebrowser --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    ;;
+  docker-mirror)
+    # 配置 Docker 镜像加速（幂等）：解决直连 Docker Hub 拉取大镜像被重置导致的
+    # 「小镜像能装、大镜像反复失败」问题。脚本内部会备份配置、校验 JSON 后重启 docker。
+    MIRROR_SCRIPT="${APP_DIR}/setup_docker_mirror.sh"
+    if [[ ! -f "$MIRROR_SCRIPT" ]]; then
+      echo "ERROR: 未找到 ${MIRROR_SCRIPT}"
+      exit 1
+    fi
+    if [[ "${EUID}" -eq 0 ]]; then
+      bash "$MIRROR_SCRIPT"
+    else
+      sudo bash "$MIRROR_SCRIPT"
+    fi
     ;;
   ""|-h|--help|help)
     usage
