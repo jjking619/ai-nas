@@ -1,7 +1,7 @@
 name: openclaw-portal
 services:
   openclaw_portal:
-    image: python:3.11-alpine
+    image: python:3.11-slim
     container_name: openclaw_portal
     restart: unless-stopped
     command:

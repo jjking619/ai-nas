@@ -20,6 +20,7 @@ SKIP_FIREWALL=0
 SKIP_VOICE="${SKIP_VOICE_BRIDGE:-0}"
 ARG_FIREWALL_ONLY=0
 ARG_UI_FIX_ONLY=0
+ARG_MIRROR_ONLY=0
 
 FIREWALL_PORTS="${FIREWALL_PORTS:-80 2283 8096 28081 28082 28083 28084 28085 28086 24190 24192}"
 INSTALL_REPO="${INSTALL_REPO:-https://github.com/jjking619/ai-nas.git}"
@@ -35,6 +36,7 @@ usage() {
   bash install.sh reset            # 重置 OpenClaw 配置为 bootstrap 并重启容器
   bash install.sh firewall         # 仅放行 NAS-Demo 所需端口（幂等 + 持久化）
   bash install.sh ui-fix           # 仅修复 CasaOS Legacy 卡片显示（幂等）
+  bash install.sh docker-mirror    # 配置 Docker 镜像加速（解决大镜像拉取失败，幂等）
   bash install.sh --skip-voice     # 安装时跳过语音桥（宿主机 systemd 服务）
 
 说明:
@@ -107,6 +109,7 @@ while [[ $# -gt 0 ]]; do
     reset) RESET=1 ;;
     firewall) RESET=0; CHECK_ONLY=0; ARG_FIREWALL_ONLY=1 ;;
     ui-fix) RESET=0; CHECK_ONLY=0; ARG_FIREWALL_ONLY=0; ARG_UI_FIX_ONLY=1 ;;
+    docker-mirror) RESET=0; CHECK_ONLY=0; ARG_FIREWALL_ONLY=0; ARG_UI_FIX_ONLY=0; ARG_MIRROR_ONLY=1 ;;
     -h|--help|help) usage; exit 0 ;;
     *)
       echo "未知参数: $1" >&2
@@ -261,6 +264,150 @@ cleanup_legacy_nas_demo_app() {
   fi
 }
 
+restart_casaos_app_services() {
+  # CasaOS 应用安装卡在 "Installing" 时，重启相关服务可清理僵死任务状态。
+  if [[ "${EUID}" -eq 0 ]]; then
+    systemctl restart casaos-message-bus casaos-app-management casaos-gateway >/dev/null 2>&1 || true
+  else
+    sudo systemctl restart casaos-message-bus casaos-app-management casaos-gateway >/dev/null 2>&1 || true
+  fi
+}
+
+run_oc_cmd_with_casaos_retry() {
+  local subcmd="$1"
+  local label="$2"
+  local max_retry="${3:-5}"
+  local wait_sec="${4:-10}"
+
+  local i out rc
+  for i in $(seq 1 "$max_retry"); do
+    set +e
+    out="$(bash "$APP_DIR/oc.sh" "$subcmd" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 0 ]]; then
+      return 0
+    fi
+
+    if printf '%s' "$out" | grep -qiE '409 Conflict|already being installed|is already being installed'; then
+      warn "${label} 遇到 CasaOS 安装冲突（409），第 ${i}/${max_retry} 次重试前先恢复 CasaOS 服务并等待 ${wait_sec}s"
+      restart_casaos_app_services
+      sleep "$wait_sec"
+      continue
+    fi
+
+    warn "${label} 失败（exit=${rc}）：$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
+    return "$rc"
+  done
+
+  warn "${label} 多次重试后仍失败（可能仍卡在 CasaOS Installing）"
+  return 1
+}
+
+pull_image_with_retry() {
+  local image="$1"
+  local attempts="${2:-4}"
+  local wait_sec="${3:-8}"
+  local i
+
+  for i in $(seq 1 "$attempts"); do
+    if docker_cmd pull "$image" >/dev/null 2>&1; then
+      log "镜像预拉取成功: $image"
+      return 0
+    fi
+    warn "镜像预拉取失败: $image（第 ${i}/${attempts} 次，${wait_sec}s 后重试）"
+    sleep "$wait_sec"
+  done
+
+  warn "镜像预拉取多次失败: $image（后续将继续尝试安装，若失败请重试 install.sh）"
+  return 1
+}
+
+pre_pull_casaos_images() {
+  # CasaOS 应用安装是异步流程，网络抖动（connection reset by peer）时不易即时感知。
+  # 先在宿主机预拉关键镜像并重试，可显著降低 install 后“只剩一个应用成功”的概率。
+  local images=(
+    # openclaw portal 与 voice assistant 统一使用 slim，减少网络抖动下镜像拉取失败概率。
+    "python:3.11-slim"
+    "jellyfin/jellyfin:12.0@sha256:baba630419915985442f315f08b0cf46d9f4c8a0cc4bd38e94a6d35751dd5ef5"
+    "ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0@sha256:c570d9e1c2494f65d2a0a379a7f6df66e8441964254a30aa62cc58e8ebf1dee0"
+    "ghcr.io/immich-app/immich-server:v3.1.0@sha256:b434cb9287eea1471c9974845914d4dd328c9c2d652e446ed4930f99944f0ceb"
+    "ghcr.io/immich-app/immich-machine-learning:v3.1.0@sha256:5a0839dc5303cd7215bcd2180a26aed3af41675aefb3e75e5157e9f10ad16e6e"
+    "redis:6.2.20-alpine@sha256:2185e741f4c1e7b0ea9ca1e163a3767c4270a73086b6bbea2049a7203212fb7f"
+  )
+  local image
+  for image in "${images[@]}"; do
+    pull_image_with_retry "$image" 4 8 || true
+  done
+}
+
+render_compose_template_file() {
+  local src="$1"
+  local dst app_dir_escaped nas_root_escaped nas_puid nas_pgid nas_root
+  dst="$(mktemp "/tmp/$(basename "$src").XXXXXX")"
+
+  nas_root="$(env_get NAS_ROOT)"
+  nas_root="${nas_root:-$HOME/nas_share}"
+  nas_puid="$(env_get NAS_PUID)"
+  nas_puid="${nas_puid:-$(id -u)}"
+  nas_pgid="$(env_get NAS_PGID)"
+  nas_pgid="${nas_pgid:-$(id -g)}"
+
+  app_dir_escaped="$(printf '%s' "$APP_DIR" | sed 's/[\/&]/\\&/g')"
+  nas_root_escaped="$(printf '%s' "$nas_root" | sed 's/[\/&]/\\&/g')"
+
+  sed \
+    -e "s#__APP_DIR__#${app_dir_escaped}#g" \
+    -e "s#__NAS_ROOT__#${nas_root_escaped}#g" \
+    -e "s#__NAS_PUID__#${nas_puid}#g" \
+    -e "s#__NAS_PGID__#${nas_pgid}#g" \
+    "$src" > "$dst"
+
+  printf '%s\n' "$dst"
+}
+
+fallback_compose_deploy() {
+  local compose_src="$1"
+  local label="$2"
+  local rendered=""
+
+  if [[ ! -f "$compose_src" ]]; then
+    warn "${label} 回退 compose 失败：文件不存在 $compose_src"
+    return 1
+  fi
+
+  rendered="$(render_compose_template_file "$compose_src")"
+  if docker_cmd compose -f "$rendered" up -d >/dev/null 2>&1; then
+    log "${label} 已通过 compose 回退部署成功"
+    rm -f "$rendered"
+    return 0
+  fi
+
+  warn "${label} compose 回退部署失败"
+  rm -f "$rendered"
+  return 1
+}
+
+run_oc_cmd_with_retry_and_fallback() {
+  local subcmd="$1"
+  local label="$2"
+  local fallback_compose="${3:-}"
+  local max_retry="${4:-5}"
+  local wait_sec="${5:-10}"
+
+  if run_oc_cmd_with_casaos_retry "$subcmd" "$label" "$max_retry" "$wait_sec"; then
+    return 0
+  fi
+
+  if [[ -n "$fallback_compose" ]]; then
+    warn "${label} 进入 compose 回退部署路径"
+    fallback_compose_deploy "$fallback_compose" "$label" && return 0
+  fi
+
+  return 1
+}
+
 env_get() {
   local key="$1"
   grep -E "^[[:space:]]*${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
@@ -354,6 +501,30 @@ check_resources() {
   log "资源检查通过"
 }
 
+# =============================================================================
+# Docker 镜像加速检查
+#
+# 背景：部分网络环境（企业网络/弱网/国内直连 Docker Hub）在从 CloudFront 拉取
+# 大镜像 blob 阶段会被重置（read: connection reset by peer），表现为
+# 「小镜像能装、大镜像反复失败」，进而导致 CasaOS 异步安装回滚，
+# 最终只留下体积最小的应用（例如 NAS Files）。
+#
+# 本检查只做提示，不改动系统；确需配置时执行:
+#   sudo bash setup_docker_mirror.sh    （或 bash install.sh docker-mirror）
+# =============================================================================
+check_docker_registry_mirror() {
+  if docker_cmd info 2>/dev/null \
+      | awk '/Registry Mirrors:/{flag=1; next} /^[[:space:]]*$/{flag=0} flag' \
+      | grep -qE 'https?://'; then
+    log "Docker 镜像加速已配置"
+    return 0
+  fi
+
+  warn "未检测到 Docker 镜像加速（registry-mirrors）"
+  warn "  直连 Docker Hub 拉取大镜像可能被重置，导致部分应用安装失败后回滚"
+  warn "  建议执行: bash $APP_DIR/setup_docker_mirror.sh"
+}
+
 check_env() {
   log "环境检查中..."
   require_cmd bash
@@ -362,6 +533,7 @@ check_env() {
   require_cmd python3
   ensure_docker_via_casaos
   check_resources
+  check_docker_registry_mirror
   ensure_casaos_web_if_missing
   if ! docker_cmd ps >/dev/null 2>&1; then
     die "docker 无法访问，请确认当前用户有 sudo docker 权限"
@@ -555,6 +727,13 @@ sync_immich_key_to_env_if_exists() {
 # =============================================================================
 setup_voice_bridge() {
   local installer="$APP_DIR/local_voice_chat/install_voice_bridge_service.sh"
+  local run_user
+
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    run_user="$SUDO_USER"
+  else
+    run_user="$(id -un)"
+  fi
 
   if [[ "${SKIP_VOICE:-0}" -eq 1 ]]; then
     log "已按 --skip-voice 跳过语音桥安装"
@@ -573,8 +752,11 @@ setup_voice_bridge() {
   fi
 
   if systemctl is-active --quiet voice-bridge 2>/dev/null; then
-    log "语音桥已在运行，跳过安装（重装: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh）"
-    return 0
+    if id -nG "$run_user" | tr ' ' '\n' | grep -qx docker; then
+      log "语音桥已在运行，跳过安装（重装: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh）"
+      return 0
+    fi
+    warn "语音桥已在运行，但用户 $run_user 不在 docker 组，继续执行修复安装"
   fi
 
   # 离线 ASR/TTS 依赖：numpy + sherpa_onnx（用户级 pip）
@@ -626,22 +808,23 @@ deploy_all() {
     if [[ "$has_casaos_cli" -eq 1 ]]; then
       log "检测到 casaos-cli，采用 CasaOS 应用模式部署（OpenClaw/Immich/Jellyfin）"
       cleanup_legacy_nas_demo_app || true
+      pre_pull_casaos_images || true
       FORCE_PLAIN_DOCKER=1 bash "$APP_DIR/deploy.sh" || warn "openclaw 部署失败，可稍后重试"
-      bash "$APP_DIR/oc.sh" openclaw-app-deploy || warn "openclaw-app-deploy 失败"
-      bash "$APP_DIR/oc.sh" immich-apply || warn "immich-apply 失败"
-      bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 失败"
+      run_oc_cmd_with_retry_and_fallback openclaw-app-deploy "openclaw-app-deploy" "$APP_DIR/openclaw-compose.yml" || warn "openclaw-app-deploy 失败"
+      run_oc_cmd_with_retry_and_fallback immich-apply "immich-apply" "$APP_DIR/immich-compose.yml" || warn "immich-apply 失败"
+      run_oc_cmd_with_retry_and_fallback jellyfin-deploy "jellyfin-deploy" "$APP_DIR/jellyfin-compose.yml" || warn "jellyfin-deploy 失败"
 
       if ! casaos_app_exists_any openclaw-app org.local.openclaw.portal openclaw openclaw-portal; then
         warn "OpenClaw 入口未注册成功，重试一次..."
-        bash "$APP_DIR/oc.sh" openclaw-app-deploy || warn "openclaw-app-deploy 重试失败"
+        run_oc_cmd_with_retry_and_fallback openclaw-app-deploy "openclaw-app-deploy" "$APP_DIR/openclaw-compose.yml" 3 12 || warn "openclaw-app-deploy 重试失败"
       fi
       if ! casaos_app_exists_any big-bear-immich com.bigbeartechworld.immich; then
         warn "Immich 应用未注册成功，重试一次..."
-        bash "$APP_DIR/oc.sh" immich-apply || warn "immich-apply 重试失败"
+        run_oc_cmd_with_retry_and_fallback immich-apply "immich-apply" "$APP_DIR/immich-compose.yml" 3 12 || warn "immich-apply 重试失败"
       fi
       if ! casaos_app_exists_any jellyfin org.jellyfin.server; then
         warn "Jellyfin 应用未注册成功，重试一次..."
-        bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 重试失败"
+        run_oc_cmd_with_retry_and_fallback jellyfin-deploy "jellyfin-deploy" "$APP_DIR/jellyfin-compose.yml" 3 12 || warn "jellyfin-deploy 重试失败"
       fi
     else
       if container_exists openclaw; then
@@ -706,17 +889,17 @@ EOF
 
   # CasaOS 附加组件（失败不阻断主流程）
   if [[ "$has_casaos_cli" -eq 1 ]]; then
-    bash "$APP_DIR/oc.sh" nas-files-deploy || warn "nas-files-deploy 失败"
-    bash "$APP_DIR/oc.sh" voice-assistant-deploy || warn "voice-assistant-deploy 失败"
+    run_oc_cmd_with_retry_and_fallback nas-files-deploy "nas-files-deploy" "$APP_DIR/filebrowser-compose.yml" || warn "nas-files-deploy 失败"
+    run_oc_cmd_with_retry_and_fallback voice-assistant-deploy "voice-assistant-deploy" "$APP_DIR/voice-assistant-compose.yml" || warn "voice-assistant-deploy 失败"
   else
     if ! container_exists jellyfin; then
-      bash "$APP_DIR/oc.sh" jellyfin-deploy || warn "jellyfin-deploy 失败"
+      run_oc_cmd_with_retry_and_fallback jellyfin-deploy "jellyfin-deploy" "$APP_DIR/jellyfin-compose.yml" || warn "jellyfin-deploy 失败"
     fi
     if ! container_exists filebrowser; then
-      bash "$APP_DIR/oc.sh" nas-files-deploy || warn "nas-files-deploy 失败"
+      run_oc_cmd_with_retry_and_fallback nas-files-deploy "nas-files-deploy" "$APP_DIR/filebrowser-compose.yml" || warn "nas-files-deploy 失败"
     fi
     if ! container_exists voice_assistant; then
-      bash "$APP_DIR/oc.sh" voice-assistant-deploy || warn "voice-assistant-deploy 失败"
+      run_oc_cmd_with_retry_and_fallback voice-assistant-deploy "voice-assistant-deploy" "$APP_DIR/voice-assistant-compose.yml" || warn "voice-assistant-deploy 失败"
     fi
   fi
 
@@ -772,7 +955,17 @@ summary() {
   echo "NAS Files: http://${ip:-<IP>}:28085"
   echo "Voice Assistant: http://${ip:-<IP>}:28083"
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet voice-bridge 2>/dev/null; then
-    echo "语音桥   : http://${ip:-<IP>}:28082 (active)"
+    local run_user
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+      run_user="$SUDO_USER"
+    else
+      run_user="$(id -un)"
+    fi
+    if id -nG "$run_user" | tr ' ' '\n' | grep -qx docker; then
+      echo "语音桥   : http://${ip:-<IP>}:28082 (active)"
+    else
+      echo "语音桥   : 运行中但用户 $run_user 缺少 docker 组权限（请重跑: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh）"
+    fi
   else
     echo "语音桥   : 未运行（Voice Assistant 依赖它；安装: cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh）"
   fi
@@ -1023,6 +1216,16 @@ bootstrap_if_needed() {
 
 main() {
   bootstrap_if_needed "$@"
+  if [[ "$ARG_MIRROR_ONLY" -eq 1 ]]; then
+    local mirror_script="$APP_DIR/setup_docker_mirror.sh"
+    [[ -f "$mirror_script" ]] || die "缺少 $mirror_script"
+    if [[ "${EUID}" -eq 0 ]]; then
+      bash "$mirror_script"
+    else
+      sudo bash "$mirror_script"
+    fi
+    exit 0
+  fi
   if [[ "$ARG_UI_FIX_ONLY" -eq 1 ]]; then
     cleanup_firewall_helper_containers || warn "清理遗留临时容器失败，可稍后手动执行 docker rm -f <container>"
     ensure_casaos_custom_js_legacy_filter || warn "写入 CasaOS custom.js 过滤规则失败，可稍后手动处理"
