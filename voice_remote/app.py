@@ -350,34 +350,40 @@ def _index_html():
   </style>
 </head>
 <body>
-  <main class=\"app\" data-ui-version=\"{UI_VERSION}\">
-    <h1>{APP_TITLE}</h1>
-    <p class=\"lead\">点击即可语音，或输入文本直接执行。两种模式都会触发 TTS 语音播报。</p>
+  <main class="app" data-ui-version="{UI_VERSION}">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+      <h1 data-i18n="appTitle">语音助手</h1>
+      <button id="langToggle" type="button" style="padding:8px 12px; border-radius:999px; border:1px solid rgba(255,255,255,0.2); background:rgba(255,255,255,0.06); color:var(--text); cursor:pointer; font-size:13px;">English</button>
+    </div>
+    <p class="lead" data-i18n="leadText">点击即可语音，或输入文本直接执行。两种模式都会触发 TTS 语音播报。</p>
 
-    <section class=\"grid\">
-      <article class=\"card\">
-        <h2>语音模式</h2>
-        <p class=\"hint\">1. 点击开始  2. 立刻对麦克风说话  3. 等待助手播报</p>
-        <button id=\"voiceBtn\" class=\"btn\">开始语音指令</button>
+    <section class="grid">
+      <article class="card">
+        <h2 data-i18n="voiceMode">语音模式</h2>
+        <p class="hint" data-i18n="voiceHint">1. 点击开始  2. 立刻对麦克风说话  3. 等待助手播报</p>
+        <button id="voiceBtn" class="btn" data-i18n="voiceBtnStart">开始语音指令</button>
       </article>
 
-      <article class=\"card\">
-        <h2>文本模式</h2>
-                <p class=\"hint\">输入示例：播放测试视频 / 帮我按内容归档手机相册</p>
-        <div class=\"row\">
-          <input id=\"textInput\" type=\"text\" placeholder=\"输入文本指令\" />
-          <button id=\"textBtn\" class=\"btn\" style=\"width: 140px;\">发送文本</button>
+      <article class="card">
+        <h2 data-i18n="textMode">文本模式</h2>
+        <p class="hint" data-i18n="textHint">输入示例：播放测试视频 / 住房合同在哪</p>
+        <div class="row">
+          <input id="textInput" type="text" data-i18n-placeholder="textInputPlaceholder" placeholder="输入文本指令" />
+          <button id="textBtn" class="btn" style="width: 140px;" data-i18n="textBtn">发送文本</button>
         </div>
       </article>
     </section>
 
-        <div id="status" style="display:none;">待机中。请选择语音或文本模式。</div>
-        <div class="meta">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>
-        <section class="turns-wrap">
-            <div class="turns-hdr"><h2>对话历史</h2><button class="clear-btn" id="clearTurns">清空</button></div>
-            <div id="turns" class="turns"></div>
-        </section>
-    </main>
+    <div id="status" style="display:none;" data-i18n="statusIdle">待机中。请选择语音或文本模式。</div>
+    <div class="meta">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>
+    <section class="turns-wrap">
+      <div class="turns-hdr">
+        <h2 data-i18n="turnsTitle">对话历史</h2>
+        <button class="clear-btn" id="clearTurns" data-i18n="clearTurns">清空</button>
+      </div>
+      <div id="turns" class="turns"></div>
+    </section>
+  </main>
 
   <script>
     window.__voiceUiLoaded = false;
@@ -414,6 +420,7 @@ def _index_html():
       }}, 1200);
     }});
   </script>
+  <script src=\"/static/i18n.js?v={UI_VERSION}\"></script>
   <script src=\"/static/app.js?v={UI_VERSION}\"></script>
 </body>
 </html>
@@ -434,20 +441,21 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             _html_response(self, HTTPStatus.OK, _index_html())
             return
-        if parsed.path == "/static/app.js":
+        if parsed.path in {"/static/app.js", "/static/i18n.js"}:
+            target = APP_JS_FILE if parsed.path.endswith("app.js") else STATIC_DIR / "i18n.js"
             try:
                 _text_response(
                     self,
                     HTTPStatus.OK,
-                    _load_static_text(APP_JS_FILE),
+                    _load_static_text(target),
                     "application/javascript",
                 )
             except FileNotFoundError:
-                _log(f"[voice-remote] static file missing: {APP_JS_FILE}")
+                _log(f"[voice-remote] static file missing: {target}")
                 _text_response(
                     self,
                     HTTPStatus.NOT_FOUND,
-                    "console.error('app.js not found');",
+                    f"console.error('{target.name} not found');",
                     "application/javascript",
                 )
             except Exception as e:  # noqa: BLE001
@@ -455,7 +463,7 @@ class Handler(BaseHTTPRequestHandler):
                 _text_response(
                     self,
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "console.error('app.js load failed');",
+                    f"console.error('{target.name} load failed');",
                     "application/javascript",
                 )
             return
