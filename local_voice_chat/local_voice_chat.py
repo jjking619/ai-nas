@@ -7,17 +7,21 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import sherpa_onnx
 
-# ---- Hotword-capable transducer models (sherpa-onnx) ----
-# SenseVoice / 离线Paraformer 不支持热词；transducer 系列（在线/离线）支持热词纠偏。
 CONFORMER_MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
     "sherpa-onnx-conformer-zh-stateless2-2023-05-23.tar.bz2"
 )
+SENSEVOICE_MODEL_URL = (
+	"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+	"sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
+)
+SENSEVOICE_MODEL_DIRNAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 
 MATCHA_ZH_EN_TTS_URL = (
 	"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
@@ -48,12 +52,64 @@ def default_hotwords_path() -> Path:
 
 
 def ensure_hotwords_file(path: Path = None) -> Path:
-    """热词表不存在时自动创建（每行一个词，cjkchar 建模可直接写中文）。"""
-    path = path or default_hotwords_path()
-    if not path.exists():
-        path.write_text("\n".join(DEFAULT_HOTWORDS) + "\n", encoding="utf-8")
-        print(f"[ASR] hotwords file created: {path}")
-    return path
+	"""Create the hotwords file if it does not exist."""
+	path = path or default_hotwords_path()
+	if not path.exists():
+		path.write_text("\n".join(DEFAULT_HOTWORDS) + "\n", encoding="utf-8")
+		print(f"[ASR] hotwords file created: {path}")
+	return path
+
+
+def _is_cjk_hotword(word: str) -> bool:
+	"""Keep only Han-character hotwords for cjkchar encoding."""
+	return bool(word) and all("\u4e00" <= ch <= "\u9fff" for ch in word)
+
+
+def hotwords_for_cjkchar(path: Path) -> Path:
+	"""Filter hotwords to the subset that cjkchar can encode."""
+	if not path.exists():
+		return path
+
+	try:
+		raw_lines = path.read_text(encoding="utf-8").splitlines()
+	except OSError:
+		return path
+
+	kept: list[str] = []
+	dropped: list[str] = []
+	seen: set[str] = set()
+	for line in raw_lines:
+		item = line.strip()
+		if not item or item.startswith("#"):
+			continue
+		word = item.split(":", 1)[0].strip()
+		if not _is_cjk_hotword(word):
+			dropped.append(word or item)
+			continue
+		if word in seen:
+			continue
+		seen.add(word)
+		kept.append(item)
+
+	cache_dir = Path(tempfile.gettempdir()) / "voice_bridge_hotwords"
+	try:
+		cache_dir.mkdir(parents=True, exist_ok=True)
+	except OSError:
+		return path
+	out = cache_dir / f"{path.stem}.cjkchar{path.suffix or '.txt'}"
+	content = "\n".join(kept) + ("\n" if kept else "")
+	try:
+		if not out.exists() or out.read_text(encoding="utf-8") != content:
+			out.write_text(content, encoding="utf-8")
+	except OSError:
+		return path
+
+	if dropped:
+		print(
+			f"[ASR] hotwords: dropped {len(dropped)} non-CJK entries "
+			f"(cjkchar cannot encode them): {', '.join(dropped)}"
+		)
+	return out
 
 
 def _parse_wake_words(value: str) -> list[str]:
@@ -166,32 +222,51 @@ def record_audio_with_ffmpeg(
 		)
 
 
-def _candidate_mic_inputs(mic_input: str) -> list[str]:
+def _candidate_mic_inputs(mic_input: str, backend: str) -> list[str]:
 	candidates = []
-	for value in [
-		mic_input,
-		"regular0",
-		"regular2",
-		"default",
-		"sysdefault",
-		"hw:1,0",
-		"plughw:1,0",
-		"hw:0,0",
-		"plughw:0,0",
-	]:
-		value = (value or "").strip()
-		if value and value not in candidates:
-			candidates.append(value)
+	raw = (mic_input or "").strip()
+
+	def _add(value: str) -> None:
+		v = (value or "").strip()
+		if v and v not in candidates:
+			candidates.append(v)
+
+	# ALSA 与 Pulse 支持的设备命名不同：
+	# - Pulse 源名常见为 regular0/regular2/voip-tx0
+	# - ALSA 设备常见为 hw:X,Y / plughw:X,Y
+	# 分开候选可显著减少无效重试与日志刷屏。
+	if backend == "pulse":
+		if raw and ("hw:" not in raw and "plughw:" not in raw):
+			_add(raw)
+		_add("regular0")
+		_add("regular2")
+		_add("voip-tx0")
+		_add("default")
+		_add("sysdefault")
+	else:
+		if raw and ("regular" not in raw and "voip-" not in raw):
+			_add(raw)
+		_add("plughw:1,0")
+		_add("hw:1,0")
+		_add("plughw:0,0")
+		_add("hw:0,0")
+		_add("default")
+		_add("sysdefault")
+
 	return candidates
 
 
 def record_audio_auto_backend(
 	out_wav: Path, duration: float, mic_input: str, backend: str
 ) -> None:
-	backend_candidates = ("pulse", "alsa") if backend == "auto" else (backend,)
+	# auto：先按显式配置的 mic_input 尝试（通常是外接 USB 麦），
+	# 全部失败再退回 PulseAudio 的板载麦（regular0/regular2/voip-tx0）。
+	# 顺序不能反过来：Pulse 只认源名，不认 ALSA 设备名，
+	# 若先试 Pulse，后面的板载兜底会抢先命中，外接麦永远不会被使用。
+	backend_candidates = ("alsa", "pulse") if backend == "auto" else (backend,)
 	last_err = None
 	for b in backend_candidates:
-		for candidate_mic in _candidate_mic_inputs(mic_input):
+		for candidate_mic in _candidate_mic_inputs(mic_input, b):
 			try:
 				record_audio_with_ffmpeg(out_wav, duration, candidate_mic, b)
 				return
@@ -489,10 +564,11 @@ def _model_dir_with_files(eng_dir: Path):
 	return None
 
 
-def ensure_transducer_model(asr_root: Path, engine: str, force_download: bool = True) -> dict:
+def ensure_transducer_model(asr_root: Path, engine: str, force_download: bool = False) -> dict:
 	"""获取支持热词的 transducer 模型，返回 {engine, encoder, decoder, joiner, tokens, root}。
 
-	优先复用已存在的模型目录（SDK 自带或历史解压），仅在完全缺失时才下载。
+	默认不预下载 Conformer，避免安装阶段把大模型一并拉下来；只有在显式开启
+	force_download 或用户明确选用 conformer 并开启下载开关时才下载。
 	"""
 	if engine == "conformer":
 		url = CONFORMER_MODEL_URL
@@ -526,7 +602,8 @@ def ensure_transducer_model(asr_root: Path, engine: str, force_download: bool = 
 	if base is None:
 		raise RuntimeError(
 			f"{engine} 模型未找到: {eng_dir}。"
-			"请放入 encoder/decoder/joiner onnx 与 tokens.txt，或开启自动下载。"
+			"默认不自动下载 Conformer；如需使用，请显式开启 --download-conformer-model "
+			"或调用 with force_download=True。"
 		)
 
 	def _pick(part: str) -> str:
@@ -550,14 +627,81 @@ def ensure_transducer_model(asr_root: Path, engine: str, force_download: bool = 
 
 
 def ensure_sensevoice_model(asr_model_dir: Path, force_download: bool) -> Path:
-	int8_model = asr_model_dir / "model.int8.onnx"
-	fp_model = asr_model_dir / "model.onnx"
+	def _pick_model(base: Path) -> Path | None:
+		int8_model = base / "model.int8.onnx"
+		fp_model = base / "model.onnx"
+		tokens = base / "tokens.txt"
+		if tokens.exists() and int8_model.exists():
+			return int8_model
+		if tokens.exists() and fp_model.exists():
+			return fp_model
+		return None
 
-	# CPU 上优先 int8（4~5 倍速度，精度损失很小）；fp32 仅在无 int8 时使用
-	if int8_model.exists():
-		return int8_model
-	if fp_model.exists():
-		return fp_model
+	def _promote_to_target(src: Path, dst: Path) -> Path:
+		dst.mkdir(parents=True, exist_ok=True)
+		for name in ("tokens.txt", "model.int8.onnx", "model.onnx"):
+			s = src / name
+			d = dst / name
+			if not s.exists():
+				continue
+			if d.exists():
+				d.unlink()
+			shutil.move(str(s), str(d))
+
+		# 可选 ITN 资源，存在则一并带上。
+		for name in ("dict", "lexicon.txt", "replace.fst"):
+			s = src / name
+			d = dst / name
+			if not s.exists():
+				continue
+			if d.exists():
+				if d.is_dir():
+					shutil.rmtree(d)
+				else:
+					d.unlink()
+			shutil.move(str(s), str(d))
+
+		picked = _pick_model(dst)
+		if picked is None:
+			raise RuntimeError(f"SenseVoice files incomplete under {dst}")
+		return picked
+
+	asr_model_dir.mkdir(parents=True, exist_ok=True)
+
+	# 1) 标准目标目录已就绪
+	picked = _pick_model(asr_model_dir)
+	if picked is not None:
+		return picked
+
+	# 2) 兼容历史嵌套目录：把文件提升到 asr_root/model/
+	for child in sorted(p for p in asr_model_dir.iterdir() if p.is_dir()):
+		picked = _pick_model(child)
+		if picked is not None:
+			return _promote_to_target(child, asr_model_dir)
+
+	if not force_download:
+		raise RuntimeError(
+			f"SenseVoice model not found under {asr_model_dir}. "
+			"Place model.int8.onnx/model.onnx + tokens.txt, or enable auto download."
+		)
+
+	# 3) 自动下载并解压，兼容一层嵌套目录
+	extract_dir = _download_model_archive(
+		SENSEVOICE_MODEL_URL,
+		asr_model_dir.parent,
+		SENSEVOICE_MODEL_DIRNAME + ".tar.bz2",
+	)
+	try:
+		candidates = [extract_dir, extract_dir / SENSEVOICE_MODEL_DIRNAME]
+		candidates += sorted(p for p in extract_dir.iterdir() if p.is_dir())
+		src_dir = next((c for c in candidates if _pick_model(c) is not None), None)
+		if src_dir is None:
+			raise RuntimeError(f"SenseVoice archive missing required files: {extract_dir}")
+		picked = _promote_to_target(src_dir, asr_model_dir)
+		print(f"[ASR] sensevoice model ready: {asr_model_dir}")
+		return picked
+	finally:
+		shutil.rmtree(extract_dir, ignore_errors=True)
 
 
 def build_asr_recognizer(
@@ -567,13 +711,16 @@ def build_asr_recognizer(
 	engine: str = "sensevoice",
 	hotwords_file: str = "",
 	hotwords_score: float = 2.5,
+	force_download: bool = False,
 ):
 	threads = max(1, (os.cpu_count() or 2) // 2)
 
 	# 热词路径：conformer（离线 transducer）支持热词
 	if engine == "conformer":
-		files = ensure_transducer_model(asr_root, engine)
-		hw = ensure_hotwords_file(Path(hotwords_file) if hotwords_file else None)
+		files = ensure_transducer_model(asr_root, engine, force_download=force_download)
+		hw = hotwords_for_cjkchar(
+			ensure_hotwords_file(Path(hotwords_file) if hotwords_file else None)
+		)
 		common = {
 			"tokens": files["tokens"],
 			"encoder": files["encoder"],
@@ -789,6 +936,12 @@ def parse_args():
 		default="sensevoice",
 		help="sensevoice=ASR 文本唤醒(默认)；conformer=离线ASR+热词支持",
 	)
+	parser.add_argument(
+		"--download-conformer-model",
+		action="store_true",
+		default=False,
+		help="默认不预下载 Conformer；显式启用时才下载并准备热词模型",
+	)
 	parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
 	parser.add_argument("--hotwords-score", type=float, default=3.0, help="热词增益分数；唤醒词已加入热词表，3.0 左右均衡")
 
@@ -838,6 +991,7 @@ def main():
 		engine=args.asr_engine,
 		hotwords_file=args.hotwords_file,
 		hotwords_score=args.hotwords_score,
+		force_download=(args.asr_engine == "conformer" and args.download_conformer_model),
 	)
 	print("[INIT] building TTS engine...")
 	tts = build_tts(tts_root)

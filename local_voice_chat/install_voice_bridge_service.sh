@@ -18,12 +18,6 @@ else
   RUN_USER="$(id -un)"
 fi
 
-# ---------------------------------------------------------------------------
-# 系统级：USB 麦克风访问（任何用户部署时自动生效）
-# - /dev/snd 设备属 root:audio，服务进程用户需在 audio 组才能 ALSA 直连录音。
-# - 高通定制 system pulse(PAL) 不暴露 USB 声卡，故 voice-bridge 默认走 ALSA；
-#   麦克风用卡名 plughw:Audio,0 引用（与 USB 插拔顺序无关）。
-# ---------------------------------------------------------------------------
 if ! id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx audio; then
   if sudo usermod -aG audio "$RUN_USER" 2>/dev/null; then
     echo "[install] $RUN_USER 已加入 audio 组（可访问 USB 麦克风）"
@@ -36,18 +30,14 @@ env_ensure() {
   local key="$1" value="$2"
   local cur new_line
 
-  # 取最后一次出现的生效值（与 shell source 语义一致：后者覆盖前者）
   cur="$(grep -E "^[[:space:]]*${key}=" "$APP_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
 
-  # 用户已显式配置过（非默认占位值）则尊重用户，仅做去重不改值
   if [[ -n "$cur" && "$cur" != "auto" && "$cur" != "default" ]]; then
     new_line="${key}=${cur}"
   else
     new_line="${key}=${value}"
   fi
 
-  # 原地替换「首个占位」（含注释形式），并丢弃其余重复项；
-  # 全部不存在时追加到末尾。这样避免反复追加造成同名键重复。
   awk -v k="$key" -v nl="$new_line" '
     {
       if ($0 ~ "^[[:space:]]*" k "=" || $0 ~ "^[[:space:]]*#[[:space:]]*" k "=") {
@@ -65,10 +55,6 @@ env_ensure VOICE_MIC_INPUT "plughw:Audio,0"
 
 RUN_USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 
-# 优先选择装有 numpy/sherpa_onnx 的 python（pyenv 或用户 PATH），
-# 避免 sudo 环境下探测到系统 /usr/bin/python3（无依赖导致服务启动崩溃）。
-# 注意：依赖装在 $RUN_USER_HOME/.local（用户级 pip），sudo 下 HOME=/root 会找不到，
-# 因此探测时通过 -c 直接注入 PYTHONPATH=~/.local/lib/python3.x/site-packages 兜底。
 detect_python() {
   local cand py user_site
   cand="$(command -v python3 || true)"
@@ -91,15 +77,9 @@ detect_python() {
 PYTHON_BIN="$(detect_python)" || { echo "[install][ERROR] 找不到装有 numpy/sherpa_onnx 的 python3，请先安装依赖" >&2; exit 1; }
 VOICE_SDK_BASE="${VOICE_SDK_BASE:-$RUN_USER_HOME/voice}"
 
-# ---------------------------------------------------------------------------
-# 语音模型预检/预下载：在安装服务前保证 ASR(conformer)+TTS 模型就绪。
-# 否则 voice_bridge 会在服务启动后的首次语音触发时才现场下载
-# （大文件下载期间无法唤醒，且用户只看到 "downloading ..." 不知在干嘛）。
-# 复用 local_voice_chat 的模型准备函数：本地已就绪则秒过，缺失才下载。
-# ---------------------------------------------------------------------------
 MODEL_ASR_ROOT="${VOICE_SDK_BASE}/asr"
 MODEL_TTS_ROOT="${VOICE_SDK_BASE}/tts"
-echo "[install] 检查语音模型（ASR/TTS，缺失将自动预下载，首次视网络需数分钟）..."
+echo "[install] 检查语音模型（SenseVoice / TTS，缺失将自动预下载，首次视网络需数分钟）..."
 if ( cd "$SCRIPT_DIR" && PYTHONPATH="${APP_DIR}:${SCRIPT_DIR}" "$PYTHON_BIN" - "$MODEL_ASR_ROOT" "$MODEL_TTS_ROOT" <<'PY'
 import sys
 from pathlib import Path
@@ -110,19 +90,21 @@ asr_root.mkdir(parents=True, exist_ok=True)
 tts_root.mkdir(parents=True, exist_ok=True)
 
 from local_voice_chat import (
-    ensure_transducer_model,
+    ensure_sensevoice_model,
     ensure_official_matcha_tts,
 )
 
-# 本地已存在完整模型时直接复用（幂等），仅缺失时下载解压
-files = ensure_transducer_model(asr_root, "conformer")
-print(f"[install][模型] ASR 就绪: {Path(files['encoder']).name} + {Path(files['tokens']).name}")
+# 默认使用 SenseVoice：中文/英文命令与唤醒都走同一模型，降低双引擎路径复杂度。
+cmd_model = ensure_sensevoice_model(asr_root / "model", force_download=True)
+print(f"[install][模型] wake 模型就绪: {Path(cmd_model).name}")
+print(f"[install][模型] command 模型就绪: {Path(cmd_model).name}")
 
 model_dir, vocoder = ensure_official_matcha_tts(tts_root, force_download=True)
-print(f"[install][模型] TTS 就绪: {model_dir.name} + {Path(vocoder).name}")
+print(f"[install][模型] TTS 模型就绪: {model_dir.name} + {Path(vocoder).name}")
 PY
 ); then
-  echo "[install] 语音模型已就绪：$MODEL_ASR_ROOT + $MODEL_TTS_ROOT"
+  echo "[install] 已准备 wake 模型 / command 模型 / TTS 模型"
+  echo "[install] 语音模型目录：$MODEL_ASR_ROOT + $MODEL_TTS_ROOT"
 else
   echo "[install][WARN] 语音模型预下载失败（可稍后重跑本脚本补齐）；" >&2
   echo "[install][WARN] 首次语音唤醒时可能需要现场下载，期间暂无法唤醒。" >&2

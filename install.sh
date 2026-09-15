@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =============================================================================
-# install.sh - NAS-Demo 一键安装/配置入口
-#
-# 目标：用户只需要配置 OpenClaw 的模型 API（base URL + API key + model id）
-# 其余步骤自动完成，并尽量复用项目现有脚本，保持简洁。
-# =============================================================================
+# Install entrypoint for NAS-Demo.
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
@@ -22,23 +17,13 @@ MODEL_ID_ARG=""
 CHECK_ONLY=0
 RESET=0
 SKIP_FIREWALL=0
-# 默认安装语音桥（宿主机 systemd 服务）；可用 --skip-voice 或 SKIP_VOICE_BRIDGE=1 跳过
 SKIP_VOICE="${SKIP_VOICE_BRIDGE:-0}"
 ARG_FIREWALL_ONLY=0
 ARG_UI_FIX_ONLY=0
 
-# NAS-Demo 需要放行的 TCP 端口（INPUT 链，宿主机/局域网访问）。
-# 可用环境变量 FIREWALL_PORTS 覆盖，例如:
-#   FIREWALL_PORTS="22 80 24190" bash install.sh
 FIREWALL_PORTS="${FIREWALL_PORTS:-80 2283 8096 28081 28082 28083 28084 28085 28086 24190 24192}"
-
-# 代码仓库地址（仅在“从任意位置运行、目录里还没有 NAS-Demo 代码”时用于自动 clone）
 INSTALL_REPO="${INSTALL_REPO:-https://github.com/jjking619/ai-nas.git}"
-
-# OpenClaw 挂载目录（宿主机）
 OPENCLAW_DATA_DIR="/DATA/AppData/openclaw"
-
-# CasaOS 安装脚本地址（CasaOS 会自动安装 docker）
 CASAOS_INSTALL_SCRIPT_URL="${CASAOS_INSTALL_SCRIPT_URL:-https://get.casaos.io}"
 
 usage() {
@@ -562,7 +547,10 @@ sync_immich_key_to_env_if_exists() {
 # 注：
 #   - 需要 root 写 /etc/systemd/system/voice-bridge.service 并启用服务；非交互
 #     环境且无免密 sudo 时安全跳过，不阻塞自动化安装。
-#   - 首次安装会预下载 ASR/TTS 模型（数百 MB），视网络需数分钟。
+#   - 默认使用 SenseVoice 作为 wake/command 共用引擎
+#   - Conformer 仅作为手动高级回退，不在默认安装流程中作为推荐路径
+#   - 如需手动启用，可在 .env 中设置 VOICE_WAKE_ASR_ENGINE=conformer
+#   - 首次安装会预下载 wake 模型 / command 模型 / TTS 模型（数百 MB），视网络需数分钟。
 #   - 幂等：已在运行则跳过；需要重装时手动执行安装脚本。
 # =============================================================================
 setup_voice_bridge() {
@@ -613,9 +601,9 @@ setup_voice_bridge() {
     log "安装语音桥需要 sudo 权限，稍后会提示输入密码"
   fi
 
-  log "安装并启动语音桥（首次会预下载 ASR/TTS 模型，视网络需数分钟）..."
+  log "安装并启动语音桥（首次会预下载 wake 模型 / command 模型 / TTS 模型，视网络需数分钟）..."
   if bash "$installer"; then
-    log "语音桥已就绪（端口 28082）"
+    log "语音桥已就绪（端口 28082）；已准备 wake 模型 / command 模型 / TTS 模型"
   else
     warn "语音桥安装失败，可稍后手动执行:"
     warn "  cd $APP_DIR/local_voice_chat && ./install_voice_bridge_service.sh"

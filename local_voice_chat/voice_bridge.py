@@ -107,6 +107,20 @@ def _detect_wakeup_open_asr(recognizer, wav_path: Path, wake_words: list[str], e
     return False, "", text
 
 
+def _is_wakeword_only_text(text: str | None, wake_words: list[str]) -> bool:
+    """Return True when ASR text is effectively just the wake word itself."""
+    norm_text = _normalize_for_wake(text or "")
+    if not norm_text:
+        return False
+    for word in wake_words:
+        norm_word = _normalize_for_wake(word)
+        if not norm_word:
+            continue
+        if norm_text == norm_word:
+            return True
+    return False
+
+
 def _resolve_sdk_root(folder_name: str) -> Path:
     env_base = os.getenv("VOICE_SDK_BASE")
     candidates = []
@@ -142,14 +156,14 @@ def parse_args():
     parser.add_argument(
         "--wake-min-level-dbfs",
         type=float,
-        default=float(os.getenv("VOICE_WAKE_MIN_LEVEL_DBFS", "-68.0")),
+        default=float(os.getenv("VOICE_WAKE_MIN_LEVEL_DBFS", "-75.0")),
         help="忽略低于该音量阈值的唤醒片段；该值越低越灵敏。"
-        "本机实测环境底噪约 -73dBFS、近距离语音约 -64dBFS，故默认 -68",
+        "对低噪声 USB 麦克风，默认应当足够宽松，避免近距离说话也被提前过滤掉。",
     )
     parser.add_argument(
         "--wake-low-level-dbfs",
         type=float,
-        default=float(os.getenv("VOICE_WAKE_LOW_LEVEL_DBFS", "-40.0")),
+        default=float(os.getenv("VOICE_WAKE_LOW_LEVEL_DBFS", "-55.0")),
         help="Wake录音低于该电平且首次未命中时，触发一次增益重试",
     )
     parser.add_argument(
@@ -170,15 +184,45 @@ def parse_args():
     parser.add_argument("--speech-tail-window", type=float, default=0.8)
     parser.add_argument("--speech-silence-threshold-dbfs", type=float, default=-45.0)
 
-    parser.add_argument("--asr-language", default="zh")
+    parser.add_argument("--asr-language", default="")
     parser.add_argument("--asr-model", default="")
     parser.add_argument("--no-auto-download-asr", action="store_true")
     parser.add_argument(
         "--asr-engine",
         choices=["sensevoice", "conformer"],
-        default="conformer",
-        help="sensevoice=不支持热词；conformer=离线大模型+热词",
+        default="",
+        help="(legacy) set both wake+command engines at once",
     )
+    parser.add_argument(
+        "--wake-asr-engine",
+        choices=["sensevoice", "conformer"],
+        default=os.getenv("VOICE_WAKE_ASR_ENGINE", "sensevoice"),
+        help="ASR engine for wake-word detection",
+    )
+    parser.add_argument(
+        "--command-asr-engine",
+        choices=["sensevoice", "conformer"],
+        default=os.getenv("VOICE_COMMAND_ASR_ENGINE", "sensevoice"),
+        help="ASR engine for command recognition",
+    )
+    parser.add_argument(
+        "--download-conformer-model",
+        action="store_true",
+        default=str(os.getenv("VOICE_DOWNLOAD_CONFORMER_MODEL", "")).strip().lower() in {"1", "true", "yes", "y", "on"},
+        help="默认不预下载 Conformer；显式启用时才下载热词模型",
+    )
+    parser.add_argument(
+        "--wake-asr-language",
+        default=os.getenv("VOICE_WAKE_ASR_LANGUAGE", "zh"),
+        help="ASR language hint for wake recognizer",
+    )
+    parser.add_argument(
+        "--command-asr-language",
+        default=os.getenv("VOICE_COMMAND_ASR_LANGUAGE", "auto"),
+        help="ASR language hint for command recognizer",
+    )
+    parser.add_argument("--wake-asr-model", default="", help="Optional wake ASR model path override")
+    parser.add_argument("--command-asr-model", default="", help="Optional command ASR model path override")
     parser.add_argument("--hotwords-file", default="", help="热词文件路径，默认自动生成 hotwords.txt")
     parser.add_argument("--hotwords-score", type=float, default=3.0, help="热词增益分数；唤醒词已加入热词表，3.0 左右均衡")
 
@@ -269,7 +313,31 @@ def parse_args():
         help="打印高频调试日志（唤醒循环音量等），默认关闭以压缩日志",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    argv = list(sys.argv[1:])
+
+    def _flag_specified(flag: str) -> bool:
+        return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+    if args.asr_engine:
+        if not _flag_specified("--wake-asr-engine"):
+            args.wake_asr_engine = args.asr_engine
+        if not _flag_specified("--command-asr-engine"):
+            args.command_asr_engine = args.asr_engine
+
+    if args.asr_language:
+        if not _flag_specified("--wake-asr-language"):
+            args.wake_asr_language = args.asr_language
+        if not _flag_specified("--command-asr-language"):
+            args.command_asr_language = args.asr_language
+
+    if args.asr_model:
+        if not _flag_specified("--wake-asr-model"):
+            args.wake_asr_model = args.asr_model
+        if not _flag_specified("--command-asr-model"):
+            args.command_asr_model = args.asr_model
+
+    return args
 
 
 _HTTP_MODEL_CACHE = {
@@ -745,17 +813,37 @@ def _fast_local_classify_reply(args, user_text):
 
     返回 None 表示不命中，交给 agent 正常处理。
     """
-    want = any(k in user_text for k in ("分类", "归档", "整理", "重命名", "清理"))
-    is_photo = any(k in user_text for k in ("照片", "图片", "相册"))
+    lower = user_text.lower()
+    want = any(k in user_text for k in ("分类", "归档", "整理", "重命名", "清理")) or any(
+        k in lower for k in ("classify", "archive", "organize", "sort", "rename", "clean", "categorize")
+    )
+    is_photo = any(k in user_text for k in ("照片", "图片", "相册")) or any(
+        k in lower for k in ("photo", "photos", "image", "images", "album", "albums")
+    )
     if not (want and is_photo):
         return None
 
     roots = ("手机相册", "家庭相册", "旅行", "备份")
+    root_map = {
+        "phone album": "手机相册",
+        "phone photos": "手机相册",
+        "family album": "家庭相册",
+        "family photos": "家庭相册",
+        "travel": "旅行",
+        "backup": "备份",
+    }
     target = next((r for r in roots if r in user_text), None)
+    if target is None:
+        for key, value in root_map.items():
+            if key in lower:
+                target = value
+                break
     if target is None:
         return None
 
-    dry = any(k in user_text for k in ("预览", "看看", "先别动", "计划"))
+    dry = any(k in user_text for k in ("预览", "看看", "先别动", "计划")) or any(
+        k in lower for k in ("preview", "check", "look", "dry-run", "dry run", "plan")
+    )
     cmd = [
         "docker",
         "exec",
@@ -769,7 +857,7 @@ def _fast_local_classify_reply(args, user_text):
     ]
     ok, output = _run_agent_cmd(cmd, timeout_sec=120)
     if not ok:
-        return f"分类脚本执行失败：{output[:120]}"
+        return _lang_reply(user_text, f"分类脚本执行失败：{output[:120]}", f"Classification script failed: {output[:120]}")
 
     counts = {}
     for line in output.splitlines():
@@ -778,27 +866,57 @@ def _fast_local_classify_reply(args, user_text):
         cat = line.split("\t建议:", 1)[1].split("(", 1)[0].strip()
         counts[cat] = counts.get(cat, 0) + 1
     if not counts:
-        return f"{target}分类脚本已执行。"
+        return _lang_reply(user_text, f"{target}分类脚本已执行。", f"{_localized_target_name(target, user_text)} classification script ran successfully.")
 
+    category_map = {
+        "风景": "scenery",
+        "美食": "food",
+        "人物": "people",
+        "动物": "animals",
+        "建筑": "architecture",
+        "交通工具": "transportation",
+        "日常用品": "daily items",
+        "植物": "plants",
+    }
+    english_summary = ", ".join(
+        f"{category_map.get(k, k)}: {v}"
+        for k, v in sorted(counts.items(), key=lambda x: -x[1])
+    )
     summary = "，".join(f"{k}{v}张" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
     if dry:
+        if _should_use_english_reply(user_text):
+            return f"Preview result: {_localized_target_name(target, user_text)} {english_summary}; no changes were made."
         return f"预览结果：{target} {summary}，未做任何改动。"
+    if _should_use_english_reply(user_text):
+        return f"{_localized_target_name(target, user_text)} classification complete: {english_summary}."
     return f"{target}分类完成：{summary}。"
 
 
 _IMAGE_STYLE_ALIASES = {
     "复古风格": "vintage",
     "复古风": "vintage",
+    "复古滤镜": "vintage",
+    "复古风镜": "vintage",
     "复古": "vintage",
     "vintage": "vintage",
+    "vintage filter": "vintage",
+    "retro": "vintage",
+    "retro filter": "vintage",
     "日系风格": "japanese",
     "日系风": "japanese",
+    "日系滤镜": "japanese",
+    "日系风镜": "japanese",
     "日系": "japanese",
     "japanese": "japanese",
+    "japanese style": "japanese",
     "胶片风格": "film",
     "胶片风": "film",
+    "胶片滤镜": "film",
+    "胶片风镜": "film",
     "胶片": "film",
     "film": "film",
+    "film style": "film",
+    "film filter": "film",
 }
 
 _IMAGE_STYLE_DIRS = {
@@ -807,17 +925,80 @@ _IMAGE_STYLE_DIRS = {
     "film": "胶片风格",
 }
 
+
+def _should_use_english_reply(user_text: str | None) -> bool:
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    english_markers = (
+        "please", "help", "what", "where", "which", "find", "search", "show",
+        "download", "play", "preview", "classify", "filter", "style", "video",
+        "movie", "photo", "album", "folder", "document", "contract", "add", "make",
+        "family album", "phone album", "travel", "backup"
+    )
+    if re.search(r"[A-Za-z]", text):
+        if any(marker in lower for marker in english_markers):
+            return True
+        if not re.search(r"[\u4e00-\u9fff]", text):
+            return True
+    return False
+
+
+def _localized_target_name(target: str | None, user_text: str | None = None) -> str:
+    if not target:
+        return ""
+    if not _should_use_english_reply(user_text):
+        return target
+    mapping = {
+        "家庭相册": "Family album",
+        "手机相册": "Phone album",
+        "旅行": "Travel",
+        "备份": "Backup",
+    }
+    return mapping.get(target, target)
+
+
+def _localized_style_name(style: str | None, user_text: str | None = None) -> str:
+    if style is None:
+        return ""
+    if not _should_use_english_reply(user_text):
+        return str(style)
+    mapping = {
+        "vintage": "vintage",
+        "japanese": "japanese",
+        "film": "film",
+        "复古风格": "vintage",
+        "日系风格": "japanese",
+        "胶片风格": "film",
+    }
+    return mapping.get(str(style), str(style))
+
+
+def _lang_reply(user_text: str | None, chinese: str, english: str) -> str:
+    return english if _should_use_english_reply(user_text) else chinese
+
+
 _IMAGE_FILTER_STYLE_PROMPT = "要哪种风格：复古、日系还是胶片？"
 _IMAGE_FILTER_TARGET_PROMPT = "请说要处理哪个目录，例如旅行或家庭相册。"
 _IMAGE_FILTER_PENDING_MAX_ATTEMPTS = 4
 
 
 def _looks_like_image_filter_request(user_text: str) -> bool:
-    has_filter_intent = any(
-        k in user_text
-        for k in ("滤镜", "风格", "调色", "处理成", "处理", "改成", "变成", "弄成", "加滤镜")
+    lower = (user_text or "").lower()
+    style_tokens = (
+        "滤镜", "风格", "调色", "复古", "日系", "胶片",
+        "风镜", "复古风镜", "日系风镜", "胶片风镜",
+        "filter", "style", "color", "tint", "retro", "vintage",
+        "japanese", "film", "apply", "make", "add", "process",
+        "processing", "convert", "turn", "use"
     )
-    has_photo_object = any(k in user_text for k in ("照片", "图片", "相册", "图像"))
+    has_filter_intent = any(k in user_text for k in ("滤镜", "风格", "调色", "处理成", "处理", "改成", "变成", "弄成", "加滤镜")) or any(
+        k in lower for k in style_tokens
+    )
+    has_photo_object = any(k in user_text for k in ("照片", "图片", "相册", "图像")) or any(
+        k in lower for k in ("photo", "photos", "image", "images", "album", "albums")
+    )
     return has_filter_intent and has_photo_object
 
 
@@ -833,7 +1014,22 @@ def _is_style_only_phrase(text: str) -> bool:
 
 def _detect_image_filter_target(user_text: str):
     roots = ("手机相册", "家庭相册", "旅行", "备份")
-    return next((r for r in roots if r in user_text), None)
+    target = next((r for r in roots if r in user_text), None)
+    if target is not None:
+        return target
+    lower = (user_text or "").lower()
+    english_roots = {
+        "phone album": "手机相册",
+        "phone photos": "手机相册",
+        "family album": "家庭相册",
+        "family photos": "家庭相册",
+        "travel": "旅行",
+        "backup": "备份",
+    }
+    for key, value in english_roots.items():
+        if key in lower:
+            return value
+    return None
 
 
 def _extract_image_filter_request(user_text: str):
@@ -842,7 +1038,9 @@ def _extract_image_filter_request(user_text: str):
 
     target = _detect_image_filter_target(user_text)
     style = _detect_image_style(user_text)
-    dry = any(k in user_text for k in ("预览", "先看看", "先别动", "计划", "试运行", "dry-run"))
+    dry = any(k in user_text for k in ("预览", "先看看", "先别动", "计划", "试运行", "dry-run")) or any(
+        k in (user_text or "").lower() for k in ("preview", "dry-run", "dry run", "check", "look", "test run")
+    )
     return {
         "target": target,
         "style": style,
@@ -850,10 +1048,10 @@ def _extract_image_filter_request(user_text: str):
     }
 
 
-def _run_image_batch_reply(target: str, style: str, dry: bool):
+def _run_image_batch_reply(target: str, style: str, dry: bool, user_text: str | None = None):
     script = Path(__file__).resolve().parent / "image_batch.py"
     if not script.exists():
-        return "滤镜脚本不存在，请先同步 image_batch.py。"
+        return _lang_reply(user_text, "滤镜脚本不存在，请先同步 image_batch.py。", "Filter script not found. Please sync image_batch.py first.")
 
     cmd = [
         sys.executable,
@@ -876,13 +1074,15 @@ def _run_image_batch_reply(target: str, style: str, dry: bool):
             timeout=600,
         )
     except subprocess.TimeoutExpired:
-        return "滤镜处理超时，请缩小目录范围后重试。"
+        return _lang_reply(user_text, "滤镜处理超时，请缩小目录范围后重试。", "Filter processing timed out. Please reduce the directory scope and try again.")
     except Exception as e:  # noqa: BLE001
-        return f"滤镜处理失败：{e}"
+        return _lang_reply(user_text, f"滤镜处理失败：{e}", f"Filter processing failed: {e}")
 
     output = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
     summary = _parse_image_batch_summary(output)
     style_dir = summary.get("style") or _IMAGE_STYLE_DIRS.get(style, "风格")
+    target_display = _localized_target_name(target, user_text)
+    style_dir_display = _localized_style_name(style_dir, user_text)
 
     def _to_int(v, default=0):
         try:
@@ -899,25 +1099,34 @@ def _run_image_batch_reply(target: str, style: str, dry: bool):
     if p.returncode != 0 and processed <= 0:
         tail = "；".join([x.strip() for x in output.splitlines()[-3:] if x.strip()])
         if "Permission denied" in output or "PermissionError" in output:
-            return "滤镜处理失败：目录无写入权限，请先修复 NAS 目录归属后重试。"
-        return f"滤镜处理失败：{(tail or '未知错误')[:120]}"
+            return _lang_reply(user_text, "滤镜处理失败：目录无写入权限，请先修复 NAS 目录归属后重试。", "Filter processing failed: the directory is not writable. Please fix the NAS directory ownership and try again.")
+        return _lang_reply(user_text, f"滤镜处理失败：{(tail or '未知错误')[:120]}", f"Filter processing failed: {(tail or 'unknown error')[:120]}")
 
     if dry:
+        if _should_use_english_reply(user_text):
+            return (
+                f"Preview complete: {target_display} contains {total} images; "
+                f"{planned} are planned for processing; output to the original folders/{style_dir_display}/, and no files were written."
+            )
         return (
             f"预览完成：{target}共{total}张，计划处理{planned}张，"
             f"输出到各原目录/{style_dir}/，未写入文件。"
         )
 
     if total == 0:
-        return f"{target}目录下未发现可处理图片。"
+        return _lang_reply(user_text, f"{target}目录下未发现可处理图片。", f"No processable images were found in {target_display}.")
     if processed == 0 and skipped > 0:
-        return f"{target}{style_dir}已是最新，跳过{skipped}张，无需重复处理。"
-    reply = f"{target}{style_dir}处理完成：成功{processed}张"
+        return _lang_reply(
+            user_text,
+            f"{target}{style_dir}已是最新，跳过{skipped}张，无需重复处理。",
+            f"{target_display} {style_dir_display} is already up to date; skipped {skipped} images, so no duplicate processing is required.",
+        )
+    reply = _lang_reply(user_text, f"{target}{style_dir}处理完成：成功{processed}张", f"{target_display} {style_dir_display} processing complete: {processed} images succeeded")
     if skipped > 0:
-        reply += f"，跳过{skipped}张"
+        reply += _lang_reply(user_text, f"，跳过{skipped}张", f"; skipped {skipped} images")
     if failed > 0:
-        reply += f"，失败{failed}张"
-    return reply + f"，输出到各原目录/{style_dir}/。"
+        reply += _lang_reply(user_text, f"，失败{failed}张", f"; failed {failed} images")
+    return reply + _lang_reply(user_text, f"，输出到各原目录/{style_dir}/。", f"; output to the original folders/{style_dir_display}/.")
 
 
 def _consume_pending_image_filter(text: str, pending: dict | None):
@@ -927,7 +1136,7 @@ def _consume_pending_image_filter(text: str, pending: dict | None):
     explicit_target = _detect_image_filter_target(text)
     explicit_style = _detect_image_style(text)
     if explicit_target is None and explicit_style is None and not _looks_like_image_filter_request(text):
-        return "我还在等你说清楚要处理哪个目录和风格。", None
+        return _lang_reply(text, "我还在等你说清楚要处理哪个目录和风格。", "I’m still waiting for you to specify the folder and style."), None
 
     target = explicit_target or pending.get("target")
     style = explicit_style
@@ -937,23 +1146,24 @@ def _consume_pending_image_filter(text: str, pending: dict | None):
         style = pending.get("style")
 
     if target is not None and style is not None:
-        return _run_image_batch_reply(target, style, bool(pending.get("dry"))), None
+        return _run_image_batch_reply(target, style, bool(pending.get("dry")), text), None
 
     attempts = int(pending.get("attempts", 0)) + 1
     if attempts >= _IMAGE_FILTER_PENDING_MAX_ATTEMPTS:
-        return "我还是没听清，请重新说完整指令。", None
+        return _lang_reply(text, "我还是没听清，请重新说完整指令。", "I still couldn’t hear clearly. Please repeat the full instruction."), None
 
     pending["target"] = target
     pending["style"] = style
     pending["attempts"] = attempts
     if target is None:
-        return _IMAGE_FILTER_TARGET_PROMPT, pending
-    return "我没听清风格，请说复古、日系或胶片。", pending
+        return _lang_reply(text, _IMAGE_FILTER_TARGET_PROMPT, "Please tell me which folder to process, such as Travel or Family album."), pending
+    return _lang_reply(text, "我没听清风格，请说复古、日系或胶片。", "I couldn’t tell the style clearly. Please say vintage, Japanese, or film."), pending
 
 
 def _detect_image_style(user_text: str):
+    text = (user_text or "").lower()
     for k in sorted(_IMAGE_STYLE_ALIASES.keys(), key=len, reverse=True):
-        if k in user_text:
+        if k.lower() in text:
             return _IMAGE_STYLE_ALIASES[k]
     return None
 
@@ -978,59 +1188,61 @@ def _fast_local_image_filter_reply(_args, user_text: str):
         return None
 
     if req["target"] is None:
-        return _IMAGE_FILTER_TARGET_PROMPT
+        return _lang_reply(user_text, _IMAGE_FILTER_TARGET_PROMPT, "Please tell me which folder to process, such as Travel or Family album.")
 
     if req["style"] is None:
-        return _IMAGE_FILTER_STYLE_PROMPT
-    return _run_image_batch_reply(req["target"], req["style"], bool(req["dry"]))
+        return _lang_reply(user_text, _IMAGE_FILTER_STYLE_PROMPT, "What style do you want: vintage, Japanese, or film?")
+    return _run_image_batch_reply(req["target"], req["style"], bool(req["dry"]), user_text)
 
 
 # 口语/别名 → 库中媒体名（ASR 常把英文媒体名识别成中文口语）
-PLAY_ALIASES = {
-    "兔子": "Big_Buck_Bunny",
-    "bunny": "Big_Buck_Bunny",
-    "大兔": "Big_Buck_Bunny",
-    "大兔子": "Big_Buck_Bunny",
-    "bbb": "Big_Buck_Bunny",
-    "bb": "Big_Buck_Bunny",
-    "预告片": "Sintel",
-    "sintel": "Sintel",
+# 统一放在一份共享字典中，播放与下载逻辑都从这里派生，避免再次漏配同义词。
+_COMMON_MEDIA_ALIASES = {
+    "兔子": {"play_name": "Big_Buck_Bunny"},
+    "bunny": {"play_name": "Big_Buck_Bunny"},
+    "大兔": {"play_name": "Big_Buck_Bunny"},
+    "大兔子": {"play_name": "Big_Buck_Bunny"},
+    "bbb": {"play_name": "Big_Buck_Bunny"},
+    "bb": {"play_name": "Big_Buck_Bunny"},
+    "预告片": {"play_name": "Sintel", "download": {"url": "https://media.w3.org/2010/05/sintel/trailer.mp4", "default_folder": "Movies"}},
+    "sintel": {"play_name": "Sintel", "download": {"url": "https://media.w3.org/2010/05/sintel/trailer.mp4", "default_folder": "Movies"}},
+    "海洋": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "大海": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "样本": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "测试": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "测试视频": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "test video": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "sample video": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "特视": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "特视视频": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "oceans": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
+    "ocean": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
 }
+PLAY_ALIASES = {k: v["play_name"] for k, v in _COMMON_MEDIA_ALIASES.items() if "play_name" in v}
 # Backward-compatible alias used by older references in this file.
 _PLAY_ALIASES = PLAY_ALIASES
 
 DOWNLOAD_MEDIA_LIBRARY = {
-    "海洋": {
-        "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "Movies",
-    },
-    "大海": {
-        "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "Movies",
-    },
-    "预告片": {
-        "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
-        "default_folder": "Movies",
-    },
-    "sintel": {
-        "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
-        "default_folder": "Movies",
-    },
-    "样本": {
-        "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "Movies",
-    },
-    "测试": {
-        "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "Movies",
-    },
-    "测试视频": {
-        "url": "https://vjs.zencdn.net/v/oceans.mp4",
-        "default_folder": "Movies",
-    },
+    k: v["download"]
+    for k, v in _COMMON_MEDIA_ALIASES.items()
+    if "download" in v
 }
 # Backward-compatible alias used by older references in this file.
 _DOWNLOAD_MEDIA_LIBRARY = DOWNLOAD_MEDIA_LIBRARY
+
+
+def _resolve_play_alias(term: str | None, user_text: str | None = None) -> str | None:
+    """优先从清洗后的 term 和原始用户文本中解析播放别名，避免只检查单一字段漏判。"""
+    haystack = " ".join(
+        part.strip() for part in (term or "", user_text or "") if part and part.strip()
+    ).lower()
+    if not haystack:
+        return None
+
+    for alias in sorted(_PLAY_ALIASES, key=len, reverse=True):
+        if alias.lower() in haystack:
+            return _PLAY_ALIASES[alias]
+    return None
 
 
 def _host_side_service_url(raw_url: str | None, fallback: str) -> str:
@@ -1077,7 +1289,7 @@ def _sanitize_download_filename(name: str) -> str:
 def _fast_local_download_reply(args, user_text: str):
     """命中下载指令时，直连 media_downloader API，避免走 agent 长链路。"""
     user_text_lower = user_text.lower()
-    short_dl = bool(re.search(r"(^|帮我|给我|请|please\s*)(下|下载|download)\s*(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny|sample|test|trailer|ocean)", user_text, flags=re.IGNORECASE))
+    short_dl = bool(re.search(r"(^|帮我|给我|请|please\s*)(下|下载|download)\s*(测试视频|测试|样本|海洋|大海|预告片|兔子|sintel|bunny|sample|sample video|test|test video|trailer|ocean|oceans)", user_text, flags=re.IGNORECASE))
     if ("下载" not in user_text) and ("download" not in user_text_lower) and (not short_dl):
         return None
     if "下载的" in user_text and not user_text.strip().startswith("下载") and "帮我下载" not in user_text:
@@ -1143,25 +1355,25 @@ def _fast_local_download_reply(args, user_text: str):
             if not (200 <= resp.status < 300) or not data.get("ok"):
                 reason = f"下载接口返回异常 status={resp.status}"
                 print(f"[DL] local download not ok status={resp.status} body={raw[:240]}")
-                return _download_failed_play_test_video(args, reason)
+                return _download_failed_play_test_video(args, reason, user_text)
 
         files = data.get("files") if isinstance(data.get("files"), list) else []
         safe_subdir = str(data.get("safe_subdir") or target_subdir)
         if files:
             first_name = _sanitize_download_filename(Path(files[0]).name)
             print(f"[DL] local download success key={matched_key or '(query)'} file={first_name}")
-            return f"下载已完成，已保存到{safe_subdir}，文件名{first_name}。"
+            return _lang_reply(user_text, f"下载已完成，已保存到{safe_subdir}，文件名{first_name}。", f"Download complete. Saved to {safe_subdir}, file name {first_name}.")
         print(f"[DL] local download success key={matched_key or '(query)'}")
-        return f"下载已完成，已保存到{safe_subdir}。"
+        return _lang_reply(user_text, f"下载已完成，已保存到{safe_subdir}。", f"Download complete. Saved to {safe_subdir}.")
     except Exception as e:  # noqa: BLE001
         reason = f"外部视频源不可访问 ({e})"
         print(f"[DL] local download failed, default to test video: {e}")
         try:
-            fallback = _download_failed_play_test_video(args, reason)
+            fallback = _download_failed_play_test_video(args, reason, user_text)
             return fallback
         except Exception as fallback_err:  # noqa: BLE001
             print(f"[DL] fallback error: {fallback_err}")
-            return f"下载失败：{reason}，未成功写入 Movies。"
+            return _lang_reply(user_text, f"下载失败：{reason}，未成功写入 Movies。", f"Download failed: {reason}. The file was not successfully written to Movies.")
 
 
 def _open_jellyfin_in_firefox(jellyfin_url: str, item_id: str | None = None) -> bool:
@@ -1303,16 +1515,25 @@ def _fast_local_play_reply(args, user_text: str):
     if not args.jellyfin_api_key:
         return None
 
+    lower = (user_text or "").lower()
+
     # 1. 检测播放意图
     #    显式播放词：含下列任意一个即命中
     explicit_play = ("播放", "放一下", "放出来", "放视频", "放电影", "放个", "放部",
                      "看一下", "看看", "看视频", "看电影", "看个", "看部", "看",
                      "一下", "一部", "一个", "给我放",
-                     "视频", "电影", "影片", "片子")
+                     "视频", "电影", "影片", "片子",
+                     "play", "play the", "watch", "watch the")
     #    口语 "放" 需搭配媒体词才算播放意图
     media_words = ("视频", "电影", "影片", "片子", "片", "纪录片", "预告片", "剧集", "短片", "动画")
 
-    has_play = any(k in user_text for k in explicit_play)
+    # "show me photos ..." / "find photos ..." 属于相册搜索，不应命中 Jellyfin 播放通道
+    if any(k in lower for k in ("photo", "photos", "image", "images", "album", "albums")) and not any(
+        k in lower for k in ("video", "movie", "film", "trailer", "episode")
+    ):
+        return None
+
+    has_play = any(k in user_text for k in explicit_play) or any(k in lower for k in ("play", "watch"))
     if not has_play:
         # 口语"放 + 内容名"（排除 放弃/放大/放小/放下/放手/放心/放松/放开 等非播放义）
         import re as _re
@@ -1328,7 +1549,8 @@ def _fast_local_play_reply(args, user_text: str):
               "播放", "放一下", "放出来", "放视频", "放电影", "放个", "放部", "放",
               "看一下", "看看", "看视频", "看电影", "看个", "看部", "看",
               "一下", "一部", "一个", "给我放",
-              "视频", "电影", "影片", "片子"):
+              "视频", "电影", "影片", "片子",
+              "play", "watch", "show", "please", "the", "a", "an"):
         term = term.replace(w, "")
     term = re.sub(r"(并且播放|并播放|然后播放)$", "", term)
     term = term.replace("并且", "").replace("并", "")
@@ -1375,10 +1597,10 @@ def _fast_local_play_reply(args, user_text: str):
         # 泛称"放视频"：列出库中视频让用户选择
         lib_items = _fetch_library()
         if not lib_items:
-            return "Jellyfin 库中暂无视频，可先下载内容。"
+            return _lang_reply(user_text, "Jellyfin 库中暂无视频，可先下载内容。", "There are no videos in Jellyfin yet. Please download one first.")
         if len(lib_items) > 1:
             names = "、".join(i["Name"] for i in lib_items[:4])
-            return f"库中有：{names}，请说具体片名。"
+            return _lang_reply(user_text, f"库中有：{names}，请说具体片名。", f"The library has: {names}. Please tell me the exact title you want.")
         item_id, item_name = lib_items[0]["Id"], lib_items[0]["Name"]
     else:
         # 指定片名：先精确搜索
@@ -1393,15 +1615,14 @@ def _fast_local_play_reply(args, user_text: str):
             print(f"[Jellyfin] search failed: {e}")
             return None  # 网络/认证异常才降级 agent
 
-        if not items and term in _PLAY_ALIASES:
-            # 口语别名兜底：如"兔子"→ Big_Buck_Bunny
-            alias = _PLAY_ALIASES[term]
-            print(f"[Jellyfin] alias: {term!r} -> {alias!r}")
+        alias_name = _resolve_play_alias(term, user_text)
+        if alias_name is not None:
+            print(f"[Jellyfin] alias: {term!r} -> {alias_name!r}")
             try:
                 result = _req(
                     "GET",
                     f"/Items?IncludeItemTypes=Movie,Video&Recursive=true&Limit=5"
-                    f"&searchTerm={_up.quote(alias)}",
+                    f"&searchTerm={_up.quote(alias_name)}",
                 )
                 items = result.get("Items", [])
             except Exception as e:
@@ -1424,9 +1645,9 @@ def _fast_local_play_reply(args, user_text: str):
                     print(f"[Jellyfin] fuzzy: {term!r} -> {item_name} (ratio={ratio:.2f})")
                 else:
                     names = "、".join(i["Name"] for i in lib_items[:4])
-                    return f"没找到{term}，库中有：{names}，请说具体片名。"
+                    return _lang_reply(user_text, f"没找到{term}，库中有：{names}，请说你想看的哪个片名？", f"Could not find {term}. The library has: {names}. Please tell me which title you want to watch.")
             else:
-                return f"没找到{term}，Jellyfin 库中暂无视频。"
+                return _lang_reply(user_text, f"没找到{term}，Jellyfin 库中暂无视频，请说你想看的哪个片名？", f"Could not find {term}. There are no videos in the Jellyfin library yet. Please tell me which title you want to watch.")
 
     # 4. 发送播放指令
     print(f"[Jellyfin] play target: {item_name} (id={item_id})")
@@ -1463,8 +1684,8 @@ def _fast_local_play_reply(args, user_text: str):
 
         if not candidates:
             if opened:
-                return f"已打开 Jellyfin，正在进入：{item_name}"
-            return f"请先打开 Jellyfin 网页，再说播放。"
+                return _lang_reply(user_text, f"已打开 Jellyfin，正在进入：{item_name}", f"Jellyfin is open and loading: {item_name}")
+            return _lang_reply(user_text, "请先打开 Jellyfin 网页，再说播放。", "Please open the Jellyfin page first, then tell me to play.")
 
     # 已有会话时也要主动前置窗口，避免后台播放看不到界面
     _focus_firefox_for_jellyfin(
@@ -1479,20 +1700,20 @@ def _fast_local_play_reply(args, user_text: str):
              f"/Sessions/{sid}/Playing"
              f"?ItemIds={_up.quote(item_id)}&PlayCommand=PlayNow")
         print(f"[Jellyfin] play sent: {item_name} -> session {sid}")
-        return f"正在播放：{item_name}"
+        return _lang_reply(user_text, f"正在播放：{item_name}", f"Playing: {item_name}")
     except Exception as e:
         print(f"[Jellyfin] play failed: {e}")
-        return f"播放失败，请在 Jellyfin 手动播放：{item_name}"
+        return _lang_reply(user_text, f"播放失败，请在 Jellyfin 手动播放：{item_name}", f"Playback failed. Please play {item_name} manually in Jellyfin.")
 
 
-def _download_failed_play_test_video(args, reason: str | None = None):
+def _download_failed_play_test_video(args, reason: str | None = None, user_text: str | None = None):
     """下载失败时的默认兜底：优先尝试播放 Jellyfin 中已有的测试视频；
 
     如果库中没有测试视频，则明确说明下载失败的真实原因，而不是误报“没找到测试”。
     """
     if getattr(args, "jellyfin_api_key", None):
         try:
-            play_reply = _fast_local_play_reply(args, "播放测试视频")
+            play_reply = _fast_local_play_reply(args, "播放测试视频" if not _should_use_english_reply(user_text) else "Play the test video")
             if play_reply and "暂无视频" not in play_reply:
                 print(f"[DL] download failed, default to playing test video: {play_reply}")
                 return play_reply
@@ -1500,8 +1721,8 @@ def _download_failed_play_test_video(args, reason: str | None = None):
             print(f"[DL] play test video on download fail error: {e}")
 
     if reason:
-        return f"我已经尝试下载，但目标视频源不可访问，当前没有写入 Movies 文件夹；{reason}。"
-    return "我已经尝试下载，但目标视频源不可访问，当前没有写入 Movies 文件夹。"
+        return _lang_reply(user_text, f"我已经尝试下载，但目标视频源不可访问，当前没有写入 Movies 文件夹；{reason}。", f"I attempted the download, but the target video source is unavailable and nothing was written to the Movies folder; {reason}.")
+    return _lang_reply(user_text, "我已经尝试下载，但目标视频源不可访问，当前没有写入 Movies 文件夹。", "I attempted the download, but the target video source is unavailable and nothing was written to the Movies folder.")
 
 
 def _fast_local_download_reply_with_args(args, user_text: str):
@@ -1510,12 +1731,12 @@ def _fast_local_download_reply_with_args(args, user_text: str):
 
 # KB 快速通道关键词：必须包含"查询意图词"之一
 _KB_INTENT_WORDS = re.compile(
-    r"在哪|哪里|哪个|找|查找|搜索|搜|是什么|有没有|有哪些|多少|内容|写着|写了"
-)
+    r"在哪|哪里|哪个|找|查找|搜索|搜|是什么|有没有|有哪些|多少|内容|写着|写了|where|what|which|find|search|how many|what's|whose|is there|is it|have|has|look for"
+, re.IGNORECASE)
 # 同时包含"对象词"之一才命中
 _KB_OBJECT_WORDS = re.compile(
-    r"文件|文档|合同|报告|表格|表|记录|照片|图片|相册|视频|电影|音乐|资料|方案|说明|计划|协议"
-)
+    r"文件|文档|合同|报告|表格|表|记录|照片|图片|相册|视频|电影|音乐|资料|方案|说明|计划|协议|file|files|document|contract|report|table|record|photo|photos|image|images|album|video|movie|music|data|plan|agreement|note|statement"
+, re.IGNORECASE)
 _KB_API_URL = _host_side_service_url(
     os.getenv("KB_API_URL"),
     "http://127.0.0.1:28084",
@@ -1581,12 +1802,19 @@ def _kb_snippet_to_spoken(snippet: str, max_chars: int = 60) -> str:
     return s.strip(" ，。；、")
 
 
-def _format_kb_spoken_reply(results):
+def _format_kb_spoken_reply(results, user_text: str | None = None):
     total = len(results)
     first = results[0] if results else {}
     first_path = first.get("path", "")
     file_spoken, loc_spoken = _kb_path_to_spoken(first_path)
     content_spoken = _kb_snippet_to_spoken(first.get("snippet", ""))
+
+    if _should_use_english_reply(user_text):
+        if content_spoken:
+            return f"The document says: {content_spoken}."
+        if total <= 1:
+            return f"Found it: {file_spoken}, in the documents folder."
+        return f"Found {total} matches. The first one is {file_spoken}, in the documents folder."
 
     if content_spoken:
         # 命中内容时优先回答内容，再补位置（loc_spoken 形如"在xx文件夹里"）
@@ -1610,27 +1838,72 @@ def _fast_local_directory_listing_reply(_args, user_text: str):
     text = (user_text or "").strip()
     if not text:
         return None
-    if not re.search(r"(有哪些|有的|列出|列举|文件|目录|文件夹)", text):
+    text_lower = text.lower()
+    if not re.search(r"(有哪些|有的|列出|列举|文件|目录|文件夹|what|list|show|files|folder|directory)", text, flags=re.IGNORECASE):
         return None
-    if not re.search(r"(家庭相册|手机相册|旅行|备份|目录|文件夹)", text):
-        return None
-
     roots = {
         "家庭相册": "/home/pi/nas_share/家庭相册",
         "手机相册": "/home/pi/nas_share/手机相册",
         "旅行": "/home/pi/nas_share/旅行",
         "备份": "/home/pi/nas_share/备份",
+        "family album": "/home/pi/nas_share/家庭相册",
+        "family photos": "/home/pi/nas_share/家庭相册",
+        "phone album": "/home/pi/nas_share/手机相册",
+        "travel": "/home/pi/nas_share/旅行",
+        "backup": "/home/pi/nas_share/备份",
     }
-    matched = next((k for k in roots if k in text), None)
+    matched = next((k for k in roots if k in text or k in text_lower), None)
     if matched is None:
         return None
     base = Path(roots[matched])
     if not base.exists():
-        return f"{matched}目录还没创建，先确认路径后再列文件。"
+        return _lang_reply(user_text, f"{matched}目录还没创建，先确认路径后再列文件。", f"The {matched} directory has not been created yet. Please confirm the path before listing files.")
     entries = sorted(p.name for p in base.iterdir() if p.exists())[:8]
     if not entries:
-        return f"{matched}目录里还没有文件。"
-    return f"{matched}里有这些文件：{ '、'.join(entries[:6]) }。"
+        return _lang_reply(user_text, f"{matched}目录里还没有文件。", f"There are no files in the {matched} directory.")
+    display = matched if matched in {"家庭相册", "手机相册", "旅行", "备份"} else {
+        "family album": "家庭相册",
+        "family photos": "家庭相册",
+        "phone album": "手机相册",
+        "travel": "旅行",
+        "backup": "备份",
+    }[matched]
+    display_en = _localized_target_name(display, user_text)
+    if _should_use_english_reply(user_text):
+        files = "、".join(entries[:6])
+        return f"{display_en} contains these files: {files}."
+    return f"{display}里有这些文件：{'、'.join(entries[:6])}。"
+
+
+def _kb_search_candidates(user_text: str):
+    """为英文 KB 查询补充中文直译候选，避免仅按原文搜索命中率偏低。"""
+    text = (user_text or "").strip()
+    if not text:
+        return []
+
+    lower = text.lower()
+    candidates = [text]
+    if "housing contract" in lower or "lease contract" in lower or "rent contract" in lower:
+        candidates.append("住房合同在哪")
+    if "family album" in lower:
+        candidates.append("家庭相册里有哪些文件")
+    if "phone album" in lower:
+        candidates.append("手机相册里有哪些文件")
+    if "where is" in lower and ("contract" in lower or "document" in lower or "file" in lower):
+        candidates.append("在文档中找")
+
+    seen = set()
+    ordered = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return ordered
 
 
 def _fast_local_kb_reply(_args, user_text: str):
@@ -1644,39 +1917,76 @@ def _fast_local_kb_reply(_args, user_text: str):
     import json as _json
     import urllib.request as _ur
 
-    try:
-        req = _ur.Request(
-            f"{_KB_API_URL}/search",
-            data=_json.dumps({"query": user_text}, ensure_ascii=False).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json; charset=utf-8"},
-        )
-        with _ur.urlopen(req, timeout=8) as resp:
-            data = _json.loads(resp.read())
-    except Exception as e:
-        print(f"[KB] api error: {e}")
-        return None
+    last_error = None
+    for query in _kb_search_candidates(user_text):
+        try:
+            req = _ur.Request(
+                f"{_KB_API_URL}/search",
+                data=_json.dumps({"query": query}, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            with _ur.urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read())
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            print(f"[KB] api error for query={query!r}: {e}")
+            continue
 
-    results = data.get("results", [])
-    if not results:
-        return f'知识库中未找到与"{user_text}"相关的内容'
+        results = data.get("results", [])
+        if results:
+            return _format_kb_spoken_reply(results, user_text)
 
-    return _format_kb_spoken_reply(results)
+    if last_error is not None:
+        print(f"[KB] all query variants failed: {last_error}")
+    return _lang_reply(user_text, f'知识库中未找到与"{user_text}"相关的内容', f'No relevant content was found for "{user_text}".')
 
 
 # ── Immich 语义相册搜索快通道 ─────────────────────────────────────────────────
 _IMMICH_API_URL = os.getenv("IMMICH_API_URL", "http://127.0.0.1:2283").rstrip("/")
 _IMMICH_API_KEY = os.getenv("IMMICH_API_KEY") or ""
 
-_IMMICH_INTENT_RE = re.compile(r"找|搜|查找|搜索|有哪些")
-_IMMICH_OBJECT_RE = re.compile(r"照片|图片|相册")
+_IMMICH_INTENT_RE = re.compile(
+    r"找|搜|查找|搜索|有哪些|find|search|look for|show|show me|what.*photo|which.*photo",
+    re.IGNORECASE,
+)
+_IMMICH_OBJECT_RE = re.compile(
+    r"照片|图片|相册|photo|photos|image|images|album|albums",
+    re.IGNORECASE,
+)
 # 位置/管理类意图不走语义搜索；文件/目录查询也不应误判为相册语义搜索
 _IMMICH_EXCLUDE_RE = re.compile(
-    r"在哪|哪里|哪个|位置|文件夹|文件|目录|路径|分类|归档|整理|下载|播放|删除|移动|滤镜|处理|备份"
+    r"在哪|哪里|哪个|位置|文件夹|文件|目录|路径|分类|归档|整理|下载|播放|删除|移动|滤镜|处理|备份|where|what|which|file|folder|directory|path|classify|archive|organize|download|play|delete|move|filter|process|backup",
+    re.IGNORECASE,
 )
 _IMMICH_STRIP_RE = re.compile(
-    r"帮我|请|找|查找|搜索|搜|所有|全部|有的|有|照片|图片|相册|包含|带|的|里|中"
+    r"帮我|请|找|查找|搜索|搜|所有|全部|有的|有|照片|图片|相册|包含|带|的|里|中|find|search|look for|show me|show|photo|photos|image|images|album|albums|of|the|a|an",
+    re.IGNORECASE,
 )
+
+
+def _strip_immich_semantic(text: str) -> str:
+    """从英文/中文用户句子里提取真正的相册语义词，保留内容词，不做字母级误删。"""
+    s = (text or "").strip()
+    if not s:
+        return ""
+
+    # 先删掉英文指令词，并用词边界避免把 "photos" 删成 "s" 或 "images" 删成 "s"。
+    s = re.sub(r"(?i)\b(?:help\s+me|please|find|search|look\s+for|show\s+me|show)\b", " ", s)
+    s = re.sub(r"(?i)\b(?:photos?|images?|albums?|album)\b", " ", s)
+    s = re.sub(r"(?i)\b(?:of|the|a|an)\b", " ", s)
+
+    # 再删掉中文指令词，避免 CJK 下 \b 失效
+    for token in [
+        "帮我", "请", "找", "查找", "搜索", "搜", "照片", "图片", "相册",
+        "有的", "有哪些", "所有", "全部", "包含", "带", "里", "中",
+    ]:
+        s = s.replace(token, " ")
+
+    s = s.replace("，", " ").replace("。", " ")
+    s = re.sub(r"[\s_]+", " ", s)
+    s = s.strip(" .!?;:，。！？；：")
+    return s
 
 
 def _immich_item_to_spoken(item: dict, idx: int) -> str:
@@ -1701,7 +2011,7 @@ def _fast_local_immich_reply(_args, user_text: str):
         return None
     if _IMMICH_EXCLUDE_RE.search(user_text):
         return None
-    semantic = _IMMICH_STRIP_RE.sub("", user_text)
+    semantic = _strip_immich_semantic(user_text)
     semantic = semantic.strip("，。！？,.!?；;：: ")
     if len(semantic) < 2:
         return None
@@ -1728,8 +2038,10 @@ def _fast_local_immich_reply(_args, user_text: str):
     items = (data.get("assets") or {}).get("items") or []
     items = [it for it in items if (it.get("type") or "").upper() == "IMAGE"]
     if not items:
-        return f"相册里没有找到和{semantic}相关的照片。"
+        return _lang_reply(user_text, f"相册里没有找到和{semantic}相关的照片。", f'No photos matching "{semantic}" were found in the album.')
     names = [_immich_item_to_spoken(it, i + 1) for i, it in enumerate(items[:3])]
+    if _should_use_english_reply(user_text):
+        return f"Found {len(items)} photos related to {semantic}, for example: {'; '.join(f'photo {i + 1}' for i in range(min(3, len(items))))}."
     return f"找到{len(items)}张和{semantic}相关的照片，比如：{'、'.join(names)}。"
 
 
@@ -1799,9 +2111,12 @@ def ask_openclaw(args, user_text):
         print(f"[DANGER] intercepted for confirmation: {user_text!r}")
         return f"你说的是\"{ user_text[:24] }\"，这是危险操作，请再说\"确认\"来执行，或说\"取消\"放弃。"
 
+    use_english_reply = _should_use_english_reply(user_text)
+    reply_language = "English" if use_english_reply else "Chinese"
     bridge_prompt = (
         "你是quectel pi上的对话助手，执行用户口头指令，可调用已有工具（文件/NAS/相册等）。"
-        "直接执行给结果，回复简短中文，不超过20字，一句说完，纯文字，禁止markdown（**加粗**、-列表、#标题）。\n"
+        "优先按用户指令语言回复：若用户用英文或混合英文指令，则用英文回答；否则按中文回答。\n"
+        f"直接执行给结果，回复简短{reply_language}，不超过20字，一句说完，纯文字，禁止markdown（**加粗**、-列表、#标题）。\n"
         "【执行规则】\n"
         "1.下载视频/音频：必须调用 download_media 工具，禁止编造结果。关键词（默认保存位置）："
         "海洋/大海→海洋纪录片(Movies)、预告片/sintel→Sintel预告片(Movies)、兔子/bunny→Big Buck Bunny(Movies)、"
@@ -1979,7 +2294,7 @@ _QUESTION_ENDINGS = ("？", "?", "吗", "呢")
 _QUESTION_WORDS = (
     "哪个", "什么", "怎么", "哪里", "哪儿", "哪些", "哪部", "哪种",
     "还是", "是否", "能不能", "要不要", "需要吗", "多少", "几位", "哪位",
-    "需要", "帮你", "帮我",
+    "需要", "帮你", "帮我", "片名", "名称",
 )
 
 
@@ -2114,28 +2429,9 @@ def _truncate_tts_text(reply: str, max_chars: int) -> str:
 
 
 def _adaptive_tts_reply(user_text: str, reply: str, max_chars: int, brief_max_chars: int, brief_user_len: int):
-    """根据用户话轮长度动态压缩播报内容，并保留可恢复详情。"""
+    """完整播报回复，不再按长度或短命令强制裁剪。"""
     if not reply:
         return "", ""
-
-    max_chars = max(16, max_chars)
-    brief_max_chars = max(12, brief_max_chars)
-    brief_user_len = max(1, brief_user_len)
-
-    important = any(k in reply for k in _IMPORTANT_REPLY_HINTS)
-    short_cmd = (len(user_text.strip()) <= brief_user_len) or any(k in user_text for k in _SHORT_CMD_HINTS)
-
-    if short_cmd and (not important):
-        first = _first_sentence(reply)
-        spoken = first if len(first) <= brief_max_chars else _truncate_tts_text(first, brief_max_chars)
-        if spoken != reply:
-            return spoken, reply
-        return spoken, ""
-
-    if len(reply) > max_chars:
-        spoken = _truncate_tts_text(reply, max_chars)
-        return spoken, reply
-
     return reply, ""
 
 
@@ -2324,13 +2620,14 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
         return f"视频已就绪，请在 Jellyfin 播放：{item_name}"
 
 
-def _resolve_asr_model_path(args, asr_root: Path):
-    if args.asr_engine == "sensevoice":
-        return Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
+def _resolve_asr_model_path(args, asr_root: Path, engine: str, model_path: str = ""):
+    model_value = (model_path or "").strip()
+    if engine == "sensevoice":
+        return Path(model_value) if model_value else ensure_sensevoice_model(
             asr_root / "model",
             force_download=not args.no_auto_download_asr,
         )
-    return Path(args.asr_model) if args.asr_model else None
+    return None
 
 
 def _run_single_http_turn(
@@ -2347,41 +2644,46 @@ def _run_single_http_turn(
     reply_wav = work_dir / "reply_http.wav"
     recognizer = None
     keep_models = bool(getattr(args, "http_keep_models", True))
+    command_engine = args.command_asr_engine
+    command_lang = args.command_asr_language
+    command_model = args.command_asr_model
 
     if not forced_text:
         if keep_models:
             cache_key = (
-                args.asr_engine,
-                args.asr_language,
-                str(args.asr_model or ""),
+                command_engine,
+                command_lang,
+                str(command_model or ""),
                 str(args.hotwords_file or ""),
                 float(args.hotwords_score),
             )
             recognizer = _HTTP_MODEL_CACHE["recognizers"].get(cache_key)
             if recognizer is None:
-                asr_model_path = _resolve_asr_model_path(args, asr_root)
-                print(f"[HTTP] building ASR recognizer (engine={args.asr_engine})...")
+                asr_model_path = _resolve_asr_model_path(args, asr_root, command_engine, command_model)
+                print(f"[HTTP] building ASR recognizer (engine={command_engine})...")
                 recognizer = build_asr_recognizer(
                     asr_root,
                     asr_model_path,
-                    args.asr_language,
-                    engine=args.asr_engine,
+                    command_lang,
+                    engine=command_engine,
                     hotwords_file=args.hotwords_file,
                     hotwords_score=args.hotwords_score,
+                    force_download=(command_engine == "conformer" and args.download_conformer_model),
                 )
                 _HTTP_MODEL_CACHE["recognizers"][cache_key] = recognizer
             else:
-                print(f"[HTTP] reusing ASR recognizer (engine={args.asr_engine})")
+                print(f"[HTTP] reusing ASR recognizer (engine={command_engine})")
         else:
-            asr_model_path = _resolve_asr_model_path(args, asr_root)
-            print(f"[HTTP] building ASR recognizer (engine={args.asr_engine})...")
+            asr_model_path = _resolve_asr_model_path(args, asr_root, command_engine, command_model)
+            print(f"[HTTP] building ASR recognizer (engine={command_engine})...")
             recognizer = build_asr_recognizer(
                 asr_root,
                 asr_model_path,
-                args.asr_language,
-                engine=args.asr_engine,
+                command_lang,
+                engine=command_engine,
                 hotwords_file=args.hotwords_file,
                 hotwords_score=args.hotwords_score,
+                force_download=(command_engine == "conformer" and args.download_conformer_model),
             )
 
     if keep_models:
@@ -2438,7 +2740,7 @@ def _run_single_http_turn(
 
                 _set_bridge_state("asr")
                 _t_asr = time.monotonic()
-                raw_text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
+                raw_text = asr_transcribe(recognizer, user_wav, engine=command_engine)
                 print(f"[HTTP][ASR] raw_text={raw_text!r} len={len(raw_text.strip())}")
                 print(f"[HTTP][PHASE] asr cost={int((time.monotonic() - _t_asr) * 1000)}ms")
                 normalized = normalize_asr_text(raw_text)
@@ -2636,24 +2938,28 @@ def _run_http_wakeword_loop(
     wake_words: list[str],
 ) -> None:
     keep_models = bool(getattr(args, "http_keep_models", True))
+    wake_engine = args.wake_asr_engine
+    wake_lang = args.wake_asr_language
+    wake_model = args.wake_asr_model
     cache_key = (
-        args.asr_engine,
-        args.asr_language,
-        str(args.asr_model or ""),
+        wake_engine,
+        wake_lang,
+        str(wake_model or ""),
         str(args.hotwords_file or ""),
         float(args.hotwords_score),
     )
     wake_recognizer = _HTTP_MODEL_CACHE["recognizers"].get(cache_key) if keep_models else None
     if wake_recognizer is None:
-        asr_model_path = _resolve_asr_model_path(args, asr_root)
-        print(f"[HTTP][WAKE] building ASR recognizer (engine={args.asr_engine})...")
+        asr_model_path = _resolve_asr_model_path(args, asr_root, wake_engine, wake_model)
+        print(f"[HTTP][WAKE] building ASR recognizer (engine={wake_engine})...")
         wake_recognizer = build_asr_recognizer(
             asr_root,
             asr_model_path,
-            args.asr_language,
-            engine=args.asr_engine,
+            wake_lang,
+            engine=wake_engine,
             hotwords_file=args.hotwords_file,
             hotwords_score=args.hotwords_score,
+            force_download=(wake_engine == "conformer" and args.download_conformer_model),
         )
         if keep_models:
             _HTTP_MODEL_CACHE["recognizers"][cache_key] = wake_recognizer
@@ -2692,7 +2998,7 @@ def _run_http_wakeword_loop(
                 wake_recognizer,
                 wake_wav,
                 wake_words,
-                args.asr_engine,
+                wake_engine,
             )
 
             if not hit:
@@ -2724,14 +3030,25 @@ def _run_http_wakeword_loop(
                     turn_source="wake",
                 )
                 print(f"[HTTP][WAKE] turn done: {result.get('message', '')}")
+                wakeword_only_retry_left = 0
+                if (
+                    result.get("message") == "识别到的是无任务语音，已跳过。"
+                    and _is_wakeword_only_text(result.get("text", ""), wake_words)
+                ):
+                    wakeword_only_retry_left = 1
                 # If a pending dialog state exists (e.g. waiting for filter style,
                 # or the assistant just asked a clarifying question), keep listening
                 # without requiring a new wake word.
                 while (
+                    wakeword_only_retry_left > 0
+                    or
                     _HTTP_DIALOG_STATE.get("pending_image_filter") is not None
                     or _HTTP_DIALOG_STATE.get("pending_question", 0) > 0
                 ):
-                    if _HTTP_DIALOG_STATE.get("pending_question", 0) > 0:
+                    if wakeword_only_retry_left > 0:
+                        wakeword_only_retry_left -= 1
+                        print("[HTTP][WAKE] wakeword repeated as first utterance, listen once more without re-wake...")
+                    elif _HTTP_DIALOG_STATE.get("pending_question", 0) > 0:
                         _HTTP_DIALOG_STATE["pending_question"] -= 1
                         print("[HTTP][WAKE] pending question, listening for answer without re-wake...")
                     else:
@@ -2963,23 +3280,50 @@ def main():
     if args.speech_duration < args.speech_min_duration:
         args.speech_duration = args.speech_min_duration
 
-    if args.asr_engine == "sensevoice":
-        asr_model_path = Path(args.asr_model) if args.asr_model else ensure_sensevoice_model(
-            asr_root / "model",
-            force_download=not args.no_auto_download_asr,
-        )
-    else:
-        asr_model_path = Path(args.asr_model) if args.asr_model else None
-
-    print(f"[INIT] building ASR recognizer (engine={args.asr_engine})...")
-    recognizer = build_asr_recognizer(
+    wake_model_path = _resolve_asr_model_path(
+        args,
         asr_root,
-        asr_model_path,
-        args.asr_language,
-        engine=args.asr_engine,
+        args.wake_asr_engine,
+        args.wake_asr_model,
+    )
+    command_model_path = _resolve_asr_model_path(
+        args,
+        asr_root,
+        args.command_asr_engine,
+        args.command_asr_model,
+    )
+
+    same_asr = (
+        args.wake_asr_engine == args.command_asr_engine
+        and args.wake_asr_language == args.command_asr_language
+        and str(wake_model_path or "") == str(command_model_path or "")
+    )
+
+    print(f"[INIT] building wake ASR recognizer (engine={args.wake_asr_engine})...")
+    wake_recognizer = build_asr_recognizer(
+        asr_root,
+        wake_model_path,
+        args.wake_asr_language,
+        engine=args.wake_asr_engine,
         hotwords_file=args.hotwords_file,
         hotwords_score=args.hotwords_score,
+        force_download=(args.wake_asr_engine == "conformer" and args.download_conformer_model),
     )
+
+    if same_asr:
+        command_recognizer = wake_recognizer
+        print("[INIT] command ASR recognizer reuses wake recognizer")
+    else:
+        print(f"[INIT] building command ASR recognizer (engine={args.command_asr_engine})...")
+        command_recognizer = build_asr_recognizer(
+            asr_root,
+            command_model_path,
+            args.command_asr_language,
+            engine=args.command_asr_engine,
+            hotwords_file=args.hotwords_file,
+            hotwords_score=args.hotwords_score,
+            force_download=(args.command_asr_engine == "conformer" and args.download_conformer_model),
+        )
     print("[INIT] building TTS engine...")
     tts = build_tts(tts_root)
 
@@ -3022,10 +3366,10 @@ def main():
                 print("[MIC] warning: volume is low, move closer or raise gain")
 
             hit, hit_keyword, raw_text = _detect_wakeup_open_asr(
-                recognizer,
+                wake_recognizer,
                 wake_wav,
                 wake_words,
-                args.asr_engine,
+                args.wake_asr_engine,
             )
 
             # 低音量下首次未命中：做一次增益重试，降低漏唤醒
@@ -3060,10 +3404,10 @@ def main():
                     if args.verbose:
                         print(f"[MIC] boosted wake clip level: {boosted_level:.1f} dBFS")
                     hit, hit_keyword, _raw = _detect_wakeup_open_asr(
-                        recognizer,
+                        wake_recognizer,
                         boosted_wav,
                         wake_words,
-                        args.asr_engine,
+                        args.wake_asr_engine,
                     )
                 else:
                     err = (p.stderr or p.stdout or "ffmpeg boost failed").strip()
@@ -3108,7 +3452,7 @@ def main():
         level = wav_level_dbfs(user_wav)
         print(f"[MIC] speech clip level: {level:.1f} dBFS")
 
-        text = asr_transcribe(recognizer, user_wav, engine=args.asr_engine)
+        text = asr_transcribe(command_recognizer, user_wav, engine=args.command_asr_engine)
         normalized = normalize_asr_text(text)
         if normalized != text:
             print(f"[ASR] normalized: {normalized}")
