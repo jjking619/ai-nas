@@ -74,7 +74,7 @@ load_runtime_env()
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NAS_ROOT = Path(os.getenv("NAS_ROOT", str(Path.home() / "nas_share"))).expanduser()
 DEFAULT_LOG_FILE = REPO_ROOT / "logs" / "voice_bridge.log"
-DEFAULT_WAKE_WORDS = ["小远同学", "xiaoyuan"]
+DEFAULT_WAKE_WORDS = ["小远同学", "xiaoyuan", "小远", "小元同学", "小园同学", "小源同学", "小袁同学"]
 
 
 def _parse_wake_words(value: str) -> list[str]:
@@ -615,12 +615,16 @@ def ensure_openclaw_exec_access(container_name: str) -> None:
         detail = out.strip() or detail
 
     if not ok:
+        run_user = os.environ.get("USER", "pi")
         raise RuntimeError(
             "No non-interactive Docker access for OpenClaw.\n"
-            "Please run these commands once and restart shell/service:\n"
-            "  sudo usermod -aG docker pi\n"
-            "  newgrp docker\n"
+            f"Voice bridge is running as user: {run_user}\n"
+            "This systemd service cannot rely on `sudo docker` because sudo requires a password here.\n"
+            "Please grant docker group access and restart the service:\n"
+            f"  sudo usermod -aG docker {run_user}\n"
+            "  sudo systemctl restart voice-bridge\n"
             "Then verify with: docker ps\n"
+            "Note: `newgrp docker` only affects the current shell and does not fix the service.\n"
             f"Current error: {detail}"
         )
 

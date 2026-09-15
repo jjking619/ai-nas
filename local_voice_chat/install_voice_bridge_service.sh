@@ -26,6 +26,16 @@ if ! id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx audio; then
   fi
 fi
 
+# voice-bridge 以 $RUN_USER 身份运行，需要非交互调用 docker（与 openclaw 容器交互）。
+# systemd 服务没有 tty，`sudo docker` 会因需要密码而必然失败，因此必须依赖 docker 组。
+if ! id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx docker; then
+  if sudo usermod -aG docker "$RUN_USER" 2>/dev/null; then
+    echo "[install] $RUN_USER 已加入 docker 组（语音桥可非交互调用 Docker）"
+  else
+    echo "[install][WARN] 无法将 $RUN_USER 加入 docker 组，语音桥可能报 'No non-interactive Docker access'" >&2
+  fi
+fi
+
 env_ensure() {
   local key="$1" value="$2"
   local cur new_line

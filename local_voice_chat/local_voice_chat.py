@@ -34,7 +34,7 @@ VOCODER_16KHZ_URL = (
 OFFICIAL_MATCHA_DIRNAME = "matcha-icefall-zh-en"
 
 DEFAULT_HOTWORDS = [
-    "小远同学", "xiaoyuan",
+	"小远同学", "xiaoyuan", "小远", "小元同学", "小园同学", "小源同学", "小袁同学",
     "家庭相册", "手机相册", "工作文档", "备份", "旅行",
     "图片", "照片", "文件夹", "文件", "视频",
     "分类", "移动到", "新建", "删除", "重命名",
