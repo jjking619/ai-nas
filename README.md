@@ -105,11 +105,16 @@ Qwen:     base-url=https://dashscope.aliyuncs.com/compatible-mode/v1   model-id=
 OpenAI:   base-url=https://api.openai.com/v1                           model-id=gpt-4o-mini
 ```
 
-Common options:
+If you later change the model settings in `~/NAS-Demo/.env` (for example `MODEL_BASE_URL`, `MODEL_API_KEY`, or `MODEL_ID`), run the following command to apply them immediately:
 
 ```bash
-bash install.sh --check        # Environment self-check only; no system changes
-bash install.sh reset          # Reset OpenClaw configuration to the factory template and restart
+./oc.sh model-apply
+```
+
+If you changed voice-bridge related environment variables, restart the service after applying the new values:
+
+```bash
+sudo systemctl restart voice-bridge
 ```
 
 ### 3. Open the CasaOS console
@@ -168,11 +173,11 @@ After the wizard completes, create an API key:
 
 - In Jellyfin: **Dashboard → Advanced → API Keys → New API Key**
 - Write the generated key to the `JELLYFIN_API_KEY` field in `~/NAS-Demo/.env`
-- Run the verification command:
+- Apply and verify the new key with one command:
 
 ```bash
-sudo systemctl restart voice-bridge
-./oc.sh jellyfin-key-check   # Verify that .env and the runtime state are aligned and the API is not returning 401
+cd ~/NAS-Demo
+./oc.sh jellyfin-apply   # Restart voice-bridge and verify .env/runtime alignment + API auth
 ```
 
 After that, videos downloaded by `media_downloader` are placed in `~/nas_share/downloads/Movies`, and Jellyfin will automatically scan and import them.
@@ -186,28 +191,21 @@ Verify both entry points:
 ```bash
 systemctl is-active voice-bridge          # Output active means it is working
 curl -sS http://127.0.0.1:28082/healthz   # Return OK means it is working
-journalctl -u voice-bridge -f             # Real-time logs (say “小远同学” into the microphone to wake it)
+journalctl -u voice-bridge -f             # Real-time logs (say “xiaoyuantongxue” into the microphone to wake it)
 ```
 
 ### 8. Try saying a sentence
 
-Use the voice assistant by text or voice (or wake it with the wake word “小远同学”):
+Use the voice assistant by text or voice (or wake it with the wake word “xiaoyuantongxue”):
 
 - Download the test video and play it
 - Help me classify the photos in the Family Album
 - Add a vintage filter to the photos under the Family Album
 - Where is my housing contract?
 
-Examples of Chinese and English commands:
+Examples of  English commands:
 
 ```text
-Chinese:
-- 下载测试视频并播放
-- 帮我把家庭相册的照片分类，先预览
-- 把家庭相册下的照片加复古滤镜，先预览
-- 住房合同在哪
-
-English:
 - Please classify the family album photos, preview first
 - Please add a vintage filter to the family album photos, preview first
 - Where is the housing contract?
@@ -221,8 +219,6 @@ English:
 ## Daily Maintenance
 
 All maintenance commands are centralized through [oc.sh](oc.sh) (installed automatically during the one-click setup by [install.sh](install.sh)). Run `./oc.sh` or `./oc.sh help` at any time to view the full command list.
-
-### Services and Configuration
 
 ```bash
 ./oc.sh status                # Show the openclaw container status
@@ -238,6 +234,8 @@ All maintenance commands are centralized through [oc.sh](oc.sh) (installed autom
 ./oc.sh ui-fix                # Re-apply CasaOS Legacy card filtering
 ./oc.sh pair-list             # Show devices awaiting pairing
 ./oc.sh pair-approve <id>     # Approve device pairing
+./oc.sh docker-mirror         # Configure Docker registry mirrors (for image pull failures)
+./oc.sh jellyfin-apply        # Apply Jellyfin .env config to voice-bridge and verify (restart + auth check)
 ```
 
 > The voice bridge is a systemd service and is not part of `./oc.sh logs`; use `journalctl -u voice-bridge -f` to view real-time logs.
@@ -259,20 +257,6 @@ All maintenance commands are centralized through [oc.sh](oc.sh) (installed autom
 ./oc.sh nas-files-deploy      # Deploy NAS Files
 ./oc.sh voice-assistant-deploy  # Deploy Voice Assistant
 ```
-
-### Status Checks (Read-only; no system changes)
-
-```bash
-./oc.sh tools-nas-show
-./oc.sh tools-media-show
-./oc.sh tools-immich-show
-./oc.sh tools-kb-show
-./oc.sh immich-show
-./oc.sh jellyfin-show
-./oc.sh nas-files-show
-./oc.sh voice-assistant-show
-```
-
 ---
 
 ## Project Structure
@@ -280,7 +264,9 @@ All maintenance commands are centralized through [oc.sh](oc.sh) (installed autom
 ```text
 NAS-Demo/
 ├── install.sh                  # One-click install / configuration entry point
-├── oc.sh                       # Maintenance command wrapper (status/logs/tools-*/deploy...)
+├── oc.sh                       # Maintenance command wrapper
+├── setup_docker_mirror.sh      # Configure Docker registry mirrors
+├── deploy.sh                   # OpenClaw deployment script
 ├── docker-compose.yml          # Core service stack orchestration
 ├── .env(.example)              # Configuration (model API, gateway token)
 ├── openclaw.bootstrap.json     # OpenClaw factory configuration template
@@ -289,9 +275,13 @@ NAS-Demo/
 ├── local_voice_chat/           # Voice assistant
 ├── voice_remote/               # Web chat assistant
 ├── redirect/                   # CasaOS icon redirect layer
+├── casaos/                     # CasaOS frontend customization
+├── assets/                     # Built-in samples (UI image / sample docs / sample photos)
+├── logs/                       # Runtime logs
 ├── filebrowser-compose.yml     # NAS file browser
 ├── jellyfin-compose.yml        # Jellyfin
 ├── immich-compose.yml          # Immich
+├── openclaw-compose.yml        # OpenClaw web entry
 └── voice-assistant-compose.yml # Web chat assistant
 ```
 
@@ -311,3 +301,4 @@ NAS-Demo/
 | Immich photos cannot be found | The background CLIP task has not finished: trigger Smart Search in the admin UI, or run `./oc.sh immich-sync-jobs` |
 | Photo classification hangs | `immich-machine-learning` may have exited: run `sudo docker start immich-machine-learning` |
 | Changes in `.env` model configuration do not take effect | Run `./oc.sh model-apply` (reads `.env`, applies immediately, and restarts in about 10 seconds) |
+| Changes to `JELLYFIN_API_KEY` in `.env` do not take effect, or Jellyfin 401 appears in logs | Run `./oc.sh jellyfin-apply` (restarts voice-bridge and verifies `.env`/runtime alignment and API auth) |

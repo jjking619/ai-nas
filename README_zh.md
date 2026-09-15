@@ -105,11 +105,16 @@ DeepSeek: base-url=https://api.deepseek.com/v1                         model-id=
 OpenAI:   base-url=https://api.openai.com/v1                           model-id=gpt-4o-mini
 ```
 
-常用参数：
+如果你后续修改了 `~/NAS-Demo/.env` 里的模型配置（例如 `MODEL_BASE_URL`、`MODEL_API_KEY`、`MODEL_ID`），执行下面命令立即生效：
 
 ```bash
-bash install.sh --check        # 仅做环境自检，不改动系统
-bash install.sh reset          # 重置 OpenClaw 配置为出厂模板并重启
+./oc.sh model-apply
+```
+
+如果改的是语音桥相关环境变量，保存后再执行：
+
+```bash
+sudo systemctl restart voice-bridge
 ```
 
 ### 3. 打开 CasaOS 控制台
@@ -173,8 +178,8 @@ cd ~/NAS-Demo
 - 输入命令验证配置是否生效：
 
 ```bash
-sudo systemctl restart voice-bridge
-./oc.sh jellyfin-key-check   # 一键校验 .env 与运行态是否一致、接口是否 401
+cd ~/NAS-Demo
+./oc.sh jellyfin-apply  # 一键校验 .env 与运行态是否一致、接口是否 401
 ```
 
 以后 media_downloader 下载的视频放入 `~/nas_share/downloads/Movies` ，Jellyfin 会自动扫描入库。
@@ -194,26 +199,13 @@ journalctl -u voice-bridge -f             # 实时日志（对着麦克风用小
 ### 8. 试试说一句话
 
 在语音助手中输入文本/语音进行对话（或通过唤醒词“小远同学”唤醒进行对话）：
-
-- 下载测试视频并播放
-- 帮我把家庭相册的照片分类
-- 把家庭相册下的照片加复古滤镜
-- 我的住房合同在哪
-
-中英文指令示例：
+指令示例：
 
 ```text
-中文：
 - 下载测试视频并播放
 - 帮我把家庭相册的照片分类，先预览
 - 把家庭相册下的照片加复古滤镜，先预览
 - 住房合同在哪
-
-英文：
-- Please classify the family album photos, preview first
-- Please add a vintage filter to the family album photos, preview first
-- Where is the housing contract?
-- Download the test video
 ```
 
 > 说明：上述英文命令已在当前语音桥中验证通过；如果目录名本身是中文（例如 `测试样例`），英文回复中保留原始目录名属于正常现象，不代表语音识别失败。
@@ -223,8 +215,6 @@ journalctl -u voice-bridge -f             # 实时日志（对着麦克风用小
 ## 日常维护
 
 所有维护命令统一走 [oc.sh](oc.sh)（由 [install.sh](install.sh) 一键安装时自动使用）。执行 `./oc.sh` 或 `./oc.sh help` 可随时查看完整命令列表。
-
-### 服务与配置
 
 ```bash
 ./oc.sh status                # 查看 openclaw 容器状态
@@ -240,40 +230,11 @@ journalctl -u voice-bridge -f             # 实时日志（对着麦克风用小
 ./oc.sh ui-fix                # 重新应用 CasaOS Legacy 卡片过滤
 ./oc.sh pair-list             # 待配对设备列表
 ./oc.sh pair-approve <id>     # 批准设备配对
+./oc.sh docker-mirror         # 配置 Docker 镜像加速
+./oc.sh jellyfin-apply        # 应用 Jellyfin 的 .env 配置到语音桥并校验（重启+鉴权）
 ```
 
 > 语音桥是 systemd 服务，不走 `./oc.sh logs`：用 `journalctl -u voice-bridge -f` 查看实时日志。
-
-### 单项能力（切换/安装）
-
-```bash
-./oc.sh tools-nas-setup       # 文件操作工具（nas_files）
-./oc.sh tools-media-setup     # 媒体下载工具（download_media）
-./oc.sh tools-kb-setup        # 知识库工具（kb_search，并自动同步内置测试合同到 文档/）
-./oc.sh tools-immich-setup    # 智能相册 MCP（immich，配置后自动导入内置测试照片）
-./oc.sh tools-sync            # 同步源码 → 容器运行副本（改完源码必执行）
-./oc.sh tools-photos-setup    # 同步样例照片 → 家庭相册/测试样例，并自动导入 Immich（幂等）
-./oc.sh openclaw-app-deploy   # 补装 OpenClaw 网页入口（CasaOS 应用）
-./oc.sh immich-apply          # 部署/修复 Immich（CasaOS 应用）
-./oc.sh immich-sync-jobs      # 触发 Immich 人脸识别/语义搜索任务（照片搜不到时用）
-./oc.sh jellyfin-deploy       # 部署 Jellyfin 家庭影院
-./oc.sh jellyfin-key-check    # 校验 Jellyfin API key 是否已生效（.env + 语音桥运行态 + 接口鉴权）
-./oc.sh nas-files-deploy      # 部署 NAS Files
-./oc.sh voice-assistant-deploy  # 部署 Voice Assistant
-```
-
-### 排查状态（只读，不改动系统）
-
-```bash
-./oc.sh tools-nas-show
-./oc.sh tools-media-show
-./oc.sh tools-immich-show
-./oc.sh tools-kb-show
-./oc.sh immich-show
-./oc.sh jellyfin-show
-./oc.sh nas-files-show
-./oc.sh voice-assistant-show
-```
 
 ---
 
@@ -282,7 +243,9 @@ journalctl -u voice-bridge -f             # 实时日志（对着麦克风用小
 ```text
 NAS-Demo/
 ├── install.sh                  # 一键安装/配置入口
-├── oc.sh                       # 维护命令封装（status/logs/tools-*/deploy...）
+├── oc.sh                       # 维护命令封装
+├── setup_docker_mirror.sh      # 配置 Docker 镜像加速
+├── deploy.sh                   # OpenClaw 部署脚本
 ├── docker-compose.yml          # 核心服务全家桶编排
 ├── .env(.example)              # 配置（模型 API、网关 token）
 ├── openclaw.bootstrap.json     # OpenClaw 出厂配置模板
@@ -291,9 +254,13 @@ NAS-Demo/
 ├── local_voice_chat/           # 语音助手
 ├── voice_remote/               # 网页对话助手
 ├── redirect/                   # CasaOS 图标跳转层
+├── casaos/                     # CasaOS 前端定制
+├── assets/                     # 内置样例（界面图 / 样例文档 / 样例照片）
+├── logs/                       # 运行时日志
 ├── filebrowser-compose.yml     # NAS 文件浏览
 ├── jellyfin-compose.yml        # Jellyfin
 ├── immich-compose.yml          # Immich
+├── openclaw-compose.yml        # OpenClaw 网页入口
 └── voice-assistant-compose.yml # 网页对话助手
 ```
 
@@ -313,4 +280,6 @@ NAS-Demo/
 | Immich 照片搜不到 | 后台 CLIP 任务未完成：管理界面触发 Smart Search，或 `./oc.sh immich-sync-jobs` |
 | 照片分类卡死 | `immich-machine-learning` 可能退出：`sudo docker start immich-machine-learning` |
 | 改了 `.env` 的模型配置不生效 | 执行 `./oc.sh model-apply`（读 .env 立即应用并重启，约 10 秒） |
+| 改了 `.env` 的 `JELLYFIN_API_KEY` 不生效 / 日志出现 Jellyfin 401 | 执行 `./oc.sh jellyfin-apply`（会重启语音桥并校验 .env 与运行态是否一致） |
+| 安装后只有「NAS Files」成功，其它应用缺失或反复安装失败 | 多为拉取大镜像时被重置（日志 `/var/log/casaos/app-management.log` 出现 `connection reset by peer`）。执行 `./oc.sh docker-mirror` 配置镜像加速后重新安装 |
 
