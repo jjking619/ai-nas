@@ -48,17 +48,44 @@ class WakeLoopNoiseGateTest(unittest.TestCase):
             sys.argv = old_argv
         self.assertGreaterEqual(args.hotwords_score, 3.0)
 
+    def test_default_wake_threshold_is_permissive_for_quiet_mics(self):
+        bridge_mod = importlib.import_module("local_voice_chat.voice_bridge")
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = ["voice_bridge.py"]
+            args = bridge_mod.parse_args()
+            self.assertLessEqual(args.wake_min_level_dbfs, -70.0)
+            self.assertLessEqual(args.wake_low_level_dbfs, -50.0)
+        finally:
+            sys.argv = old_argv
+
     def test_download_media_library_name_is_correct(self):
         voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
         self.assertTrue(hasattr(voice_bridge, "DOWNLOAD_MEDIA_LIBRARY"))
         self.assertTrue(hasattr(voice_bridge, "_DOWNLOAD_MEDIA_LIBRARY"))
         self.assertIs(voice_bridge._DOWNLOAD_MEDIA_LIBRARY, voice_bridge.DOWNLOAD_MEDIA_LIBRARY)
 
+    def test_wakeword_only_text_detection(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        self.assertTrue(voice_bridge._is_wakeword_only_text("小远同学。", ["小远同学", "xiaoyuan"]))
+        self.assertTrue(voice_bridge._is_wakeword_only_text("xiaoyuan", ["小远同学", "xiaoyuan"]))
+        self.assertFalse(voice_bridge._is_wakeword_only_text("小远同学，播放测试视频", ["小远同学", "xiaoyuan"]))
+
     def test_play_aliases_compatibility_name_exists(self):
         voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
         self.assertTrue(hasattr(voice_bridge, "PLAY_ALIASES"))
         self.assertTrue(hasattr(voice_bridge, "_PLAY_ALIASES"))
         self.assertIs(voice_bridge._PLAY_ALIASES, voice_bridge.PLAY_ALIASES)
+
+    def test_play_aliases_cover_test_video_keyword(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        self.assertEqual(voice_bridge.PLAY_ALIASES.get("测试视频"), "Oceans")
+        self.assertEqual(voice_bridge.PLAY_ALIASES.get("测试"), "Oceans")
+
+    def test_resolve_play_alias_uses_full_user_text_when_term_is_short(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        self.assertEqual(voice_bridge._resolve_play_alias("测试", "帮我播放特视视频"), "Oceans")
+        self.assertEqual(voice_bridge._resolve_play_alias("测试", "放测试视频"), "Oceans")
 
     def test_download_failure_message_is_explicit(self):
         voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
@@ -73,6 +100,28 @@ class WakeLoopNoiseGateTest(unittest.TestCase):
         self.assertIn("我已经尝试下载", msg)
         self.assertIn("没有写入 Movies 文件夹", msg)
         self.assertIn("外部视频源无法解析", msg)
+
+
+class FilterEdgeCaseRegressionTest(unittest.TestCase):
+    def test_filter_request_with_missing_style_asks_for_style(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        reply = voice_bridge._fast_local_image_filter_reply(None, "Please process my family album photos")
+        self.assertIsNotNone(reply)
+        self.assertIn("style", reply.lower())
+
+    def test_filter_request_detects_capitalized_english_style(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        req = voice_bridge._extract_image_filter_request("Please add a Japanese style filter to my family album photos and preview it first")
+        self.assertIsNotNone(req)
+        self.assertEqual(req["target"], "家庭相册")
+        self.assertEqual(req["style"], "japanese")
+
+    def test_filter_request_accepts_chinese_style_aliases(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        req = voice_bridge._extract_image_filter_request("把家庭相册的照片加胶片风镜，预览一下")
+        self.assertIsNotNone(req)
+        self.assertEqual(req["target"], "家庭相册")
+        self.assertEqual(req["style"], "film")
 
 
 class AudioGainNormalizeTest(unittest.TestCase):
@@ -152,6 +201,21 @@ class AudioGainNormalizeTest(unittest.TestCase):
                     os.environ[key] = value
 
 
+class MicCandidateSelectionTest(unittest.TestCase):
+    def test_pulse_candidates_prefer_onboard_sources(self):
+        model_mod = importlib.import_module("local_voice_chat.local_voice_chat")
+        cands = model_mod._candidate_mic_inputs("plughw:Audio,0", "pulse")
+        self.assertIn("regular0", cands)
+        self.assertIn("voip-tx0", cands)
+        self.assertNotIn("plughw:Audio,0", cands)
+
+    def test_alsa_candidates_keep_hw_style_inputs(self):
+        model_mod = importlib.import_module("local_voice_chat.local_voice_chat")
+        cands = model_mod._candidate_mic_inputs("plughw:Audio,0", "alsa")
+        self.assertIn("plughw:Audio,0", cands)
+        self.assertIn("hw:1,0", cands)
+
+
 
 
 class ConversationGuardRegressionTest(unittest.TestCase):
@@ -181,13 +245,18 @@ class ConversationGuardRegressionTest(unittest.TestCase):
         self.assertEqual(new_pending["target"], "家庭相册")
         self.assertIsNone(new_pending["style"])
 
-    def test_tts_cut_uses_sentence_boundary(self):
+    def test_tts_full_reply_not_cut(self):
         voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
         reply = "已处理完成：家庭相册已按复古风格处理，成功23张，输出到各原目录/复古风格/。"
-        spoken = voice_bridge._truncate_tts_text(reply, 18)
-        self.assertTrue(spoken.endswith("。"))
-        self.assertLessEqual(len(spoken), 22)
-        self.assertNotIn("23张", spoken)
+        spoken, tail = voice_bridge._adaptive_tts_reply(
+            "帮我把家庭相册的照片加复古滤镜，先预览",
+            reply,
+            max_chars=80,
+            brief_max_chars=36,
+            brief_user_len=12,
+        )
+        self.assertEqual(spoken, reply)
+        self.assertEqual(tail, "")
 
     def test_immich_skips_file_management_queries(self):
         import unittest.mock as mock
