@@ -112,12 +112,15 @@ def _upstream_url(path, extra_query=None):
 
 def _call_upstream_trigger(text=""):
     payload = {"text": text} if text else {}
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         _upstream_url("/trigger"),
         data=body,
         method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8"} if body else {},
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Voice-Remote": "1",
+        },
     )
     with urllib.request.urlopen(req, timeout=TRIGGER_TIMEOUT_SEC) as resp:
         raw = resp.read()

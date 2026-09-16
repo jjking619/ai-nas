@@ -448,6 +448,17 @@ def _html_response(handler, status: int, html: str) -> None:
     handler.wfile.write(body)
 
 
+_REQUEST_CONTEXT = threading.local()
+
+
+def _set_request_context(frontend_redirect: bool) -> None:
+    _REQUEST_CONTEXT.frontend_redirect = bool(frontend_redirect)
+
+
+def _frontend_redirect_requested() -> bool:
+    return bool(getattr(_REQUEST_CONTEXT, "frontend_redirect", False))
+
+
 def _http_ui_html(trigger_port: int) -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1409,6 +1420,12 @@ def _jellyfin_target_url(jellyfin_url: str, item_id: str | None = None) -> str:
     return f"{base}/web/index.html"
 
 
+def _should_redirect_http_ui_to_jellyfin(user_text: str, raw_reply: str, jellyfin_hint: str) -> bool:
+    # 保持网页停留在当前语音助手界面，Jellyfin 页面切换由后端根据会话状态处理。
+    _ = (user_text, raw_reply, jellyfin_hint)
+    return False
+
+
 def _build_firefox_desktop_env() -> dict[str, str]:
     import glob
 
@@ -1451,11 +1468,13 @@ def _focus_firefox_for_jellyfin(
     try:
         check_cmd_exists("xdotool")
     except Exception:
-        if open_if_missing:
-            print("[Jellyfin] xdotool not found, fallback opening tab")
-            return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
-        print("[Jellyfin] xdotool not found, skip opening new tab")
-        return False
+        if not open_if_missing:
+            print("[Jellyfin] xdotool not found, skip opening new tab")
+            return False
+        # Wayland/精简桌面环境下常没有 xdotool；此时唯一可靠的前置方式
+        # 就是让 firefox 通过 D-Bus 复用现有实例并切到 Jellyfin 标签页。
+        print("[Jellyfin] xdotool not found, opening via firefox fallback")
+        return _open_jellyfin_in_firefox(jellyfin_url, item_id=item_id)
 
     try:
         res = subprocess.run(
@@ -2642,6 +2661,7 @@ def _run_single_http_turn(
     forced_text: str | None = None,
     audio_lock=None,
     turn_source: str = "button",
+    frontend_redirect: bool = False,
 ) -> dict:
     _turn_start = time.monotonic()
     user_wav = work_dir / "user_http.wav"
@@ -2703,6 +2723,7 @@ def _run_single_http_turn(
         tts = build_tts(tts_root)
 
     try:
+        _set_request_context(frontend_redirect)
         listen_round = 0
         text = ""
         while True:
@@ -2869,6 +2890,7 @@ def _run_single_http_turn(
         tts_speak(tts, spoken_reply, reply_wav, play=not args.no_play)
         print(f"[HTTP][PHASE] tts cost={int((time.monotonic() - _t_tts) * 1000)}ms")
 
+        jf_hint = ""
         if args.jellyfin_api_key:
             jf_hint = _jellyfin_play_after_download(
                 text, raw_reply, args.jellyfin_url, args.jellyfin_api_key
@@ -2877,6 +2899,10 @@ def _run_single_http_turn(
                 jf_hint = _sanitize_reply_for_tts(jf_hint)
                 print(f"[HTTP][Jellyfin] {jf_hint}")
                 tts_speak(tts, jf_hint, reply_wav, play=not args.no_play)
+
+        redirect_url = ""
+        if frontend_redirect and _should_redirect_http_ui_to_jellyfin(text, raw_reply, jf_hint):
+            redirect_url = _jellyfin_target_url(args.jellyfin_url)
 
         _record_voice_turn(
             source="text" if forced_text else turn_source,
@@ -2895,8 +2921,10 @@ def _run_single_http_turn(
             "message": "文本指令处理完成。" if forced_text else "语音指令处理完成。",
             "text": text,
             "reply": spoken_reply,
+            "redirect_url": redirect_url,
         }
     finally:
+        _set_request_context(False)
         if recognizer is not None and not keep_models:
             del recognizer
         if not keep_models:
@@ -3236,6 +3264,7 @@ def _run_http_server(args) -> None:
                     tts_root,
                     forced_text=text or None,
                     audio_lock=audio_lock,
+                    frontend_redirect=self.headers.get("X-Voice-Remote", "") == "1",
                 )
                 cost_ms = int((time.monotonic() - req_start) * 1000)
                 print(f"[HTTP] trigger done mode={mode} cost_ms={cost_ms}")
