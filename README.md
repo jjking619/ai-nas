@@ -234,6 +234,9 @@ All maintenance commands are centralized through [oc.sh](oc.sh) (installed autom
 ./oc.sh ui-fix                # Re-apply CasaOS Legacy card filtering
 ./oc.sh pair-list             # Show devices awaiting pairing
 ./oc.sh pair-approve <id>     # Approve device pairing
+./oc.sh mic-mode status       # Show active microphone mode (.env + runtime)
+./oc.sh mic-mode usb          # Switch to USB-first (fallback to onboard if unavailable)
+./oc.sh mic-mode onboard      # Use onboard microphone only
 ./oc.sh docker-mirror         # Configure Docker registry mirrors (for image pull failures)
 ./oc.sh jellyfin-apply        # Apply Jellyfin .env config to voice-bridge and verify (restart + auth check)
 ```
@@ -296,6 +299,7 @@ NAS-Demo/
 | `bash ./oc.sh casaos-url` does not open | If it says “CasaOS Web service not detected”, run `curl -fsSL https://get.casaos.io \| sudo bash` to install CasaOS |
 | Voice Assistant (28083) reports 502 / connection refused when sending a message | The voice bridge (28082) is not running. Re-run `bash install.sh` to install it automatically, or manually run `cd ~/NAS-Demo/local_voice_chat && ./install_voice_bridge_service.sh` |
 | Speech recognition returns single characters / no response | The systemd environment is missing PulseAudio. Confirm `voice-bridge.service` includes `LD_PRELOAD` + `PULSE_SERVER`, then run `sudo systemctl restart voice-bridge` |
+| Need a quick USB/onboard microphone switch | Use `./oc.sh mic-mode usb` or `./oc.sh mic-mode onboard`; check current status with `./oc.sh mic-mode status` |
 | Voice bridge installation reports “no python3 with numpy/sherpa_onnx found” | Dependencies are missing: run `python3 -m pip install --user sherpa-onnx numpy` and retry |
 | Voice Assistant playback is blocked (Chrome/Edge shows “Block Audio”) | This is caused by the browser autoplay policy, not a service fault. Click the lock/permissions icon to the left of the address bar → **Permissions** → change **Autoplay** to **Audio and Video** |
 | Immich photos cannot be found | The background CLIP task has not finished: trigger Smart Search in the admin UI, or run `./oc.sh immich-sync-jobs` |

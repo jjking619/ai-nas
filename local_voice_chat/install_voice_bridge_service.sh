@@ -59,8 +59,16 @@ env_ensure() {
     END { if (!done) print nl }
   ' "$APP_DIR/.env" > "$APP_DIR/.env.tmp" && mv "$APP_DIR/.env.tmp" "$APP_DIR/.env"
 }
-# 仅当未配置或仍为默认占位时写入录音配置
-# auto 会先尝试显式 mic_input(常见为 USB 麦)，失败后再退回 pulse 板载麦。
+# 录音设备策略：优先 USB；仅在 USB 不可用时回退到板载麦。
+env_ensure VOICE_MIC_PRIORITY "usb,onboard"
+env_ensure VOICE_MIC_USB_BACKEND "alsa"
+env_ensure VOICE_MIC_USB_INPUT "plughw:Audio,0"
+env_ensure VOICE_MIC_ONBOARD_BACKEND "pulse"
+env_ensure VOICE_MIC_ONBOARD_INPUT "regular0"
+env_ensure VOICE_MIC_RECHECK_SEC "60"
+env_ensure VOICE_MIC_STRICT "0"
+
+# 兼容旧版本配置项（运行时可被 VOICE_MIC_* 优先策略覆盖）。
 env_ensure VOICE_RECORD_BACKEND "auto"
 env_ensure VOICE_MIC_INPUT "plughw:Audio,0"
 

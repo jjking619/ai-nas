@@ -201,19 +201,73 @@ class AudioGainNormalizeTest(unittest.TestCase):
                     os.environ[key] = value
 
 
-class MicCandidateSelectionTest(unittest.TestCase):
-    def test_pulse_candidates_prefer_onboard_sources(self):
+class MicResolverSelectionTest(unittest.TestCase):
+    def test_build_mic_options_priority_order(self):
         model_mod = importlib.import_module("local_voice_chat.local_voice_chat")
-        cands = model_mod._candidate_mic_inputs("plughw:Audio,0", "pulse")
-        self.assertIn("regular0", cands)
-        self.assertIn("voip-tx0", cands)
-        self.assertNotIn("plughw:Audio,0", cands)
+        opts = model_mod.build_mic_options(
+            "usb,onboard",
+            "alsa",
+            "plughw:Audio,0",
+            "pulse",
+            "regular0",
+        )
+        self.assertEqual(len(opts), 2)
+        self.assertEqual(opts[0].backend, "alsa")
+        self.assertEqual(opts[0].device, "plughw:Audio,0")
+        self.assertEqual(opts[1].backend, "pulse")
+        self.assertEqual(opts[1].device, "regular0")
 
-    def test_alsa_candidates_keep_hw_style_inputs(self):
+    def test_legacy_auto_keeps_usb_then_onboard(self):
         model_mod = importlib.import_module("local_voice_chat.local_voice_chat")
-        cands = model_mod._candidate_mic_inputs("plughw:Audio,0", "alsa")
-        self.assertIn("plughw:Audio,0", cands)
-        self.assertIn("hw:1,0", cands)
+        opts = model_mod.build_legacy_mic_options("plughw:Audio,0", "auto")
+        self.assertEqual([o.name for o in opts], ["usb", "onboard"])
+        self.assertEqual(opts[1].backend, "pulse")
+
+    def test_resolver_fallback_to_onboard_when_usb_unavailable(self):
+        import unittest.mock as mock
+
+        model_mod = importlib.import_module("local_voice_chat.local_voice_chat")
+        resolver = model_mod.MicResolver(
+            model_mod.build_mic_options(
+                "usb,onboard",
+                "alsa",
+                "plughw:Audio,0",
+                "pulse",
+                "regular0",
+            ),
+            strict=False,
+            recheck_sec=0,
+        )
+
+        def fake_probe(opt):
+            if opt.name == "usb":
+                return "No such device"
+            return None
+
+        with mock.patch.object(resolver, "_probe", side_effect=fake_probe):
+            resolver._select("test")
+
+        self.assertIsNotNone(resolver.selected())
+        self.assertEqual(resolver.selected().name, "onboard")
+
+    def test_resolver_strict_disables_fallback(self):
+        import unittest.mock as mock
+
+        model_mod = importlib.import_module("local_voice_chat.local_voice_chat")
+        resolver = model_mod.MicResolver(
+            model_mod.build_mic_options(
+                "usb,onboard",
+                "alsa",
+                "plughw:Audio,0",
+                "pulse",
+                "regular0",
+            ),
+            strict=True,
+        )
+
+        with mock.patch.object(resolver, "_probe", return_value="No such device"):
+            with self.assertRaises(RuntimeError):
+                resolver._select("test")
 
 
 

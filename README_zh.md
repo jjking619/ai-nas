@@ -39,7 +39,7 @@
 | USB 麦克风（可选） | 1 个 | 48 kHz 高采样，360° 全指向拾音 |
 | 主控板板载麦克风 | 板载 | Quectel Pi H1 板载，PulseAudio 源 `regular0` |
 
-> **麦克风说明**：喇叭用于 TTS 语音播报，麦克风用于唤醒与语音指令。未接 USB 麦克风时，系统会自动退回**主控板板载麦克风**，语音入口仍然可用；两者都不可用时，网页文本模式不受影响。
+> **麦克风说明**：喇叭用于 TTS 语音播报，麦克风用于唤醒与语音指令。系统默认**优先使用 USB 麦克风**，USB 不可用时自动回退到**主控板板载麦克风**（同一时刻只使用一支）；两者都不可用时，网页文本模式不受影响。优先级与设备名全部由 `.env` 控制，详见 [配置麦克风](#9-配置麦克风usb-优先--板载兜底)。
 
 ### 软件
 
@@ -230,6 +230,9 @@ journalctl -u voice-bridge -f             # 实时日志（对着麦克风用小
 ./oc.sh ui-fix                # 重新应用 CasaOS Legacy 卡片过滤
 ./oc.sh pair-list             # 待配对设备列表
 ./oc.sh pair-approve <id>     # 批准设备配对
+./oc.sh mic-mode status       # 查看当前麦克风模式（.env + 运行态）
+./oc.sh mic-mode usb          # 切到 USB 优先（不可用时回退板载）
+./oc.sh mic-mode onboard      # 仅使用板载麦克风
 ./oc.sh docker-mirror         # 配置 Docker 镜像加速
 ./oc.sh jellyfin-apply        # 应用 Jellyfin 的 .env 配置到语音桥并校验（重启+鉴权）
 ```
@@ -275,6 +278,7 @@ NAS-Demo/
 | `bash ./oc.sh casaos-url` 打不开 | 提示“未检测到 CasaOS Web 服务”时，执行 `curl -fsSL https://get.casaos.io \| sudo bash` 安装 CasaOS |
 | Voice Assistant（28083）发消息报 502 / connection refused | 语音桥（28082）未运行。重跑 `bash install.sh` 自动安装，或手动执行 `cd ~/NAS-Demo/local_voice_chat && ./install_voice_bridge_service.sh` |
 | 语音识别全单字/无反应 | systemd 缺 PulseAudio 环境。确认 `voice-bridge.service` 含 `LD_PRELOAD` + `PULSE_SERVER` 后 `sudo systemctl restart voice-bridge` |
+| 想一键切换 USB/板载麦克风 | 使用 `./oc.sh mic-mode usb` 或 `./oc.sh mic-mode onboard`；当前状态用 `./oc.sh mic-mode status` |
 | 语音桥安装报“找不到装有 numpy/sherpa_onnx 的 python3” | 依赖未装：`python3 -m pip install --user sherpa-onnx numpy` 后重试 |
 | Voice Assistant 播放被拦（Chrome/Edge 提示 Block Audio） | 浏览器自动播放策略所致，非服务故障。点击地址栏左侧锁/权限图标 → **Permissions** → 把 **Autoplay** 改成 **Audio and Video** |
 | Immich 照片搜不到 | 后台 CLIP 任务未完成：管理界面触发 Smart Search，或 `./oc.sh immich-sync-jobs` |

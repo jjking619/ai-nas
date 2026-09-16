@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -222,66 +223,231 @@ def record_audio_with_ffmpeg(
 		)
 
 
-def _candidate_mic_inputs(mic_input: str, backend: str) -> list[str]:
-	candidates = []
-	raw = (mic_input or "").strip()
+MIN_RECORDABLE_CHUNK_SEC = 0.3
 
-	def _add(value: str) -> None:
-		v = (value or "").strip()
-		if v and v not in candidates:
-			candidates.append(v)
 
-	# ALSA 与 Pulse 支持的设备命名不同：
-	# - Pulse 源名常见为 regular0/regular2/voip-tx0
-	# - ALSA 设备常见为 hw:X,Y / plughw:X,Y
-	# 分开候选可显著减少无效重试与日志刷屏。
-	if backend == "pulse":
-		if raw and ("hw:" not in raw and "plughw:" not in raw):
-			_add(raw)
-		_add("regular0")
-		_add("regular2")
-		_add("voip-tx0")
-		_add("default")
-		_add("sysdefault")
+def _env_bool(name: str, default: bool) -> bool:
+	value = os.getenv(name)
+	if value is None:
+		return default
+	v = value.strip().lower()
+	if v in {"1", "true", "yes", "y", "on"}:
+		return True
+	if v in {"0", "false", "no", "n", "off"}:
+		return False
+	return default
+
+
+def _env_optional_float(name: str) -> float | None:
+	value = os.getenv(name)
+	if value is None or not value.strip():
+		return None
+	try:
+		return float(value)
+	except ValueError:
+		return None
+
+
+class MicOption:
+	__slots__ = ("name", "backend", "device")
+
+	def __init__(self, name: str, backend: str, device: str):
+		self.name = (name or "").strip() or "custom"
+		self.backend = (backend or "").strip().lower()
+		self.device = (device or "").strip()
+
+	def label(self) -> str:
+		return f"{self.name}({self.backend}:{self.device})"
+
+
+def build_mic_options(
+	priority: str,
+	usb_backend: str,
+	usb_input: str,
+	onboard_backend: str,
+	onboard_input: str,
+) -> list[MicOption]:
+	named = {
+		"usb": MicOption("usb", usb_backend, usb_input),
+		"onboard": MicOption("onboard", onboard_backend, onboard_input),
+	}
+	options: list[MicOption] = []
+	seen = set()
+	for raw in (priority or "").split(","):
+		entry = raw.strip()
+		if not entry:
+			continue
+		opt = named.get(entry.lower())
+		if opt is None and ":" in entry:
+			backend, _, device = entry.partition(":")
+			opt = MicOption("custom", backend, device)
+		if opt is None:
+			print(f"[MIC] unknown priority entry ignored: {entry!r}")
+			continue
+		if not opt.device:
+			print(f"[MIC] priority entry skipped (missing device): {entry!r}")
+			continue
+		sig = (opt.backend, opt.device)
+		if sig in seen:
+			continue
+		seen.add(sig)
+		options.append(opt)
+	return options
+
+
+def build_legacy_mic_options(mic_input: str, backend: str) -> list[MicOption]:
+	primary = (mic_input or "").strip()
+	backend = (backend or "auto").strip().lower()
+	options: list[MicOption] = []
+	if primary:
+		options.append(MicOption("usb", "pulse" if backend == "pulse" else "alsa", primary))
+	if backend != "pulse" or not primary:
+		options.append(MicOption("onboard", "pulse", "regular0"))
+	return options
+
+
+class MicResolver:
+	def __init__(
+		self,
+		options: list[MicOption],
+		min_level_dbfs: float | None = None,
+		strict: bool = False,
+		recheck_sec: float = 60.0,
+		probe_sec: float = 0.4,
+		probe_dir: Path | None = None,
+		fail_threshold: int = 2,
+	):
+		self.options = list(options or [])
+		self.min_level_dbfs = min_level_dbfs
+		self.strict = bool(strict)
+		self.recheck_sec = max(0.0, float(recheck_sec))
+		self.probe_sec = max(0.2, float(probe_sec))
+		self.probe_dir = Path(probe_dir) if probe_dir else Path(tempfile.gettempdir()) / "voice_bridge"
+		self.fail_threshold = max(1, int(fail_threshold))
+		self._current: MicOption | None = None
+		self._consecutive_failures = 0
+		self._last_recheck_ts = 0.0
+
+	def selected(self) -> MicOption | None:
+		return self._current
+
+	def _probe(self, opt: MicOption) -> str | None:
+		if not opt.device:
+			return "empty device"
+		self.probe_dir.mkdir(parents=True, exist_ok=True)
+		probe_wav = self.probe_dir / f"mic_probe_{os.getpid()}.wav"
+		try:
+			record_audio_with_ffmpeg(probe_wav, self.probe_sec, opt.device, opt.backend)
+			if self.min_level_dbfs is not None:
+				level = wav_level_dbfs(probe_wav)
+				if level < self.min_level_dbfs:
+					return f"level {level:.1f} dBFS < min {self.min_level_dbfs:.1f} dBFS"
+			return None
+		except Exception as e:  # noqa: BLE001
+			text = str(e).strip()
+			return text.splitlines()[0] if text else repr(e)
+		finally:
+			probe_wav.unlink(missing_ok=True)
+
+	def _select(self, reason: str) -> None:
+		candidates = self.options[:1] if self.strict else self.options
+		if not candidates:
+			self._current = None
+			raise RuntimeError(f"No microphone configured ({reason})")
+
+		failures: list[str] = []
+		for opt in candidates:
+			err = self._probe(opt)
+			if err is None:
+				prev = self._current
+				self._current = opt
+				self._consecutive_failures = 0
+				self._last_recheck_ts = time.time()
+				if prev is not None and prev.label() != opt.label():
+					print(f"[MIC] switched: {prev.label()} -> {opt.label()} ({reason})")
+				else:
+					print(f"[MIC] selected: {opt.label()} ({reason})")
+				print(f"[MIC] exclusive: using {opt.label()}, other mics stay closed")
+				return
+			failures.append(f"{opt.label()}: {err}")
+
+		self._current = None
+		raise RuntimeError(f"No usable microphone ({reason}): " + " | ".join(failures))
+
+	def maybe_recheck(self) -> None:
+		if self._current is None or not self.options:
+			return
+		preferred = self.options[0]
+		if self._current.label() == preferred.label():
+			return
+		if self.recheck_sec > 0 and (time.time() - self._last_recheck_ts) < self.recheck_sec:
+			return
+		self._last_recheck_ts = time.time()
+		if self._probe(preferred) is None:
+			print(f"[MIC] preferred mic is back: {preferred.label()}")
+			self._current = preferred
+			self._consecutive_failures = 0
+
+	def record(self, out_wav: Path, duration: float) -> None:
+		self.maybe_recheck()
+		if self._current is None:
+			self._select("initial")
+
+		try:
+			record_audio_with_ffmpeg(out_wav, duration, self._current.device, self._current.backend)
+			self._consecutive_failures = 0
+			return
+		except Exception as e:  # noqa: BLE001
+			self._consecutive_failures += 1
+			print(
+				f"[MIC] record failed on {self._current.label()} "
+				f"({self._consecutive_failures}/{self.fail_threshold}): {e}"
+			)
+			if self._consecutive_failures < self.fail_threshold:
+				raise
+
+		self._select("re-probe after failures")
+		record_audio_with_ffmpeg(out_wav, duration, self._current.device, self._current.backend)
+		self._consecutive_failures = 0
+
+
+_DEFAULT_MIC_RESOLVERS: dict[tuple[str, str], MicResolver] = {}
+
+
+def get_default_mic_resolver(mic_input: str, backend: str) -> MicResolver:
+	key = ((mic_input or "").strip(), (backend or "auto").strip().lower())
+	resolver = _DEFAULT_MIC_RESOLVERS.get(key)
+	if resolver is not None:
+		return resolver
+
+	priority = os.getenv("VOICE_MIC_PRIORITY", "").strip()
+	if priority:
+		usb_backend = os.getenv("VOICE_MIC_USB_BACKEND", "alsa")
+		usb_input = os.getenv("VOICE_MIC_USB_INPUT", mic_input)
+		onboard_backend = os.getenv("VOICE_MIC_ONBOARD_BACKEND", "pulse")
+		onboard_input = os.getenv("VOICE_MIC_ONBOARD_INPUT", "regular0")
+		options = build_mic_options(priority, usb_backend, usb_input, onboard_backend, onboard_input)
 	else:
-		if raw and ("regular" not in raw and "voip-" not in raw):
-			_add(raw)
-		_add("plughw:1,0")
-		_add("hw:1,0")
-		_add("plughw:0,0")
-		_add("hw:0,0")
-		_add("default")
-		_add("sysdefault")
+		options = build_legacy_mic_options(mic_input, backend)
 
-	return candidates
+	resolver = MicResolver(
+		options=options,
+		min_level_dbfs=_env_optional_float("VOICE_MIC_MIN_LEVEL_DBFS"),
+		strict=_env_bool("VOICE_MIC_STRICT", False),
+		recheck_sec=float(os.getenv("VOICE_MIC_RECHECK_SEC", "60")),
+	)
+	_DEFAULT_MIC_RESOLVERS[key] = resolver
+	return resolver
 
 
 def record_audio_auto_backend(
-	out_wav: Path, duration: float, mic_input: str, backend: str
+	out_wav: Path,
+	duration: float,
+	mic_input: str,
+	backend: str,
+	resolver: MicResolver | None = None,
 ) -> None:
-	# auto：先按显式配置的 mic_input 尝试（通常是外接 USB 麦），
-	# 全部失败再退回 PulseAudio 的板载麦（regular0/regular2/voip-tx0）。
-	# 顺序不能反过来：Pulse 只认源名，不认 ALSA 设备名，
-	# 若先试 Pulse，后面的板载兜底会抢先命中，外接麦永远不会被使用。
-	backend_candidates = ("alsa", "pulse") if backend == "auto" else (backend,)
-	first_err = None
-	last_err = None
-	for b in backend_candidates:
-		for candidate_mic in _candidate_mic_inputs(mic_input, b):
-			try:
-				record_audio_with_ffmpeg(out_wav, duration, candidate_mic, b)
-				return
-			except Exception as e:  # noqa: BLE001
-				if first_err is None:
-					first_err = e
-				last_err = e
-				if candidate_mic != mic_input:
-					print(f"[MIC] fallback to onboard mic: backend={b}, mic={candidate_mic}")
-	# 保留首个错误：它通常来自用户配置的麦克风，最接近真实原因；
-	# last_err 往往只是最后一个不存在设备的“打不开”噪音。
-	raise RuntimeError(
-		f"Unable to record audio with {backend}: first={first_err}; last={last_err}"
-	)
+	(resolver or get_default_mic_resolver(mic_input, backend)).record(out_wav, duration)
 
 
 def play_wav(wav_path: Path) -> None:
@@ -436,11 +602,13 @@ def record_speech_until_silence(
 	silence_threshold_dbfs: float,
 	chunk_duration: float = 1.2,
 	consecutive_silence_chunks: int = 4,
+	resolver: MicResolver | None = None,
 ) -> None:
 	all_chunks = []
 	total_sec = 0.0
 	silence_count = 0
 	tmp_files = []
+	active_resolver = resolver or get_default_mic_resolver(mic_input, backend)
 	adaptive_base_threshold = float(silence_threshold_dbfs)
 	dynamic_threshold_dbfs = adaptive_base_threshold
 	speech_peak_dbfs = -99.0
@@ -458,6 +626,7 @@ def record_speech_until_silence(
 				duration=this_dur,
 				mic_input=mic_input,
 				backend=backend,
+				resolver=active_resolver,
 			)
 			if chunk_wav.exists() and chunk_wav.stat().st_size > 44:  # WAV 头至少 44 字节
 				recorded = True
@@ -497,7 +666,7 @@ def record_speech_until_silence(
 
 	while total_sec < max_duration:
 		remain = max_duration - total_sec
-		if remain < 0.3:
+		if remain < MIN_RECORDABLE_CHUNK_SEC:
 			break
 		this_dur = min(chunk_duration, remain)
 		tail_db = _record_chunk(this_dur, "speech")
@@ -511,7 +680,7 @@ def record_speech_until_silence(
 			if silence_count >= consecutive_silence_chunks:
 				remain = max_duration - total_sec
 				# 剩余时长不足以录出可校验的分片时直接收尾（确认帧同理）。
-				if remain < min_recordable_chunk_sec:
+				if remain < MIN_RECORDABLE_CHUNK_SEC:
 					break
 
 				# 确认帧：避免句中长停顿被误判结束

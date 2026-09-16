@@ -69,6 +69,7 @@ Usage:
   ./oc.sh jellyfin-show      Show Jellyfin container status
   ./oc.sh jellyfin-apply [URL]  Apply Jellyfin .env key/url to voice-bridge and verify
   ./oc.sh jellyfin-key-check [URL]  Verify Jellyfin API key in .env and runtime state
+  ./oc.sh mic-mode [status|usb|onboard]
   ./oc.sh voice-assistant-deploy  Install Voice Assistant (CasaOS web app)
   ./oc.sh voice-assistant-show    Show Voice Assistant container status
   ./oc.sh nas-files-deploy        Install NAS file browser (read-only nas_share)
@@ -155,6 +156,132 @@ short_fingerprint() {
   else
     printf '%s' "na"
   fi
+}
+
+env_get_raw_value() {
+  local key="$1" env_file="$APP_DIR/.env"
+  if [[ ! -f "$env_file" ]]; then
+    printf '%s' ""
+    return 0
+  fi
+  grep -E "^[[:space:]]*${key}=" "$env_file" | tail -1 | cut -d= -f2- | xargs || true
+}
+
+env_set_value() {
+  local key="$1" value="$2" env_file="$APP_DIR/.env"
+  local line
+  line="${key}=${value}"
+  touch "$env_file"
+
+  awk -v k="$key" -v nl="$line" '
+    {
+      if ($0 ~ "^[[:space:]]*" k "=" || $0 ~ "^[[:space:]]*#[[:space:]]*" k "=") {
+        if (!done) { print nl; done = 1 }
+        next
+      }
+      print
+    }
+    END { if (!done) print nl }
+  ' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+}
+
+env_ensure_value() {
+  local key="$1" fallback="$2" cur
+  cur="$(env_get_raw_value "$key")"
+  if [[ -n "$cur" ]]; then
+    env_set_value "$key" "$cur"
+  else
+    env_set_value "$key" "$fallback"
+  fi
+}
+
+mic_mode_status() {
+  local env_file="$APP_DIR/.env"
+  echo "Microphone mode (.env): $env_file"
+  for k in \
+    VOICE_MIC_PRIORITY \
+    VOICE_MIC_USB_BACKEND \
+    VOICE_MIC_USB_INPUT \
+    VOICE_MIC_ONBOARD_BACKEND \
+    VOICE_MIC_ONBOARD_INPUT \
+    VOICE_MIC_RECHECK_SEC \
+    VOICE_MIC_STRICT \
+    VOICE_MIC_MIN_LEVEL_DBFS; do
+    echo "  $k=$(env_get_raw_value "$k")"
+  done
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet voice-bridge 2>/dev/null; then
+    local pid
+    pid="$(systemctl show -p MainPID --value voice-bridge 2>/dev/null || true)"
+    if [[ -n "$pid" && "$pid" != "0" && -r "/proc/$pid/environ" ]]; then
+      echo "Microphone mode (voice-bridge runtime):"
+      for k in \
+        VOICE_MIC_PRIORITY \
+        VOICE_MIC_USB_BACKEND \
+        VOICE_MIC_USB_INPUT \
+        VOICE_MIC_ONBOARD_BACKEND \
+        VOICE_MIC_ONBOARD_INPUT \
+        VOICE_MIC_RECHECK_SEC \
+        VOICE_MIC_STRICT \
+        VOICE_MIC_MIN_LEVEL_DBFS; do
+        rv="$(tr '\0' '\n' < "/proc/$pid/environ" | grep -E "^${k}=" | tail -1 | cut -d= -f2- || true)"
+        echo "  $k=${rv}"
+      done
+    fi
+  else
+    echo "voice-bridge: inactive"
+  fi
+}
+
+mic_mode_apply() {
+  local mode="$1"
+
+  # Backward-compatible aliases (hidden from help to keep UX simple).
+  case "$mode" in
+    usb-first|usb-only)
+      mode="usb"
+      ;;
+    onboard-first|onboard-only)
+      mode="onboard"
+      ;;
+  esac
+
+  env_ensure_value VOICE_MIC_USB_BACKEND "alsa"
+  env_ensure_value VOICE_MIC_USB_INPUT "plughw:Audio,0"
+  env_ensure_value VOICE_MIC_ONBOARD_BACKEND "pulse"
+  env_ensure_value VOICE_MIC_ONBOARD_INPUT "regular0"
+  env_ensure_value VOICE_MIC_RECHECK_SEC "60"
+
+  case "$mode" in
+    usb)
+      env_set_value VOICE_MIC_PRIORITY "usb,onboard"
+      env_set_value VOICE_MIC_STRICT "0"
+      ;;
+    onboard)
+      env_set_value VOICE_MIC_PRIORITY "onboard"
+      env_set_value VOICE_MIC_STRICT "1"
+      ;;
+    *)
+      echo "ERROR: unknown mic mode: $mode"
+      echo "Usage: ./oc.sh mic-mode [status|usb|onboard]"
+      return 1
+      ;;
+  esac
+
+  # 保留旧键位兼容。
+  env_ensure_value VOICE_RECORD_BACKEND "auto"
+  env_ensure_value VOICE_MIC_INPUT "plughw:Audio,0"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    if [[ "${EUID}" -eq 0 ]]; then
+      systemctl restart voice-bridge
+    else
+      sudo systemctl restart voice-bridge
+    fi
+  fi
+
+  echo "Applied mic mode: $mode"
+  mic_mode_status
 }
 
 jellyfin_api_key_from_env() {
@@ -1062,6 +1189,14 @@ case "${1:-}" in
       sudo systemctl restart voice-bridge
     fi
     check_jellyfin_api_key "${2:-}"
+    ;;
+  mic-mode)
+    mode="${2:-status}"
+    if [[ "$mode" == "status" ]]; then
+      mic_mode_status
+    else
+      mic_mode_apply "$mode"
+    fi
     ;;
   voice-assistant-deploy)
     VOICE_COMPOSE="${APP_DIR}/voice-assistant-compose.yml"
