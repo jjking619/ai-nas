@@ -2968,6 +2968,13 @@ def _run_http_wakeword_loop(
         if keep_models:
             _HTTP_MODEL_CACHE["recognizers"][cache_key] = wake_recognizer
 
+    # Error-path safeguards: reduce log spam and hot-loop CPU burn when recording fails continuously.
+    loop_backoff_sec = 0.5
+    max_backoff_sec = 8.0
+    last_loop_error_text = ""
+    same_loop_error_count = 0
+    last_loop_error_log_ts = 0.0
+
     while True:
         if trigger_lock.locked():
             time.sleep(0.2)
@@ -3075,9 +3082,36 @@ def _run_http_wakeword_loop(
             finally:
                 trigger_lock.release()
         except Exception as e:  # noqa: BLE001
-            print(f"[HTTP][WAKE] loop error: {e}")
+            err_text = str(e)
+            now = time.time()
+            if err_text == last_loop_error_text:
+                same_loop_error_count += 1
+            else:
+                last_loop_error_text = err_text
+                same_loop_error_count = 1
+
+            should_log = (
+                same_loop_error_count <= 3
+                or (now - last_loop_error_log_ts) >= 10.0
+            )
+            if should_log:
+                if same_loop_error_count > 1:
+                    print(
+                        f"[HTTP][WAKE] loop error x{same_loop_error_count}: {e} "
+                        f"(backoff={loop_backoff_sec:.1f}s)"
+                    )
+                else:
+                    print(f"[HTTP][WAKE] loop error: {e}")
+                last_loop_error_log_ts = now
+
             _set_bridge_state("idle")  # 兜底复位，覆盖 acquire/录检测阶段抛异常的路径
-            time.sleep(0.5)
+            time.sleep(loop_backoff_sec)
+            loop_backoff_sec = min(max_backoff_sec, loop_backoff_sec * 2.0)
+        else:
+            # Any successful loop iteration means recording/ASR path is healthy again.
+            loop_backoff_sec = 0.5
+            same_loop_error_count = 0
+            last_loop_error_text = ""
 
 
 def _run_http_server(args) -> None:

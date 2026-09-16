@@ -59,8 +59,9 @@ env_ensure() {
     END { if (!done) print nl }
   ' "$APP_DIR/.env" > "$APP_DIR/.env.tmp" && mv "$APP_DIR/.env.tmp" "$APP_DIR/.env"
 }
-# 仅当未配置或仍为默认占位时写入 USB 直连配置
-env_ensure VOICE_RECORD_BACKEND "alsa"
+# 仅当未配置或仍为默认占位时写入录音配置
+# auto 会先尝试显式 mic_input(常见为 USB 麦)，失败后再退回 pulse 板载麦。
+env_ensure VOICE_RECORD_BACKEND "auto"
 env_ensure VOICE_MIC_INPUT "plughw:Audio,0"
 
 RUN_USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"

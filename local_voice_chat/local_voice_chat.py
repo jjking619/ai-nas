@@ -264,6 +264,7 @@ def record_audio_auto_backend(
 	# 顺序不能反过来：Pulse 只认源名，不认 ALSA 设备名，
 	# 若先试 Pulse，后面的板载兜底会抢先命中，外接麦永远不会被使用。
 	backend_candidates = ("alsa", "pulse") if backend == "auto" else (backend,)
+	first_err = None
 	last_err = None
 	for b in backend_candidates:
 		for candidate_mic in _candidate_mic_inputs(mic_input, b):
@@ -271,10 +272,16 @@ def record_audio_auto_backend(
 				record_audio_with_ffmpeg(out_wav, duration, candidate_mic, b)
 				return
 			except Exception as e:  # noqa: BLE001
+				if first_err is None:
+					first_err = e
 				last_err = e
 				if candidate_mic != mic_input:
 					print(f"[MIC] fallback to onboard mic: backend={b}, mic={candidate_mic}")
-	raise RuntimeError(f"Unable to record audio with {backend}: {last_err}")
+	# 保留首个错误：它通常来自用户配置的麦克风，最接近真实原因；
+	# last_err 往往只是最后一个不存在设备的“打不开”噪音。
+	raise RuntimeError(
+		f"Unable to record audio with {backend}: first={first_err}; last={last_err}"
+	)
 
 
 def play_wav(wav_path: Path) -> None:
@@ -489,7 +496,10 @@ def record_speech_until_silence(
 		return tail_db
 
 	while total_sec < max_duration:
-		this_dur = min(chunk_duration, max_duration - total_sec)
+		remain = max_duration - total_sec
+		if remain < 0.3:
+			break
+		this_dur = min(chunk_duration, remain)
 		tail_db = _record_chunk(this_dur, "speech")
 
 		if total_sec >= min_duration:
@@ -500,7 +510,8 @@ def record_speech_until_silence(
 
 			if silence_count >= consecutive_silence_chunks:
 				remain = max_duration - total_sec
-				if remain <= 0:
+				# 剩余时长不足以录出可校验的分片时直接收尾（确认帧同理）。
+				if remain < min_recordable_chunk_sec:
 					break
 
 				# 确认帧：避免句中长停顿被误判结束
