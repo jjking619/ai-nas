@@ -70,7 +70,14 @@ env_ensure VOICE_MIC_STRICT "0"
 
 # 兼容旧版本配置项（运行时可被 VOICE_MIC_* 优先策略覆盖）。
 env_ensure VOICE_RECORD_BACKEND "auto"
-env_ensure VOICE_MIC_INPUT "plughw:Audio,0"
+env_ensure VOICE_MIC_INPUT "default"
+env_ensure VOICE_HTTP_WAKE_ERROR_BACKOFF_INITIAL_SEC "1.0"
+env_ensure VOICE_HTTP_WAKE_ERROR_BACKOFF_MAX_SEC "30.0"
+
+# install 脚本常由 sudo 调用，避免 .env 被 root 接管导致后续无法编辑。
+if [[ -f "$APP_DIR/.env" ]]; then
+  chown "$RUN_USER":"$RUN_USER" "$APP_DIR/.env" 2>/dev/null || true
+fi
 
 RUN_USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 

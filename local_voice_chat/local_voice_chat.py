@@ -388,7 +388,7 @@ class MicResolver:
 			self._current = preferred
 			self._consecutive_failures = 0
 
-	def record(self, out_wav: Path, duration: float) -> None:
+	def record(self, out_wav: Path, duration: float) -> MicOption:
 		self.maybe_recheck()
 		if self._current is None:
 			self._select("initial")
@@ -396,7 +396,7 @@ class MicResolver:
 		try:
 			record_audio_with_ffmpeg(out_wav, duration, self._current.device, self._current.backend)
 			self._consecutive_failures = 0
-			return
+			return self._current
 		except Exception as e:  # noqa: BLE001
 			self._consecutive_failures += 1
 			print(
@@ -409,6 +409,7 @@ class MicResolver:
 		self._select("re-probe after failures")
 		record_audio_with_ffmpeg(out_wav, duration, self._current.device, self._current.backend)
 		self._consecutive_failures = 0
+		return self._current
 
 
 _DEFAULT_MIC_RESOLVERS: dict[tuple[str, str], MicResolver] = {}
@@ -446,8 +447,8 @@ def record_audio_auto_backend(
 	mic_input: str,
 	backend: str,
 	resolver: MicResolver | None = None,
-) -> None:
-	(resolver or get_default_mic_resolver(mic_input, backend)).record(out_wav, duration)
+) -> MicOption:
+	return (resolver or get_default_mic_resolver(mic_input, backend)).record(out_wav, duration)
 
 
 def play_wav(wav_path: Path) -> None:

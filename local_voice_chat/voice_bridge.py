@@ -19,6 +19,7 @@ from local_voice_chat import (
     build_tts,
     check_cmd_exists,
     ensure_sensevoice_model,
+    get_default_mic_resolver,
     record_audio_auto_backend,
     record_speech_until_silence,
     tts_speak,
@@ -359,6 +360,7 @@ _TURNS_FILE_LOCK = threading.Lock()
 
 _BRIDGE_STATE: dict = {"state": "idle", "ts": 0.0, "last_text": ""}
 _BRIDGE_STATE_LOCK = threading.Lock()
+_LAST_MIC_RUNTIME_SIG = ""
 
 
 def _set_bridge_state(state: str, last_text: str = "") -> None:
@@ -367,6 +369,57 @@ def _set_bridge_state(state: str, last_text: str = "") -> None:
         _BRIDGE_STATE["ts"] = time.time()
         if last_text:
             _BRIDGE_STATE["last_text"] = last_text
+
+
+def _mic_runtime_snapshot(args) -> dict:
+    resolver = get_default_mic_resolver(args.mic_input, args.record_backend)
+    current = resolver.selected()
+    options = [
+        {
+            "name": opt.name,
+            "backend": opt.backend,
+            "device": opt.device,
+            "label": opt.label(),
+        }
+        for opt in resolver.options
+    ]
+    return {
+        "configured_backend": args.record_backend,
+        "configured_input": args.mic_input,
+        "strict": bool(resolver.strict),
+        "priority": [opt.get("name", "") for opt in options],
+        "candidates": options,
+        "active_name": current.name if current is not None else "",
+        "active_backend": current.backend if current is not None else "",
+        "active_device": current.device if current is not None else "",
+        "active_label": current.label() if current is not None else "",
+        "active_ready": current is not None,
+    }
+
+
+def _log_mic_runtime(args, reason: str) -> None:
+    global _LAST_MIC_RUNTIME_SIG
+    snap = _mic_runtime_snapshot(args)
+    sig = "|".join(
+        [
+            snap.get("active_label", "") or "(none)",
+            str(snap.get("strict", False)),
+            ",".join(snap.get("priority", [])),
+        ]
+    )
+    if sig == _LAST_MIC_RUNTIME_SIG:
+        return
+    _LAST_MIC_RUNTIME_SIG = sig
+
+    active = snap.get("active_label") or "(not selected yet)"
+    configured = f"{snap.get('configured_backend')}:{snap.get('configured_input')}"
+    candidates = ", ".join(
+        c.get("label", "") for c in snap.get("candidates", []) if c.get("label")
+    ) or "(none)"
+    print(
+        f"[MIC][RUNTIME] reason={reason} active={active} configured={configured} "
+        f"strict={1 if snap.get('strict') else 0} candidates=[{candidates}]"
+    )
 
 
 def _record_voice_turn(source: str, text: str, reply: str, cost_ms: int) -> None:
@@ -395,15 +448,16 @@ def _record_voice_turn(source: str, text: str, reply: str, cost_ms: int) -> None
 
 def _ensure_audio_runtime_env() -> None:
     """补齐 systemd 场景常缺失的音频环境变量，避免 ffmpeg 只录到极短片段。"""
+    runtime_dir = Path(f"/run/user/{os.getuid()}")
     if not os.getenv("XDG_RUNTIME_DIR"):
-        runtime_dir = Path(f"/run/user/{os.getuid()}")
         if runtime_dir.exists():
             os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
             print(f"[AUDIO] XDG_RUNTIME_DIR not set, using {runtime_dir}")
 
     if not os.getenv("PULSE_SERVER"):
-        pulse_native = Path("/run/pulse/native")
-        if pulse_native.exists():
+        candidates = [runtime_dir / "pulse" / "native", Path("/run/pulse/native")]
+        pulse_native = next((p for p in candidates if p.exists()), None)
+        if pulse_native is not None:
             os.environ["PULSE_SERVER"] = f"unix:{pulse_native}"
             print(f"[AUDIO] PULSE_SERVER not set, using unix:{pulse_native}")
 
@@ -2418,7 +2472,7 @@ def _sanitize_reply_for_tts(reply: str) -> str:
     reply = re.sub(r"/nas_share/?", "", reply)  # 共享目录路径前缀不播报
     reply = re.sub(r"\*+", "", reply)
     reply = re.sub(r"^\s*[-#]+\s*", "", reply, flags=re.MULTILINE)
-    reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；""''（）…—\s]", "", reply)
+    reply = re.sub(r"[^\u0000-\u007F\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。！？、：；\"'（）…—\s]", "", reply)
     reply = re.sub(r"\s+", " ", reply).strip()
     return reply
 
@@ -2757,8 +2811,12 @@ def _run_single_http_turn(
                         audio_lock.release()
                 level = wav_level_dbfs(user_wav)
                 print(f"[HTTP] speech clip level: {level:.1f} dBFS")
+                snap = _mic_runtime_snapshot(args)
+                _log_mic_runtime(args, "http-command-record")
                 print(
-                    f"[HTTP][AUDIO] mic={args.mic_input} backend={args.record_backend} "
+                    f"[HTTP][AUDIO] mic={snap.get('active_device') or args.mic_input} "
+                    f"backend={snap.get('active_backend') or args.record_backend} "
+                    f"source={snap.get('active_name') or 'unknown'} "
                     f"{_wav_meta_for_log(user_wav)}"
                 )
                 print(f"[HTTP][PHASE] record cost={int((time.monotonic() - _t_mic) * 1000)}ms")
@@ -2997,8 +3055,14 @@ def _run_http_wakeword_loop(
             _HTTP_MODEL_CACHE["recognizers"][cache_key] = wake_recognizer
 
     # Error-path safeguards: reduce log spam and hot-loop CPU burn when recording fails continuously.
-    loop_backoff_sec = 0.5
-    max_backoff_sec = 8.0
+    loop_backoff_sec = max(
+        0.5,
+        float(os.getenv("VOICE_HTTP_WAKE_ERROR_BACKOFF_INITIAL_SEC", "1.0")),
+    )
+    max_backoff_sec = max(
+        loop_backoff_sec,
+        float(os.getenv("VOICE_HTTP_WAKE_ERROR_BACKOFF_MAX_SEC", "30.0")),
+    )
     last_loop_error_text = ""
     same_loop_error_count = 0
     last_loop_error_log_ts = 0.0
@@ -3020,6 +3084,7 @@ def _run_http_wakeword_loop(
                     mic_input=args.mic_input,
                     backend=args.record_backend,
                 )
+                _log_mic_runtime(args, "http-wake-record")
             finally:
                 audio_lock.release()
             level = wav_level_dbfs(wake_wav)
@@ -3039,6 +3104,46 @@ def _run_http_wakeword_loop(
                 wake_words,
                 wake_engine,
             )
+
+            # HTTP 模式下也做一次低电平增益重试，避免近讲但电平偏低时漏唤醒。
+            if (not hit) and (level < args.wake_low_level_dbfs) and (args.wake_boost_db > 0):
+                boosted_wav = work_dir / "wake_http_boost.wav"
+                if args.verbose:
+                    print(
+                        f"[HTTP][WAKE] low-level clip ({level:.1f} dBFS), retry with +{args.wake_boost_db:.1f} dB"
+                    )
+                p = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(wake_wav),
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-af",
+                        f"volume={args.wake_boost_db}dB",
+                        str(boosted_wav),
+                        "-loglevel",
+                        "error",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if p.returncode == 0 and boosted_wav.exists():
+                    hit, hit_keyword, _raw = _detect_wakeup_open_asr(
+                        wake_recognizer,
+                        boosted_wav,
+                        wake_words,
+                        wake_engine,
+                    )
+                elif args.verbose:
+                    err = (p.stderr or p.stdout or "ffmpeg boost failed").strip()
+                    print(f"[HTTP][WAKE] boost retry skipped: {err}")
+
+                boosted_wav.unlink(missing_ok=True)
 
             if not hit:
                 if args.verbose:
@@ -3137,7 +3242,10 @@ def _run_http_wakeword_loop(
             loop_backoff_sec = min(max_backoff_sec, loop_backoff_sec * 2.0)
         else:
             # Any successful loop iteration means recording/ASR path is healthy again.
-            loop_backoff_sec = 0.5
+            loop_backoff_sec = max(
+                0.5,
+                float(os.getenv("VOICE_HTTP_WAKE_ERROR_BACKOFF_INITIAL_SEC", "1.0")),
+            )
             same_loop_error_count = 0
             last_loop_error_text = ""
 
@@ -3198,6 +3306,7 @@ def _run_http_server(args) -> None:
                 with _BRIDGE_STATE_LOCK:
                     state_copy = dict(_BRIDGE_STATE)
                 state_copy["busy"] = trigger_lock.locked()
+                state_copy["mic"] = _mic_runtime_snapshot(args)
                 _json_response(self, HTTPStatus.OK, {"ok": True, **state_copy})
                 return
             if parsed.path == "/trigger":
@@ -3315,6 +3424,7 @@ def main():
     elif args.log_file:
         print("[LOG] file logging setup failed")
     _ensure_audio_runtime_env()
+    _log_mic_runtime(args, "startup")
 
     use_http_mode = args.http_mode or (not args.wake_mode and not os.isatty(0))
     if use_http_mode:
@@ -3419,6 +3529,7 @@ def main():
                 mic_input=args.mic_input,
                 backend=args.record_backend,
             )
+            _log_mic_runtime(args, "cli-wake-record")
             level = wav_level_dbfs(wake_wav)
             if args.verbose:
                 print(f"[MIC] wake clip level: {level:.1f} dBFS")
@@ -3518,6 +3629,7 @@ def main():
 
         level = wav_level_dbfs(user_wav)
         print(f"[MIC] speech clip level: {level:.1f} dBFS")
+        _log_mic_runtime(args, "cli-command-record")
 
         text = asr_transcribe(command_recognizer, user_wav, engine=args.command_asr_engine)
         normalized = normalize_asr_text(text)
