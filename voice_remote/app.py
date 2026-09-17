@@ -100,6 +100,33 @@ def _load_static_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+# 启动自检结果，供 /api/healthz 暴露。目录型 bind mount 的 inode 一旦被替换
+# （宿主机 rm -rf + 重建同名目录），容器内会看到一个空目录，前端随即整体失效。
+_STATIC_STATUS = {"ok": True, "missing": []}
+
+
+def _check_static_assets() -> bool:
+    required = ("app.js", "i18n.js")
+    missing = [name for name in required if not (STATIC_DIR / name).is_file()]
+    try:
+        entries = len(list(STATIC_DIR.iterdir())) if STATIC_DIR.is_dir() else -1
+    except OSError:
+        entries = -1
+    _STATIC_STATUS["ok"] = not missing
+    _STATIC_STATUS["missing"] = missing
+    if missing:
+        _log(
+            "[voice-remote] 前端静态资源缺失: "
+            + ", ".join(missing)
+            + f"（{STATIC_DIR} 条目数={entries}）。"
+            "若宿主机同名目录内确实存在这些文件，说明 bind mount 仍指向"
+            "已被替换的旧目录 inode，重启容器即可恢复: docker restart voice_assistant"
+        )
+    else:
+        _log(f"[voice-remote] 静态资源自检通过: {STATIC_DIR}（{entries} 个条目）")
+    return not missing
+
+
 def _upstream_url(path, extra_query=None):
     query = {}
     if TRIGGER_TOKEN:
@@ -420,6 +447,13 @@ def _index_html():
       window.setTimeout(function () {{
         if (window.__voiceUiLoaded) return;
             _reportUiStatus('页面脚本异常：脚本未完成加载');
+            fetch('/static/app.js', {{ cache: 'no-store' }}).then(function (resp) {{
+                if (resp.ok) return;
+                _reportUiStatus(
+                    '页面脚本异常：app.js 返回 HTTP ' + resp.status +
+                    '（服务端静态资源缺失，请重启 voice_assistant 容器后刷新）'
+                );
+            }}).catch(function () {{}});
       }}, 1200);
     }});
   </script>
@@ -476,6 +510,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(raw) if raw else {}
                 payload["proxy_ok"] = True
                 payload["ui_version"] = UI_VERSION
+                payload["ui_static_ok"] = _STATIC_STATUS["ok"]
+                if _STATIC_STATUS["missing"]:
+                    payload["ui_static_missing"] = _STATIC_STATUS["missing"]
                 _json_response(self, code, payload)
             except Exception as e:  # noqa: BLE001
                 _json_response(self, HTTPStatus.BAD_GATEWAY, {
@@ -587,6 +624,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     _log(f"[voice-remote] log file: {LOG_FILE or '(disabled)'}")
+    _check_static_assets()
     server = ThreadingHTTPServer((LISTEN_HOST, PORT), Handler)
     _log(f"[voice-remote] listening at http://{LISTEN_HOST}:{PORT}, upstream={UPSTREAM_BASE_URL}, ui={UI_VERSION}")
     server.serve_forever()
