@@ -1089,16 +1089,33 @@ apply_casaos_legacy_hide_patch() {
   tmp_file="$(mktemp /tmp/casaos-home.XXXXXX.js)"
   cp "$home_bundle" "$tmp_file"
 
-  if grep -q "nasDemoLegacyHideBlacklist" "$tmp_file"; then
+  # 补丁版本标记：规则变更后需能升级覆盖旧补丁
+  local marker="nasDemoLegacyHideApps"
+  if grep -q "$marker" "$tmp_file"; then
     rm -f "$tmp_file"
-    log "CasaOS Legacy 卡片过滤补丁已存在，跳过"
+    log "CasaOS Legacy 卡片过滤补丁已是最新版本，跳过"
     return 0
   fi
 
-  replacement="const nasDemoLegacyHideBlacklist=['openclaw','media_downloader','knowledge_base','immich-server','immich-machine-learning','immich-postgres','immich-redis'];this.oldAppList = orgOldAppList.filter(item => { const titleObj=(item \&\& item.title) || {}; const title=((titleObj.en_us || titleObj.en_US || '') + '').toLowerCase(); return nasDemoLegacyHideBlacklist.indexOf(title) === -1; });"
+  # 命中旧版补丁时，先用 pristine 备份还原，避免在已打补丁的 bundle 上二次注入。
+  if grep -q "nasDemoLegacyHideBlacklist" "$tmp_file"; then
+    if [[ -f "$backup_file" ]]; then
+      cp "$backup_file" "$tmp_file"
+      log "检测到旧版过滤补丁，已用备份还原后重新应用新版规则"
+    else
+      warn "检测到旧版过滤补丁但缺少备份，跳过首页 bundle 补丁（custom.js 层仍会生效）"
+      rm -f "$tmp_file"
+      return 0
+    fi
+  fi
+
+  # 规则与 casaos/casaos-legacy-hide.custom.js 保持一致：
+  #   container 型 -> 按容器名(title)过滤；v2app 型 -> 按应用 ID(name)过滤 + 幽灵条目过滤。
+  # sed 替换串中的字面 "&" 必须转义为 "\&"，否则会被展开成整个匹配内容（历史上曾致首页白屏）。
+  replacement="const nasDemoLegacyHideContainer=['openclaw','knowledge_base','media_downloader','immich-server','immich-machine-learning','immich-postgres','immich-redis'];const ${marker}=['ai-nas','nas-demo'];this.oldAppList = orgOldAppList.filter(item => { if (!item) return false; const t=(item.title) || {}; const title=((t.en_us || t.en_US || '') + '').trim().toLowerCase(); const nm=((item.name || '') + '').trim().toLowerCase(); if (item.app_type === 'container') return nasDemoLegacyHideContainer.indexOf(title) === -1; if (item.app_type === 'v2app') { if (${marker}.indexOf(nm) !== -1) return false; if (!item.status \&\& !item.port \&\& !item.store_app_id) return false; } return true; });"
   sed -i "0,/this.oldAppList = orgOldAppList;/s#this.oldAppList = orgOldAppList;#${replacement}#" "$tmp_file"
 
-  if ! grep -q "nasDemoLegacyHideBlacklist" "$tmp_file"; then
+  if ! grep -q "$marker" "$tmp_file"; then
     rm -f "$tmp_file"
     warn "Legacy 卡片过滤补丁注入失败，保持原状"
     return 0
