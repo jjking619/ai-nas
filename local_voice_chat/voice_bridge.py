@@ -455,7 +455,9 @@ def _ensure_audio_runtime_env() -> None:
             print(f"[AUDIO] XDG_RUNTIME_DIR not set, using {runtime_dir}")
 
     if not os.getenv("PULSE_SERVER"):
-        candidates = [runtime_dir / "pulse" / "native", Path("/run/pulse/native")]
+        # Some devices expose /run/user/<uid>/pulse/native but return unstable
+        # capture results; prefer system pulse socket first when available.
+        candidates = [Path("/run/pulse/native"), runtime_dir / "pulse" / "native"]
         pulse_native = next((p for p in candidates if p.exists()), None)
         if pulse_native is not None:
             os.environ["PULSE_SERVER"] = f"unix:{pulse_native}"
