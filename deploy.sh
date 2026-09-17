@@ -127,6 +127,7 @@ else
     --restart unless-stopped \
     --init \
     --platform linux/arm64 \
+    --no-healthcheck \
     --network "$NAS_NET" \
     --memory "$OPENCLAW_MEM_LIMIT" \
     --add-host host.docker.internal:host-gateway \

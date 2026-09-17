@@ -281,6 +281,9 @@ NAS-Demo/
 ├── casaos/                     # CasaOS frontend customization
 ├── assets/                     # Built-in samples (UI image / sample docs / sample photos)
 ├── logs/                       # Runtime logs
+├── ops/
+│   ├── scripts/                # Operations scripts
+│   └── systemd/                # systemd service/timer and journald limit config
 ├── filebrowser-compose.yml     # NAS file browser
 ├── jellyfin-compose.yml        # Jellyfin
 ├── immich-compose.yml          # Immich
@@ -294,7 +297,6 @@ NAS-Demo/
 
 | Symptom | Resolution |
 |------|------|
-| openclaw status shows `unhealthy` | The image health check probes the HTTPS port via HTTP; the gateway is actually fine and no action is needed |
 | OpenClaw / Immich / Jellyfin do not appear on the CasaOS page, or the app does not open when clicked | Run `./oc.sh openclaw-app-deploy`, `./oc.sh immich-apply`, and `./oc.sh jellyfin-deploy` to re-register the app entries |
 | `bash ./oc.sh casaos-url` does not open | If it says “CasaOS Web service not detected”, run `curl -fsSL https://get.casaos.io \| sudo bash` to install CasaOS |
 | Voice Assistant (28083) reports 502 / connection refused when sending a message | The voice bridge (28082) is not running. Re-run `bash install.sh` to install it automatically, or manually run `cd ~/NAS-Demo/local_voice_chat && ./install_voice_bridge_service.sh` |

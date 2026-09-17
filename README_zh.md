@@ -39,7 +39,7 @@
 | USB 麦克风（可选） | 1 个 | 48 kHz 高采样，360° 全指向拾音 |
 | 主控板板载麦克风 | 板载 | Quectel Pi H1 板载，PulseAudio 源 `regular0` |
 
-> **麦克风说明**：喇叭用于 TTS 语音播报，麦克风用于唤醒与语音指令。系统默认**优先使用 USB 麦克风**，USB 不可用时自动回退到**主控板板载麦克风**（同一时刻只使用一支）；两者都不可用时，网页文本模式不受影响。优先级与设备名全部由 `.env` 控制，详见 [配置麦克风](#9-配置麦克风usb-优先--板载兜底)。
+> **麦克风说明**：喇叭用于 TTS 语音播报，麦克风用于唤醒与语音指令。系统默认**优先使用 USB 麦克风**，USB 不可用时自动回退到**主控板板载麦克风**（同一时刻只使用一支）；两者都不可用时，网页文本模式不受影响。优先级与设备名全部由 `.env` 控制。
 
 ### 软件
 
@@ -260,6 +260,9 @@ NAS-Demo/
 ├── casaos/                     # CasaOS 前端定制
 ├── assets/                     # 内置样例（界面图 / 样例文档 / 样例照片）
 ├── logs/                       # 运行时日志
+├── ops/
+│   ├── scripts/                # 运维脚本
+│   └── systemd/                # systemd service/timer 与 journald 限额配置
 ├── filebrowser-compose.yml     # NAS 文件浏览
 ├── jellyfin-compose.yml        # Jellyfin
 ├── immich-compose.yml          # Immich
@@ -273,7 +276,6 @@ NAS-Demo/
 
 | 现象 | 处理 |
 |------|------|
-| openclaw 状态显示 `unhealthy` | 镜像健康检查用 HTTP 探测 HTTPS 端口所致，网关实际正常，无需处理 |
 | CasaOS 页面里看不到 OpenClaw/Immich/Jellyfin，或点击应用打不开 | 运行 `./oc.sh openclaw-app-deploy`、`./oc.sh immich-apply`、`./oc.sh jellyfin-deploy` 重新注册应用入口 |
 | `bash ./oc.sh casaos-url` 打不开 | 提示“未检测到 CasaOS Web 服务”时，执行 `curl -fsSL https://get.casaos.io \| sudo bash` 安装 CasaOS |
 | Voice Assistant（28083）发消息报 502 / connection refused | 语音桥（28082）未运行。重跑 `bash install.sh` 自动安装，或手动执行 `cd ~/NAS-Demo/local_voice_chat && ./install_voice_bridge_service.sh` |
