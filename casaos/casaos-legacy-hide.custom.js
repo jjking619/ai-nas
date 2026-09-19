@@ -6,7 +6,6 @@
     "openclaw": true,
     "knowledge_base": true,
     "media_downloader": true,
-    "immich-server": true,
     "immich-machine-learning": true,
     "immich-postgres": true,
     "immich-redis": true
