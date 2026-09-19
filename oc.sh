@@ -58,7 +58,7 @@ Usage:
   ./oc.sh tools-kb-setup
   ./oc.sh tools-kb-show
   ./oc.sh tools-sync         Sync NAS-Demo sources -> nas_share/tools (runtime copy)
-  ./oc.sh tools-photos-setup  Sync sample photos -> 家庭相册/测试样例，并自动导入 Immich
+  ./oc.sh tools-photos-setup  Sync sample photos -> 家庭相册/测试样例 + Family album/Test Samples + Travel/Test Samples，并自动导入 Immich
   ./oc.sh pair-list
   ./oc.sh pair-approve <request_id>
   ./oc.sh openclaw-app-deploy  Install OpenClaw launcher (CasaOS web app)
@@ -915,7 +915,7 @@ case "${1:-}" in
           --restart unless-stopped \
           -e NAS_ROOT=/nas_share \
           -e PORT=8084 \
-          -e SCAN_INTERVAL=60 \
+          -e SCAN_INTERVAL=300 \
           -e LOG_FILE=/logs/knowledge_base.log \
           -e LOG_MAX_BYTES=5242880 \
           -e LOG_BACKUPS=3 \
@@ -1003,33 +1003,53 @@ case "${1:-}" in
     ;;
   tools-photos-setup)
     # 同步仓库内置样例照片到 NAS 相册，并尽量自动导入 Immich，方便直接试照片语义能力。
-    # 目标：$NAS_ROOT/家庭相册/测试样例（语音指令可命中"家庭相册"路由）
+    # 目标：同时写入中文和英文测试目录，便于中英文语音指令联调。
+    #   - $NAS_ROOT/家庭相册/测试样例
+    #   - $NAS_ROOT/Family album/Test Samples
+    #   - $NAS_ROOT/Travel/Test Samples
     src_dir="$APP_DIR/assets/sample_photos"
-    album_root="$NAS_ROOT/家庭相册"
-    dest_dir="$album_root/测试样例"
+    dest_dirs=(
+      "$NAS_ROOT/家庭相册/测试样例"
+      "$NAS_ROOT/Family album/Test Samples"
+      "$NAS_ROOT/Travel/Test Samples"
+    )
+    album_roots=(
+      "$NAS_ROOT/家庭相册"
+      "$NAS_ROOT/Family album"
+      "$NAS_ROOT/Travel"
+    )
     if [[ ! -d "$src_dir" ]]; then
       echo "SKIP  sample_photos 源目录不存在: $src_dir"
       exit 0
     fi
-    mkdir -p "$dest_dir"
+    for dest_dir in "${dest_dirs[@]}"; do
+      mkdir -p "$dest_dir"
+    done
     photos_copied=0
     for src in "$src_dir"/*.jpg; do
       [[ -f "$src" ]] || continue
       name="$(basename "$src")"
-      dst="$dest_dir/$name"
-      if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
-        echo "SAME  $name"
-        continue
-      fi
-      cp "$src" "$dst"
-      echo "SYNC  $name -> 家庭相册/测试样例/"
-      photos_copied=$((photos_copied + 1))
+      for dest_dir in "${dest_dirs[@]}"; do
+        dst="$dest_dir/$name"
+        rel_dir="${dest_dir#"$NAS_ROOT/"}"
+        if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+          echo "SAME  $name -> ${rel_dir}/"
+          continue
+        fi
+        cp "$src" "$dst"
+        echo "SYNC  $name -> ${rel_dir}/"
+        photos_copied=$((photos_copied + 1))
+      done
     done
     # 目录权限对齐宿主用户（避免容器以其它 uid 创建后无法写入）
     if [[ "${EUID}" -eq 0 ]]; then
-      chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+      for album_root in "${album_roots[@]}"; do
+        chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+      done
     else
-      sudo chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+      for album_root in "${album_roots[@]}"; do
+        sudo chown -R "$(id -u):$(id -g)" "$album_root" 2>/dev/null || true
+      done
     fi
     echo "Importing sample photos into Immich..."
     import_sample_photos_to_immich
@@ -1037,7 +1057,7 @@ case "${1:-}" in
       echo "Triggering Immich indexing jobs..."
       trigger_immich_jobs
     fi
-    echo "tools-photos-setup done: $photos_copied photo(s) synced to 家庭相册/测试样例"
+    echo "tools-photos-setup done: $photos_copied file sync action(s) across Chinese/English sample folders"
     ;;
   pair-list)
     docker_cmd exec -it openclaw node dist/index.js devices list
