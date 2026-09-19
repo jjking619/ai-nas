@@ -9,7 +9,7 @@ services:
             POSTGRES_USER: casaos
         image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0@sha256:c570d9e1c2494f65d2a0a379a7f6df66e8441964254a30aa62cc58e8ebf1dee0
         labels:
-            icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+          icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
         networks:
             big_bear_immich_network: null
         restart: unless-stopped
@@ -54,9 +54,10 @@ services:
             DB_USERNAME: casaos
             REDIS_HOSTNAME: immich-redis
             MACHINE_LEARNING_MODEL_TTL: "600"
+            HF_ENDPOINT: "https://hf-mirror.com"
         image: ghcr.io/immich-app/immich-machine-learning:v3.1.0@sha256:5a0839dc5303cd7215bcd2180a26aed3af41675aefb3e75e5157e9f10ad16e6e
         labels:
-            icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+          icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
         networks:
             big_bear_immich_network: null
         restart: unless-stopped
@@ -120,7 +121,7 @@ services:
             REDIS_HOSTNAME: immich-redis
         image: ghcr.io/immich-app/immich-server:v3.1.0@sha256:b434cb9287eea1471c9974845914d4dd328c9c2d652e446ed4930f99944f0ceb
         labels:
-            icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+          icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
         networks:
             big_bear_immich_network: null
         ports:
@@ -188,7 +189,7 @@ services:
         container_name: immich-redis
         image: redis:6.2.20-alpine@sha256:2185e741f4c1e7b0ea9ca1e163a3767c4270a73086b6bbea2049a7203212fb7f
         labels:
-            icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
+        icon: https://cdn.jsdelivr.net/gh/selfhst/icons/png/immich.png
         networks:
             big_bear_immich_network: null
         restart: always

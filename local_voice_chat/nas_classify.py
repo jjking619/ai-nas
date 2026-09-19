@@ -16,6 +16,7 @@ import re
 import socket
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +27,8 @@ MODEL = "ViT-B-32__openai"
 CONNECT_TIMEOUT = 3
 PREDICT_TIMEOUT = 120
 _ML_READY_CHECKED = False
+PREDICT_RETRIES = 1
+PREDICT_RETRY_DELAY_SEC = 0.8
 
 ARCHIVE_ROOT_HINTS = ("家庭相册", "手机相册", "旅行", "备份")
 
@@ -134,14 +137,20 @@ def _predict(entries: dict, text=None, image=None) -> dict:
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=PREDICT_TIMEOUT) as resp:
-            return json.load(resp)
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"Immich ML请求失败: {e}. "
-            "请检查 immich-machine-learning 容器状态。"
-        ) from e
+    last_err = None
+    for attempt in range(PREDICT_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=PREDICT_TIMEOUT) as resp:
+                return json.load(resp)
+        except urllib.error.URLError as e:
+            last_err = e
+            if attempt < PREDICT_RETRIES:
+                time.sleep(PREDICT_RETRY_DELAY_SEC)
+                continue
+    raise RuntimeError(
+        f"Immich ML请求失败: {last_err}. "
+        "请检查 immich-machine-learning 容器状态。"
+    ) from last_err
 
 
 def _embedding(resp: dict):

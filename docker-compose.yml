@@ -98,7 +98,7 @@ services:
     environment:
       NAS_ROOT: /nas_share
       PORT: 8084
-      SCAN_INTERVAL: 60
+      SCAN_INTERVAL: 300
       LOG_FILE: /logs/knowledge_base.log
       LOG_MAX_BYTES: "5242880"
       LOG_BACKUPS: "3"
@@ -193,7 +193,7 @@ services:
       DB_DATABASE_NAME: casaos
       DB_PORT: "5432"
       REDIS_HOSTNAME: immich-redis
-      MACHINE_LEARNING_MODEL_TTL: "0"
+      MACHINE_LEARNING_MODEL_TTL: "600"
     volumes:
       - /DATA/AppData/big-bear-immich/model-cache:/cache
     logging:
