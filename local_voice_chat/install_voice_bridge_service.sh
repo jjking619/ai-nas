@@ -73,6 +73,8 @@ env_ensure VOICE_RECORD_BACKEND "auto"
 env_ensure VOICE_MIC_INPUT "default"
 env_ensure VOICE_HTTP_WAKE_ERROR_BACKOFF_INITIAL_SEC "1.0"
 env_ensure VOICE_HTTP_WAKE_ERROR_BACKOFF_MAX_SEC "30.0"
+env_ensure VOICE_HTTP_WAKEWORD "0"
+env_ensure VOICE_HTTP_KEEP_MODELS "0"
 
 # install 脚本常由 sudo 调用，避免 .env 被 root 接管导致后续无法编辑。
 if [[ -f "$APP_DIR/.env" ]]; then

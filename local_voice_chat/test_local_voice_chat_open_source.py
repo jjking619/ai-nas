@@ -103,6 +103,14 @@ class WakeLoopNoiseGateTest(unittest.TestCase):
 
 
 class FilterEdgeCaseRegressionTest(unittest.TestCase):
+    def test_filter_request_maps_my_album_to_family_album(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        req = voice_bridge._extract_image_filter_request("Add a vintage filter to my album, preview first")
+        self.assertIsNotNone(req)
+        self.assertEqual(req["target"], "家庭相册")
+        self.assertEqual(req["style"], "vintage")
+        self.assertTrue(req["dry"])
+
     def test_filter_request_with_missing_style_asks_for_style(self):
         voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
         reply = voice_bridge._fast_local_image_filter_reply(None, "Please process my family album photos")
@@ -273,6 +281,43 @@ class MicResolverSelectionTest(unittest.TestCase):
 
 
 class ConversationGuardRegressionTest(unittest.TestCase):
+    def test_immich_spoken_name_prefers_filename(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        item = {
+            "originalFileName": "landscape_sea_01.jpg",
+            "originalPath": "/nas_share/家庭相册/测试样例/landscape_sea_01.jpg",
+        }
+        spoken = voice_bridge._immich_item_to_spoken(item, 1)
+        self.assertIn("landscape", spoken.lower())
+        self.assertNotIn("第1张", spoken)
+
+    def test_english_number_words_for_tts(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        self.assertEqual(voice_bridge._num_to_en_words(0), "zero")
+        self.assertEqual(voice_bridge._num_to_en_words(10), "ten")
+        self.assertEqual(voice_bridge._num_to_en_words(25), "twenty-five")
+
+    def test_immich_semantic_strip_removes_english_prepositions(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        semantic = voice_bridge._strip_immich_semantic("Show me photos from the seaside")
+        self.assertEqual(semantic, "seaside")
+
+    def test_immich_semantic_strip_removes_chinese_particle_de(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        semantic = voice_bridge._strip_immich_semantic("找海边的照片")
+        self.assertEqual(semantic, "海边")
+
+    def test_immich_select_relevant_items_prefers_keyword_matches(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        items = [
+            {"type": "IMAGE", "originalFileName": "landscape sea 01.jpg", "originalPath": "/nas_share/家庭相册/landscape sea 01.jpg"},
+            {"type": "IMAGE", "originalFileName": "food manti 01.jpg", "originalPath": "/nas_share/家庭相册/food manti 01.jpg"},
+            {"type": "IMAGE", "originalFileName": "person market 01.jpg", "originalPath": "/nas_share/家庭相册/person market 01.jpg"},
+        ]
+        selected = voice_bridge._immich_select_relevant_items(items, "seaside", limit=5)
+        self.assertEqual(len(selected), 1)
+        self.assertIn("sea", selected[0].get("originalFileName", "").lower())
+
     def test_short_style_only_text_is_incomplete(self):
         voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
         self.assertTrue(voice_bridge._looks_like_incomplete_command("日系"))

@@ -78,6 +78,18 @@ DEFAULT_LOG_FILE = REPO_ROOT / "logs" / "voice_bridge.log"
 DEFAULT_WAKE_WORDS = ["小远同学", "xiaoyuan", "小远", "小元同学", "小园同学", "小源同学", "小袁同学"]
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _parse_wake_words(value: str) -> list[str]:
     parts = re.split(r"[,，;；\n]+", value or "")
     out = []
@@ -289,13 +301,13 @@ def parse_args():
     parser.add_argument(
         "--http-keep-models",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=_env_bool("VOICE_HTTP_KEEP_MODELS", True),
         help="Keep ASR/TTS models in memory in HTTP mode for lower latency",
     )
     parser.add_argument(
         "--http-wakeword",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=_env_bool("VOICE_HTTP_WAKEWORD", True),
         help="Enable background wake-word loop in HTTP mode",
     )
     parser.add_argument(
@@ -1050,6 +1062,57 @@ def _lang_reply(user_text: str | None, chinese: str, english: str) -> str:
     return english if _should_use_english_reply(user_text) else chinese
 
 
+def _num_to_en_words(n: int) -> str:
+    """Convert non-negative integers to simple English words for TTS clarity."""
+    if n < 0:
+        return str(n)
+    if n == 0:
+        return "zero"
+
+    ones = [
+        "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+    ]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+    def under_thousand(x: int) -> str:
+        out = []
+        if x >= 100:
+            out.append(f"{ones[x // 100]} hundred")
+            x %= 100
+        if x >= 20:
+            t = tens[x // 10]
+            u = x % 10
+            out.append(f"{t}-{ones[u]}" if u else t)
+        elif x > 0:
+            out.append(ones[x])
+        return " ".join([p for p in out if p]).strip()
+
+    parts = []
+    billion = n // 1_000_000_000
+    if billion:
+        parts.append(f"{under_thousand(billion)} billion")
+        n %= 1_000_000_000
+    million = n // 1_000_000
+    if million:
+        parts.append(f"{under_thousand(million)} million")
+        n %= 1_000_000
+    thousand = n // 1_000
+    if thousand:
+        parts.append(f"{under_thousand(thousand)} thousand")
+        n %= 1_000
+    if n:
+        parts.append(under_thousand(n))
+    return " ".join([p for p in parts if p]).strip()
+
+
+def _tts_en_count(n: int, user_text: str | None = None) -> str:
+    """Return count text optimized for English TTS, while preserving Chinese numeric output."""
+    if _should_use_english_reply(user_text):
+        return _num_to_en_words(max(0, int(n)))
+    return str(n)
+
+
 _IMAGE_FILTER_STYLE_PROMPT = "要哪种风格：复古、日系还是胶片？"
 _IMAGE_FILTER_TARGET_PROMPT = "请说要处理哪个目录，例如旅行或家庭相册。"
 _IMAGE_FILTER_PENDING_MAX_ATTEMPTS = 4
@@ -1094,6 +1157,8 @@ def _detect_image_filter_target(user_text: str):
         "phone photos": "手机相册",
         "family album": "家庭相册",
         "family photos": "家庭相册",
+        "my album": "家庭相册",
+        "my photos": "家庭相册",
         "travel": "旅行",
         "backup": "备份",
     }
@@ -1119,13 +1184,53 @@ def _extract_image_filter_request(user_text: str):
     }
 
 
+def _python_has_image_deps(python_exec: str) -> bool:
+    try:
+        probe = subprocess.run(
+            [python_exec, "-c", "import PIL, numpy; print('ok')"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=8,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return probe.returncode == 0
+
+
+def _resolve_image_batch_python() -> str:
+    env_python = (os.getenv("IMAGE_BATCH_PYTHON") or "").strip()
+    candidates = []
+    if env_python:
+        candidates.append(env_python)
+    candidates.extend([
+        "/home/pi/.pyenv/versions/3.10.15/bin/python3",
+        sys.executable,
+        "/usr/bin/python3",
+    ])
+
+    seen = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        if not Path(cand).exists():
+            continue
+        if _python_has_image_deps(cand):
+            return cand
+
+    # 最后兜底：保持当前行为，便于日志暴露真实缺依赖错误。
+    return sys.executable
+
+
 def _run_image_batch_reply(target: str, style: str, dry: bool, user_text: str | None = None):
     script = Path(__file__).resolve().parent / "image_batch.py"
     if not script.exists():
         return _lang_reply(user_text, "滤镜脚本不存在，请先同步 image_batch.py。", "Filter script not found. Please sync image_batch.py first.")
 
+    runner = _resolve_image_batch_python()
     cmd = [
-        sys.executable,
+        runner,
         str(script),
         "--dir",
         str(NAS_ROOT / target),
@@ -1171,13 +1276,21 @@ def _run_image_batch_reply(target: str, style: str, dry: bool, user_text: str | 
         tail = "；".join([x.strip() for x in output.splitlines()[-3:] if x.strip()])
         if "Permission denied" in output or "PermissionError" in output:
             return _lang_reply(user_text, "滤镜处理失败：目录无写入权限，请先修复 NAS 目录归属后重试。", "Filter processing failed: the directory is not writable. Please fix the NAS directory ownership and try again.")
+        if "No module named 'PIL'" in output or "No module named \"PIL\"" in output:
+            return _lang_reply(
+                user_text,
+                f"滤镜处理失败：运行环境缺少 Pillow 依赖（执行器 {runner}）。",
+                f"Filter processing failed: Pillow is missing in runtime ({runner}).",
+            )
         return _lang_reply(user_text, f"滤镜处理失败：{(tail or '未知错误')[:120]}", f"Filter processing failed: {(tail or 'unknown error')[:120]}")
 
     if dry:
         if _should_use_english_reply(user_text):
+            total_en = _tts_en_count(total, user_text)
+            planned_en = _tts_en_count(planned, user_text)
             return (
-                f"Preview complete: {target_display} contains {total} images; "
-                f"{planned} are planned for processing; output to the original folders/{style_dir_display}/, and no files were written."
+                f"Preview complete: {target_display} contains {total_en} images; "
+                f"{planned_en} are planned for processing; output to the original folders/{style_dir_display}/, and no files were written."
             )
         return (
             f"预览完成：{target}共{total}张，计划处理{planned}张，"
@@ -1187,16 +1300,20 @@ def _run_image_batch_reply(target: str, style: str, dry: bool, user_text: str | 
     if total == 0:
         return _lang_reply(user_text, f"{target}目录下未发现可处理图片。", f"No processable images were found in {target_display}.")
     if processed == 0 and skipped > 0:
+        skipped_en = _tts_en_count(skipped, user_text)
         return _lang_reply(
             user_text,
             f"{target}{style_dir}已是最新，跳过{skipped}张，无需重复处理。",
-            f"{target_display} {style_dir_display} is already up to date; skipped {skipped} images, so no duplicate processing is required.",
+            f"{target_display} {style_dir_display} is already up to date; skipped {skipped_en} images, so no duplicate processing is required.",
         )
-    reply = _lang_reply(user_text, f"{target}{style_dir}处理完成：成功{processed}张", f"{target_display} {style_dir_display} processing complete: {processed} images succeeded")
+    processed_en = _tts_en_count(processed, user_text)
+    reply = _lang_reply(user_text, f"{target}{style_dir}处理完成：成功{processed}张", f"{target_display} {style_dir_display} processing complete: {processed_en} images succeeded")
     if skipped > 0:
-        reply += _lang_reply(user_text, f"，跳过{skipped}张", f"; skipped {skipped} images")
+        skipped_en = _tts_en_count(skipped, user_text)
+        reply += _lang_reply(user_text, f"，跳过{skipped}张", f"; skipped {skipped_en} images")
     if failed > 0:
-        reply += _lang_reply(user_text, f"，失败{failed}张", f"; failed {failed} images")
+        failed_en = _tts_en_count(failed, user_text)
+        reply += _lang_reply(user_text, f"，失败{failed}张", f"; failed {failed_en} images")
     return reply + _lang_reply(user_text, f"，输出到各原目录/{style_dir}/。", f"; output to the original folders/{style_dir_display}/.")
 
 
@@ -1733,8 +1850,13 @@ def _fast_local_play_reply(args, user_text: str):
     try:
         sessions = _req("GET", "/Sessions")
         candidates = [
-            s for s in sessions
+            s
+            for s in sessions
             if "Video" in s.get("Capabilities", {}).get("PlayableMediaTypes", [])
+            and (
+                s.get("SupportsRemoteControl") is True
+                or s.get("SupportsMediaControl") is True
+            )
         ]
     except Exception as e:
         print(f"[Jellyfin] sessions failed: {e}")
@@ -1751,8 +1873,13 @@ def _fast_local_play_reply(args, user_text: str):
                 try:
                     sessions = _req("GET", "/Sessions")
                     candidates = [
-                        s for s in sessions
+                        s
+                        for s in sessions
                         if "Video" in s.get("Capabilities", {}).get("PlayableMediaTypes", [])
+                        and (
+                            s.get("SupportsRemoteControl") is True
+                            or s.get("SupportsMediaControl") is True
+                        )
                     ]
                     if candidates:
                         print(f"[Jellyfin] session detected after firefox open: attempt={attempt + 1}")
@@ -1773,13 +1900,70 @@ def _fast_local_play_reply(args, user_text: str):
         open_if_missing=False,
     )
 
-    sid = candidates[0]["Id"]
+    selected = candidates[0]
+    sid = selected["Id"]
+    before_now = (selected.get("NowPlayingItem") or {})
+    before_now_id = str(before_now.get("Id") or "")
+    before_now_name = (before_now.get("Name") or "").strip().lower()
+    target_id = str(item_id)
+    target_name = (item_name or "").strip().lower()
+
+    def _is_target_now_playing(session_obj):
+        now_item = (session_obj.get("NowPlayingItem") or {})
+        now_id = str(now_item.get("Id") or "")
+        now_name = (now_item.get("Name") or "").strip().lower()
+        if now_id and now_id == target_id:
+            return True
+        if (not now_id) and now_name and target_name and now_name == target_name:
+            return True
+        return False
+
+    def _did_now_playing_change_to_target(session_obj):
+        now_item = (session_obj.get("NowPlayingItem") or {})
+        now_id = str(now_item.get("Id") or "")
+        now_name = (now_item.get("Name") or "").strip().lower()
+        changed = (now_id != before_now_id) or (now_name != before_now_name)
+        return changed and _is_target_now_playing(session_obj)
+
     try:
         _req("POST",
              f"/Sessions/{sid}/Playing"
              f"?ItemIds={_up.quote(item_id)}&PlayCommand=PlayNow")
         print(f"[Jellyfin] play sent: {item_name} -> session {sid}")
-        return _lang_reply(user_text, f"正在播放：{item_name}", f"Playing: {item_name}")
+
+        import time as _time
+
+        confirmed_change = False
+        already_playing_target = False
+        for attempt in range(6):
+            if attempt > 0:
+                _time.sleep(0.7)
+            try:
+                refreshed_sessions = _req("GET", "/Sessions")
+                cur = next((s for s in refreshed_sessions if s.get("Id") == sid), None)
+                if not cur:
+                    print("[Jellyfin] play verify: session disappeared")
+                    break
+
+                if _did_now_playing_change_to_target(cur):
+                    confirmed_change = True
+                    break
+
+                if _is_target_now_playing(cur):
+                    already_playing_target = True
+            except Exception as e:
+                print(f"[Jellyfin] play verify failed: {e}")
+                break
+
+        if confirmed_change:
+            return _lang_reply(user_text, f"正在播放：{item_name}", f"Playing: {item_name}")
+        if already_playing_target:
+            return _lang_reply(user_text, f"{item_name} 已在播放。", f"{item_name} is already playing.")
+        return _lang_reply(
+            user_text,
+            f"播放指令已发送，但未确认客户端开始播放。请在 Jellyfin 页面点一下播放：{item_name}",
+            f"The play command was sent, but playback was not confirmed on the client. Please press Play in Jellyfin: {item_name}",
+        )
     except Exception as e:
         print(f"[Jellyfin] play failed: {e}")
         return _lang_reply(user_text, f"播放失败，请在 Jellyfin 手动播放：{item_name}", f"Playback failed. Please play {item_name} manually in Jellyfin.")
@@ -1816,6 +2000,18 @@ _KB_INTENT_WORDS = re.compile(
 _KB_OBJECT_WORDS = re.compile(
     r"文件|文档|合同|报告|表格|表|记录|照片|图片|相册|视频|电影|音乐|资料|方案|说明|计划|协议|file|files|document|contract|report|table|record|photo|photos|image|images|album|video|movie|music|data|plan|agreement|note|statement"
 , re.IGNORECASE)
+_KB_PHOTO_SEMANTIC_INTENT_RE = re.compile(
+    r"找|搜|查找|搜索|show me|show|find|search|look for",
+    re.IGNORECASE,
+)
+_KB_PHOTO_OBJECT_RE = re.compile(
+    r"照片|图片|相册|photo|photos|image|images|album|albums",
+    re.IGNORECASE,
+)
+_KB_PHOTO_LOCATION_RE = re.compile(
+    r"在哪|哪里|哪个目录|路径|文件夹|folder|path|directory|where",
+    re.IGNORECASE,
+)
 _KB_API_URL = _host_side_service_url(
     os.getenv("KB_API_URL"),
     "http://127.0.0.1:28084",
@@ -1989,6 +2185,13 @@ def _fast_local_kb_reply(_args, user_text: str):
     """命中知识库查询时，直连 KB API 搜索，避免走 agent 长链路。"""
     if not (_KB_INTENT_WORDS.search(user_text) and _KB_OBJECT_WORDS.search(user_text)):
         return None
+    # 语义搜图优先交给 Immich 通道或主 Agent，避免误命中 KB 返回"未找到"。
+    if (
+        _KB_PHOTO_SEMANTIC_INTENT_RE.search(user_text)
+        and _KB_PHOTO_OBJECT_RE.search(user_text)
+        and not _KB_PHOTO_LOCATION_RE.search(user_text)
+    ):
+        return None
     # 下载/播放意图优先，本通道不抢
     if "下载" in user_text or "播放" in user_text or "放一下" in user_text:
         return None
@@ -2043,6 +2246,157 @@ _IMMICH_STRIP_RE = re.compile(
     re.IGNORECASE,
 )
 
+_IMMICH_FILENAME_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"}
+
+_IMMICH_SEMANTIC_SYNONYMS = {
+    "海边": ["sea", "beach", "coast", "ocean", "seaside", "海边", "海", "沙滩"],
+    "海": ["sea", "beach", "coast", "ocean", "seaside", "海边", "海", "沙滩"],
+    "沙滩": ["beach", "seaside", "coast", "沙滩", "海边", "海"],
+    "seaside": ["seaside", "sea", "beach", "coast", "ocean", "海边", "沙滩"],
+    "beach": ["beach", "seaside", "coast", "sea", "ocean", "海边", "沙滩"],
+    "coast": ["coast", "seaside", "beach", "sea", "ocean", "海边", "沙滩"],
+    "ocean": ["ocean", "sea", "seaside", "beach", "coast", "海边", "沙滩"],
+    "猫": ["cat", "kitty", "feline", "猫"],
+    "cat": ["cat", "kitty", "feline", "猫"],
+    "狗": ["dog", "puppy", "canine", "狗"],
+    "dog": ["dog", "puppy", "canine", "狗"],
+    "动物": ["animal", "animals", "pet", "cat", "dog", "动物", "猫", "狗"],
+    "animal": ["animal", "animals", "pet", "cat", "dog", "动物", "猫", "狗"],
+    "animals": ["animal", "animals", "pet", "cat", "dog", "动物", "猫", "狗"],
+}
+
+_IMMICH_EN_STOPWORDS = {
+    "from", "in", "at", "on", "for", "to", "into", "with", "about", "by", "near",
+    "my", "me", "all", "any", "some", "those", "these", "that", "this",
+}
+
+
+def _immich_semantic_matches_key(semantic: str, key: str) -> bool:
+    s = (semantic or "").lower()
+    k = (key or "").lower()
+    if not s or not k:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", k):
+        return k in s
+    return bool(re.search(rf"\b{re.escape(k)}\b", s))
+
+
+def _immich_keyword_candidates(semantic: str):
+    s = (semantic or "").strip().lower()
+    if not s:
+        return []
+    for key, words in _IMMICH_SEMANTIC_SYNONYMS.items():
+        if _immich_semantic_matches_key(s, key):
+            return words
+    if "/" in s:
+        out = []
+        for part in s.split("/"):
+            out.extend(_immich_keyword_candidates(part))
+        return list(dict.fromkeys(out))
+    tokens = [t for t in re.split(r"[\s,，/]+", s) if t]
+    if tokens:
+        return list(dict.fromkeys(tokens))
+    return [s]
+
+
+def _immich_item_search_text(item: dict) -> str:
+    parts = [
+        item.get("originalFileName", "") or "",
+        item.get("originalPath", "") or "",
+        item.get("localDateTime", "") or "",
+        item.get("city", "") or "",
+        item.get("state", "") or "",
+        item.get("country", "") or "",
+    ]
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _immich_item_model_score(item: dict) -> float:
+    """提取模型相似度分数（若有）；兼容常见字段命名。"""
+    candidate_nodes = [item]
+    for key in ("smartInfo", "smartSearch", "searchInfo", "metadata"):
+        node = item.get(key)
+        if isinstance(node, dict):
+            candidate_nodes.append(node)
+
+    best = 0.0
+    for node in candidate_nodes:
+        for key in ("score", "similarity", "confidence"):
+            val = node.get(key)
+            if isinstance(val, (int, float)):
+                best = max(best, float(val))
+        dist = node.get("distance")
+        if isinstance(dist, (int, float)):
+            # 距离越小越相关，压到 0..1 区间参与排序。
+            best = max(best, max(0.0, 1.0 - float(dist)))
+    return best
+
+
+def _immich_keyword_match_score(item: dict, keywords: list[str]) -> int:
+    text = _immich_item_search_text(item)
+    score = 0
+    for kw in keywords:
+        k = (kw or "").strip().lower()
+        if len(k) < 2:
+            continue
+        if k in text:
+            score += 2 if len(k) >= 4 else 1
+    return score
+
+
+def _immich_select_relevant_items(items: list[dict], semantic: str, limit: int = 5) -> list[dict]:
+    if not items:
+        return []
+    keywords = _immich_keyword_candidates(semantic)
+
+    scored = []
+    for idx, it in enumerate(items):
+        kw_score = _immich_keyword_match_score(it, keywords)
+        model_score = _immich_item_model_score(it)
+        total = kw_score * 10 + model_score
+        scored.append((total, kw_score, model_score, idx, it))
+
+    scored.sort(key=lambda x: (x[0], x[2]), reverse=True)
+
+    # 仅在“海边/动物”等语义映射命中时，启用关键词强约束，避免明显误报。
+    s = (semantic or "").strip().lower()
+    strict_filter = any(_immich_semantic_matches_key(s, key) for key in _IMMICH_SEMANTIC_SYNONYMS)
+    if strict_filter and any(x[1] > 0 for x in scored):
+        selected = [x[4] for x in scored if x[1] > 0][:limit]
+        if selected:
+            return selected
+
+    return [x[4] for x in scored[:limit]]
+
+
+def _fallback_local_photo_hits(semantic: str, limit: int = 3):
+    words = _immich_keyword_candidates(semantic)
+    if not words:
+        return []
+
+    roots = [
+        NAS_ROOT / "家庭相册",
+        NAS_ROOT / "手机相册",
+        NAS_ROOT / "旅行",
+        NAS_ROOT / "备份",
+    ]
+    hits = []
+    lowered = [w.lower() for w in words if w]
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in _IMMICH_FILENAME_EXTS:
+                continue
+            name = p.name.lower()
+            rel = str(p.relative_to(NAS_ROOT))
+            rel_lower = rel.lower()
+            if any(w in name or w in rel_lower for w in lowered):
+                hits.append(rel)
+                if len(hits) >= limit:
+                    return hits
+    return hits
+
 
 def _strip_immich_semantic(text: str) -> str:
     """从英文/中文用户句子里提取真正的相册语义词，保留内容词，不做字母级误删。"""
@@ -2054,27 +2408,40 @@ def _strip_immich_semantic(text: str) -> str:
     s = re.sub(r"(?i)\b(?:help\s+me|please|find|search|look\s+for|show\s+me|show)\b", " ", s)
     s = re.sub(r"(?i)\b(?:photos?|images?|albums?|album)\b", " ", s)
     s = re.sub(r"(?i)\b(?:of|the|a|an)\b", " ", s)
+    s = re.sub(r"(?i)\b(?:from|in|at|on|for|to|into|with|about|by|near|my|me|all|any|some|those|these|that|this)\b", " ", s)
 
     # 再删掉中文指令词，避免 CJK 下 \b 失效
     for token in [
         "帮我", "请", "找", "查找", "搜索", "搜", "照片", "图片", "相册",
-        "有的", "有哪些", "所有", "全部", "包含", "带", "里", "中",
+        "有的", "有哪些", "所有", "全部", "包含", "带", "里", "中", "的",
     ]:
         s = s.replace(token, " ")
 
     s = s.replace("，", " ").replace("。", " ")
     s = re.sub(r"[\s_]+", " ", s)
     s = s.strip(" .!?;:，。！？；：")
+    words = [w for w in re.split(r"\s+", s) if w]
+    if words:
+        words = [w for w in words if w.lower() not in _IMMICH_EN_STOPWORDS]
+        s = " ".join(words).strip()
     return s
 
 
 def _immich_item_to_spoken(item: dict, idx: int) -> str:
-    """把 Immich 结果项转成口语描述：中文文件名读名字，否则读所在分类目录。"""
+    """把 Immich 结果项转成口语描述：优先读真实文件名，其次回退目录位置信息。"""
     stem = os.path.splitext(item.get("originalFileName", "") or "")[0]
     stem = re.sub(r"\[[^\]]*\]", "", stem)  # 去掉 [id]
     stem = re.sub(r"^\d{8}_\d{6}_", "", stem)  # 去掉归档时间戳前缀
     stem = re.sub(r"^\S+?_(?=[一-鿿])", "", stem)  # 去掉归档类别前缀（如 风景_）
-    stem = re.sub(r"[_\-. ]+", "", stem).strip()
+    stem_compact = re.sub(r"[_\-. ]+", "", stem).strip()
+    stem_readable = re.sub(r"[_\-.]+", " ", stem).strip()
+
+    # 中文名优先紧凑读；英文/数字文件名也直接读文件名，避免“第N张”信息量太低。
+    if len(re.findall(r"[一-鿿]", stem_compact)) >= 2:
+        return stem_compact[:12]
+    if stem_readable:
+        return stem_readable[:40]
+
     if len(re.findall(r"[一-鿿]", stem)) >= 2:
         return stem[:10]
     path = item.get("originalPath", "") or ""
@@ -2082,6 +2449,19 @@ def _immich_item_to_spoken(item: dict, idx: int) -> str:
         if re.search(r"[一-鿿]", p):
             return f"{p}里的第{idx}张"
     return f"第{idx}张"
+
+
+def _immich_item_to_name(item: dict, idx: int) -> str:
+    """提取可播报的照片名称；无文件名时回退为 photo N。"""
+    raw = (item.get("originalFileName", "") or "").strip()
+    stem = os.path.splitext(raw)[0].strip()
+    stem = re.sub(r"\[[^\]]*\]", "", stem)
+    stem = re.sub(r"^\d{8}_\d{6}_", "", stem)
+    stem = re.sub(r"^\S+?_(?=[一-鿿])", "", stem)
+    stem = re.sub(r"[_\-.]+", " ", stem).strip()
+    if stem:
+        return stem[:40]
+    return f"photo {idx}"
 
 
 def _fast_local_immich_reply(_args, user_text: str):
@@ -2116,11 +2496,22 @@ def _fast_local_immich_reply(_args, user_text: str):
 
     items = (data.get("assets") or {}).get("items") or []
     items = [it for it in items if (it.get("type") or "").upper() == "IMAGE"]
+    items = _immich_select_relevant_items(items, semantic, limit=5)
     if not items:
+        local_hits = _fallback_local_photo_hits(semantic, limit=3)
+        if local_hits:
+            if _should_use_english_reply(user_text):
+                count_en = _tts_en_count(len(local_hits), user_text)
+                return f'Found {count_en} local photo(s) matching "{semantic}", for example: {"; ".join(local_hits)}.'
+            if len(local_hits) == 1:
+                return f"找到1张{semantic}照片：{local_hits[0]}"
+            return f"找到{len(local_hits)}张和{semantic}相关的照片，比如：{'、'.join(local_hits)}。"
         return _lang_reply(user_text, f"相册里没有找到和{semantic}相关的照片。", f'No photos matching "{semantic}" were found in the album.')
     names = [_immich_item_to_spoken(it, i + 1) for i, it in enumerate(items[:3])]
+    names_en = [_immich_item_to_name(it, i + 1) for i, it in enumerate(items[:3])]
     if _should_use_english_reply(user_text):
-        return f"Found {len(items)} photos related to {semantic}, for example: {'; '.join(f'photo {i + 1}' for i in range(min(3, len(items))))}."
+        count_en = _tts_en_count(len(items), user_text)
+        return f"Found {count_en} photos related to {semantic}, for example: {'; '.join(names_en)}."
     return f"找到{len(items)}张和{semantic}相关的照片，比如：{'、'.join(names)}。"
 
 
@@ -2882,7 +3273,18 @@ def _run_single_http_turn(
                     f"[HTTP][FILTER] pending {missing} target={filter_req['target']} "
                     f"style={filter_req['style']} dry={1 if filter_req['dry'] else 0}"
                 )
-                prompt = _IMAGE_FILTER_TARGET_PROMPT if filter_req["target"] is None else _IMAGE_FILTER_STYLE_PROMPT
+                if filter_req["target"] is None:
+                    prompt = _lang_reply(
+                        text,
+                        _IMAGE_FILTER_TARGET_PROMPT,
+                        "Please tell me which folder to process, such as Travel or Family album.",
+                    )
+                else:
+                    prompt = _lang_reply(
+                        text,
+                        _IMAGE_FILTER_STYLE_PROMPT,
+                        "What style do you want: vintage, Japanese, or film?",
+                    )
                 _set_bridge_state("speaking")
                 tts_speak(tts, prompt, reply_wav, play=not args.no_play)
                 _record_voice_turn(
