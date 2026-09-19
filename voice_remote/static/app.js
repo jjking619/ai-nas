@@ -6,6 +6,7 @@ const textInput = document.getElementById('textInput');
 const statusEl = document.getElementById('status');
 const turnsEl = document.getElementById('turns');
 const clearTurnsBtn = document.getElementById('clearTurns');
+const redirectHintEl = document.getElementById('redirectHint');
 const langToggle = document.getElementById('langToggle');
 let _taskBusy = false;
 let _liveTurnEl = null;
@@ -62,6 +63,9 @@ function apiUrl(path) {
 
 function setBusy(busy) {
   _taskBusy = busy;
+  document.querySelectorAll('.qa').forEach((el) => {
+    el.disabled = busy;
+  });
   if (voiceBtn) {
     voiceBtn.disabled = busy;
     voiceBtn.textContent = busy ? tr('voiceBtnBusy') : tr('voiceBtnStart');
@@ -74,6 +78,20 @@ function setBusy(busy) {
   }
 }
 
+function clearRedirectHint() {
+  if (!redirectHintEl) return;
+  redirectHintEl.style.display = 'none';
+  redirectHintEl.innerHTML = '';
+}
+
+function showRedirectHint(url) {
+  if (!redirectHintEl || !url) return;
+  const safeUrl = String(url).trim();
+  if (!safeUrl) return;
+  redirectHintEl.innerHTML = `${tr('openResult')} <a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeUrl}</a>`;
+  redirectHintEl.style.display = 'block';
+}
+
 async function pollTask(taskId) {
   for (;;) {
     const resp = await fetch(apiUrl('/api/task/' + encodeURIComponent(taskId)), { cache: 'no-store' });
@@ -81,23 +99,34 @@ async function pollTask(taskId) {
     if (!resp.ok) {
       setStatus(() => `${tr('taskQueryFailed')}${data.error || resp.statusText}`);
       setBusy(false);
-      return;
+      return { ok: false, retriableBusy: false };
     }
     const task = data.task;
     if (task.status === 'error') {
-      setStatus(() => `${tr('processingFailed')}${task.error || tr('unknownError')}`);
-      setBusy(false);
-      return;
+      const busyConflict = task.http_status === 409 || (task.result && task.result.error === 'busy');
+      if (!busyConflict) {
+        setStatus(() => `${tr('processingFailed')}${task.error || tr('unknownError')}`);
+        setBusy(false);
+      }
+      return { ok: false, retriableBusy: busyConflict, task };
     }
     if (task.status === 'done') {
-      setBusy(false);
-      return;
+      return { ok: true, task };
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    if (task.status === 'running') {
+      const cost = task.started_ms ? Math.max(0, Date.now() - task.started_ms) : 0;
+      if (cost > 0) {
+        setStatus(() => `${tr('taskStart')} (${cost} ms)`);
+      }
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
 }
 
-async function submitTask(payload, modeKey) {
+async function submitTask(payload, modeKey, retryCount = 0) {
+  if (retryCount === 0) {
+    clearRedirectHint();
+  }
   setBusy(true);
   setStatus(() => `${tr(modeKey)} ${tr('taskQueued')}`);
   try {
@@ -114,7 +143,29 @@ async function submitTask(payload, modeKey) {
       return;
     }
     setStatus(() => `${tr('taskCreated')}${data.task_id}\n${tr('taskStart')}`);
-    await pollTask(data.task_id);
+    const polled = await pollTask(data.task_id);
+    if (!polled || !polled.ok) {
+      if (polled && polled.retriableBusy && retryCount < 2) {
+        setStatus(() => tr('taskRetryBusy'));
+        await new Promise((resolve) => window.setTimeout(resolve, 1200));
+        await submitTask(payload, modeKey, retryCount + 1);
+        return;
+      }
+      if (polled && polled.retriableBusy) {
+        setStatus(() => tr('taskBusyGiveup'));
+      }
+      setBusy(false);
+      return;
+    }
+
+    const doneTask = polled.task || {};
+    const doneCost = Number.isFinite(doneTask.cost_ms) ? `${tr('taskDoneWithCost')} ${doneTask.cost_ms} ms` : tr('taskDone');
+    setStatus(() => doneCost);
+    const redirectUrl = doneTask.result && doneTask.result.redirect_url ? String(doneTask.result.redirect_url) : '';
+    if (redirectUrl) {
+      showRedirectHint(redirectUrl);
+    }
+    setBusy(false);
   } catch (err) {
     setStatus(() => `${tr('requestFailed')}${err}`);
     setBusy(false);
@@ -209,7 +260,11 @@ function localizeDisplayText(text) {
     value = value.split(source).join(target);
   });
 
-  value = value.replace(/(\d+)张/g, '$1 images');
+  // Avoid broad "N张 -> N images" because it breaks phrases like "第1张".
+  value = value.replace(/找到(\d+)张和(.+?)相关的照片，比如：/g, 'Found $1 photos related to $2, for example: ');
+  value = value.replace(/找到1张(.+?)照片：/g, 'Found one photo matching $1: ');
+  value = value.replace(/第(\d+)张/g, 'photo $1');
+  value = value.replace(/\b(scenery|food|people|animals|architecture|transportation|daily items|plants)(\d+)张/gi, '$1: $2');
   value = value.replace(/\b(scenery|food|people|animals|architecture|transportation|daily items|plants)\s+(\d+)\s+images/gi, '$1: $2');
   value = value.replace(/\b(Family album|Phone album|Trip|Backup)\s+([A-Za-z ]+)/g, '$1: $2');
 
@@ -236,6 +291,12 @@ function renderNewTurns(turns) {
   if (!turns || !turns.length || !turnsEl) return;
   const live = (_liveTurnEl && _liveTurnEl.isConnected) ? _liveTurnEl : null;
   const labels = srcLabels();
+  const escapeHtml = (value) => String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
   turns.forEach((turn) => {
     const div = document.createElement('div');
     div.className = 'turn';
@@ -247,8 +308,8 @@ function renderNewTurns(turns) {
     const replyContent = turn.reply ? localizeDisplayText(turn.reply) : '';
     div.innerHTML =
       `<div class="turn-src"><span class="turn-src-label" data-src-key="${turn.source}">${src}</span> · ${hhmm}</div>` +
-      (turn.text ? `<div class="turn-txt" data-raw-text="${String(turn.text).replace(/"/g, '&quot;')}">🗣 ${textContent}</div>` : '') +
-      (turn.reply ? `<div class="turn-rep" data-raw-text="${String(turn.reply).replace(/"/g, '&quot;')}">💬 ${replyContent}</div>` : '') +
+      (turn.text ? `<div class="turn-txt" data-raw-text="${escapeHtml(turn.text)}">🗣 ${escapeHtml(textContent)}</div>` : '') +
+      (turn.reply ? `<div class="turn-rep" data-raw-text="${escapeHtml(turn.reply)}">💬 ${escapeHtml(replyContent)}</div>` : '') +
       `<div class="turn-meta" data-cost-ms="${turn.cost_ms}">${costText}</div>`;
     if (live) {
       turnsEl.insertBefore(div, live.nextSibling);
@@ -298,6 +359,7 @@ if (clearTurnsBtn) {
     }
     _liveTurnEl = null;
     lastTurnTs = Date.now() / 1000;
+    clearRedirectHint();
     setStatus(() => tr('statusIdle'));
   });
 }
@@ -360,6 +422,41 @@ document.addEventListener('voice:lang-change', () => {
     langToggle.textContent = nextLang === 'en' ? '中文' : 'English';
   }
   refreshDynamicI18n();
+  refreshQaLabels();
 });
+
+function currentLang() {
+  return (window.voiceI18n && typeof window.voiceI18n.getLang === 'function')
+    ? window.voiceI18n.getLang() : 'zh';
+}
+
+function qaPromptFor(el) {
+  const isEn = currentLang() === 'en';
+  const prompt = isEn ? el.dataset.promptEn : el.dataset.promptZh;
+  return (prompt || el.dataset.promptZh || '').trim();
+}
+
+function refreshQaLabels() {
+  const isEn = currentLang() === 'en';
+  document.querySelectorAll('.qa[data-label-zh]').forEach((el) => {
+    const label = isEn ? (el.dataset.labelEn || el.dataset.labelZh) : el.dataset.labelZh;
+    if (label) el.textContent = label;
+  });
+}
+
+function bindQuickActions() {
+  document.querySelectorAll('.qa').forEach((el) => {
+    el.addEventListener('click', async () => {
+      if (_taskBusy) return;
+      const prompt = qaPromptFor(el);
+      if (!prompt) return;
+      if (textInput) textInput.value = prompt;
+      await submitTask({ text: prompt }, 'textMode');
+    });
+  });
+}
+
+bindQuickActions();
+refreshQaLabels();
 
 window.__voiceUiLoaded = true;

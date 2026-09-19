@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import html
 import os
 import threading
 import time
@@ -25,11 +26,15 @@ MAX_TASKS = int(os.getenv("MAX_TASKS", "120"))
 STATIC_DIR = Path(__file__).with_name("static")
 APP_JS_FILE = STATIC_DIR / "app.js"
 TURNS_FILE = Path(os.getenv("TURNS_FILE", "/logs/voice_turns.jsonl"))
+NAS_CONTENT_FILE = Path(os.getenv("NAS_CONTENT_FILE", "/logs/nas_content.json"))
+NAS_SHARE_ROOT = Path(os.getenv("NAS_SHARE_ROOT", str(Path.home() / "nas_share"))).expanduser()
+MANIFEST_FALLBACK_SCAN_TTL_SEC = int(os.getenv("MANIFEST_FALLBACK_SCAN_TTL_SEC", "45"))
 
 _TASKS = {}
 _TASK_ORDER = []
 _TASK_LOCK = threading.Lock()
 _LOG_LOCK = threading.Lock()
+_FALLBACK_SCAN_CACHE = {"ts": 0.0, "counts": {"documents": 0, "photos": 0, "videos": 0}}
 
 
 def _now_str() -> str:
@@ -267,7 +272,190 @@ def _submit_task(text: str):
     return task
 
 
+_FALLBACK_ACTIONS = {
+    "docs": [
+        {"zh": "住房合同在哪", "en": "Where is my housing contract?", "lzh": "住房合同在哪", "len": "Find the contract"},
+        {"zh": "住房合同的甲方是谁", "en": "Who signed the housing contract?", "lzh": "合同甲方是谁", "len": "Who signed it"},
+        {"zh": "合同编号是多少", "en": "What is the contract number?", "lzh": "合同编号是多少", "len": "Contract number"},
+        {"zh": "住房合同里的关键日期", "en": "Key dates in the housing contract", "lzh": "合同关键日期", "len": "Key dates"},
+    ],
+    "photos": [
+        {"zh": "帮我把家庭相册的照片分类，先预览", "en": "Organize my family album, preview first", "lzh": "相册自动分类", "len": "Organize album"},
+        {"zh": "把家庭相册的照片加复古滤镜，先预览", "en": "Add a vintage filter to my album, preview first", "lzh": "加复古滤镜", "len": "Vintage filter"},
+        {"zh": "找海边的照片", "en": "Show me photos from the seaside", "lzh": "找海边的照片", "len": "Seaside photos"},
+        {"zh": "找猫/动物的照片", "en": "Show me photos of animals", "lzh": "找猫/动物的照片", "len": "Animal photos"},
+    ],
+    "videos": [
+        {"zh": "下载测试视频", "en": "Download the sample video", "lzh": "下载测试视频", "len": "Download a video"},
+        {"zh": "播放oceans", "en": "Play oceans", "lzh": "播放oceans", "len": "Play oceans"},
+    ],
+    "ask": [
+        {"zh": "简单介绍下你能帮我做什么", "en": "Briefly, what can you help me with?", "lzh": "你能做什么", "len": "What can you do"},
+        {"zh": "这台 NAS 上都有什么内容", "en": "What is on this NAS?", "lzh": "NAS 里有什么", "len": "What's on it"},
+    ],
+}
+
+
+def _safe_int(value, default=0):
+    try:
+        return max(0, int(value))
+    except Exception:
+        return default
+
+
+def _safe_text(value, default=""):
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+_DOC_EXTS = {
+    ".txt", ".md", ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".rtf", ".odt"
+}
+_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif", ".tif", ".tiff"}
+_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm", ".ts", ".m2ts", ".wmv", ".flv"}
+
+
+def _fallback_count_from_nas_share():
+    now = time.time()
+    cached_ts = float(_FALLBACK_SCAN_CACHE.get("ts", 0.0))
+    if now - cached_ts <= MANIFEST_FALLBACK_SCAN_TTL_SEC:
+        return dict(_FALLBACK_SCAN_CACHE.get("counts", {}))
+
+    counts = {"documents": 0, "photos": 0, "videos": 0}
+    root = NAS_SHARE_ROOT
+    if not root.exists() or not root.is_dir():
+        _FALLBACK_SCAN_CACHE["ts"] = now
+        _FALLBACK_SCAN_CACHE["counts"] = counts
+        return counts
+
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            # 跳过隐藏目录，减少扫描成本
+            if "/." in dirpath:
+                continue
+            for name in filenames:
+                ext = Path(name).suffix.lower()
+                if ext in _PHOTO_EXTS:
+                    counts["photos"] += 1
+                elif ext in _VIDEO_EXTS:
+                    counts["videos"] += 1
+                elif ext in _DOC_EXTS:
+                    counts["documents"] += 1
+    except Exception as e:  # noqa: BLE001
+        _log(f"[voice-remote] fallback scan failed: {e}")
+
+    _FALLBACK_SCAN_CACHE["ts"] = now
+    _FALLBACK_SCAN_CACHE["counts"] = counts
+    return counts
+
+
+def _safe_prompt_item(item):
+    if not isinstance(item, dict):
+        return None
+    zh = _safe_text(item.get("zh"))
+    en = _safe_text(item.get("en"), zh)
+    lzh = _safe_text(item.get("lzh"), zh)
+    len_ = _safe_text(item.get("len"), en)
+    if not zh and not en:
+        return None
+    if not zh:
+        zh = en
+    if not en:
+        en = zh
+    if not lzh:
+        lzh = zh
+    if not len_:
+        len_ = en
+    return {
+        "zh": zh[:180],
+        "en": en[:180],
+        "lzh": lzh[:90],
+        "len": len_[:90],
+    }
+
+
+def _load_nas_manifest():
+    raw = {}
+    has_manifest = False
+    try:
+        if NAS_CONTENT_FILE.is_file():
+            raw = json.loads(NAS_CONTENT_FILE.read_text(encoding="utf-8"))
+            has_manifest = True
+    except Exception as e:  # noqa: BLE001
+        _log(f"[voice-remote] failed to read nas manifest: {e}")
+
+    counts = raw.get("counts") if isinstance(raw, dict) else {}
+    actions = {}
+    for key in ("docs", "photos", "videos", "ask"):
+        src = raw.get(key) if isinstance(raw, dict) else None
+        items = []
+        if isinstance(src, list):
+            for item in src:
+                cleaned = _safe_prompt_item(item)
+                if cleaned:
+                    items.append(cleaned)
+                if len(items) >= 8:
+                    break
+        if not items:
+            items = list(_FALLBACK_ACTIONS[key])
+        actions[key] = items
+
+    fallback_counts = _fallback_count_from_nas_share() if not has_manifest else {"documents": 0, "photos": 0, "videos": 0}
+
+    return {
+        "generated_at": _safe_text((raw or {}).get("generated_at"), ""),
+        "counts": {
+            "documents": _safe_int((counts or {}).get("documents", fallback_counts["documents"])),
+            "photos": _safe_int((counts or {}).get("photos", fallback_counts["photos"])),
+            "videos": _safe_int((counts or {}).get("videos", fallback_counts["videos"])),
+        },
+        "actions": actions,
+    }
+
+
+def _render_count(doc_count, photo_count, video_count):
+    return {
+        "docs": f'<span class="zh">{doc_count} 份文档</span><span class="en">{doc_count} document(s)</span>',
+        "photos": f'<span class="zh">{photo_count} 张照片</span><span class="en">{photo_count} photo(s)</span>',
+        "videos": f'<span class="zh">{video_count} 个视频</span><span class="en">{video_count} video(s)</span>',
+        "ask": "&nbsp;",
+    }
+
+
+def _render_chips(items):
+    out = []
+    for item in items:
+        out.append(
+            "<button type=\"button\" class=\"qa\" "
+            f"data-prompt-zh=\"{html.escape(item['zh'], quote=True)}\" "
+            f"data-prompt-en=\"{html.escape(item['en'], quote=True)}\" "
+            f"data-label-zh=\"{html.escape(item['lzh'], quote=True)}\" "
+            f"data-label-en=\"{html.escape(item['len'], quote=True)}\">"
+            f"{html.escape(item['lzh'])}</button>"
+        )
+    return "\n            ".join(out)
+
+
+def _task_card(icon, title_key, hint_key, count_html, actions):
+    chips = _render_chips(actions)
+    return f"""<article class=\"task-card\">\n        <div class=\"tc-head\">\n          <span class=\"tc-icon\">{icon}</span>\n          <div class=\"tc-title\">\n            <h3 data-i18n=\"{title_key}\">{title_key}</h3>\n            <p class=\"tc-sub\" data-i18n=\"{hint_key}\">{hint_key}</p>\n          </div>\n        </div>\n        <div class=\"tc-count\">{count_html}</div>\n        <div class=\"chips\">\n            {chips}\n        </div>\n      </article>"""
+
+
 def _index_html():
+    manifest = _load_nas_manifest()
+    doc_count = manifest["counts"]["documents"]
+    photo_count = manifest["counts"]["photos"]
+    video_count = manifest["counts"]["videos"]
+    count_text = _render_count(doc_count, photo_count, video_count)
+    generated_at = html.escape(manifest.get("generated_at") or _now_str())
+
+    docs_card = _task_card("📄", "catDocs", "catDocsHint", count_text["docs"], manifest["actions"]["docs"])
+    photos_card = _task_card("🖼", "catPhotos", "catPhotosHint", count_text["photos"], manifest["actions"]["photos"])
+    videos_card = _task_card("🎬", "catVideos", "catVideosHint", count_text["videos"], manifest["actions"]["videos"])
+    ask_card = _task_card("✨", "catAsk", "catAskHint", count_text["ask"], manifest["actions"]["ask"])
+
     return f"""<!DOCTYPE html>
 <html lang=\"zh-CN\">
 <head>
@@ -377,38 +565,92 @@ def _index_html():
     .turn-txt {{ color: var(--text); }}
     .turn-rep {{ color: var(--ok); margin-top: 4px; }}
     .turn-meta {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
+
+        html[lang^="en"] .zh {{ display: none !important; }}
+        html:not([lang^="en"]) .en {{ display: none !important; }}
+
+        .topbar {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }}
+        .ask-title {{ margin: 4px 0 0; font-size: clamp(20px, 2.2vw, 26px); }}
+        .tasks {{ display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }}
+        .task-card {{
+            background: rgba(0,0,0,0.22);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 18px;
+            padding: 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        .tc-head {{ display: flex; align-items: center; gap: 12px; }}
+        .tc-icon {{ font-size: 28px; line-height: 1; }}
+        .tc-title h3 {{ margin: 0; font-size: 20px; }}
+        .tc-sub {{ margin: 2px 0 0; color: var(--muted); font-size: 13px; }}
+        .tc-count {{ color: var(--accent); font-size: 13px; font-weight: 700; }}
+        .chips {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+        .qa {{
+            border: 1px solid rgba(255,255,255,0.22);
+            background: rgba(255,255,255,0.06);
+            color: var(--text);
+            border-radius: 999px;
+            padding: 8px 14px;
+            font-size: 14px;
+            cursor: pointer;
+        }}
+        .qa:hover {{ background: rgba(245,158,11,0.18); border-color: var(--accent); }}
+        .qa:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+        .manifest-note {{ grid-column: 1 / -1; color: var(--muted); font-size: 12px; }}
+
+        .entry {{
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: rgba(0,0,0,0.18);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 14px 16px;
+        }}
+        .entry-label {{ color: var(--muted); font-size: 13px; }}
+        .btn-ghost {{ width: auto; align-self: flex-start; padding: 12px 20px; font-size: 16px; }}
+        .btn-send {{ width: 120px; padding: 12px 16px; font-size: 16px; }}
+        .jump-link {{ color: #93c5fd; font-size: 13px; margin-top: 4px; display: none; }}
+        .jump-link a {{ color: #bfdbfe; }}
   </style>
 </head>
 <body>
   <main class="app" data-ui-version="{UI_VERSION}">
-    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-      <h1 data-i18n="appTitle">语音助手</h1>
+        <div class="topbar">
+            <div>
+                <h1 data-i18n="appTitle">智能 NAS</h1>
+                <p class="lead" data-i18n="leadText">你的文件，一句话就够。</p>
+            </div>
       <button id="langToggle" type="button" style="padding:8px 12px; border-radius:999px; border:1px solid rgba(255,255,255,0.2); background:rgba(255,255,255,0.06); color:var(--text); cursor:pointer; font-size:13px;">English</button>
     </div>
-    <p class="lead" data-i18n="leadText">点击即可语音，或输入文本直接执行。两种模式都会触发 TTS 语音播报。</p>
 
-    <section class="grid">
-      <article class="card">
-        <h2 data-i18n="voiceMode">语音模式</h2>
-        <p class="hint" data-i18n="voiceHint">1. 点击开始  2. 立刻对麦克风说话  3. 等待助手播报</p>
-        <button id="voiceBtn" class="btn" data-i18n="voiceBtnStart">开始语音指令</button>
-      </article>
+        <h2 class="ask-title" data-i18n="askTitle">你想做什么？</h2>
 
-      <article class="card">
-        <h2 data-i18n="textMode">文本模式</h2>
-        <p class="hint" data-i18n="textHint">输入示例：播放测试视频 / 住房合同在哪</p>
-        <div class="row">
-          <input id="textInput" type="text" data-i18n-placeholder="textInputPlaceholder" placeholder="输入文本指令" />
-          <button id="textBtn" class="btn" style="width: 140px;" data-i18n="textBtn">发送文本</button>
-        </div>
-      </article>
+        <section class="tasks">
+            {docs_card}
+            {photos_card}
+            {videos_card}
+            {ask_card}
+            <div class="manifest-note"><span class="zh">清单时间 {generated_at}</span><span class="en">Indexed {generated_at}</span></div>
     </section>
 
-    <div id="status" style="display:none;" data-i18n="statusIdle">待机中。请选择语音或文本模式。</div>
-    <div class="meta">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</div>
+        <section class="entry">
+            <div class="entry-label" data-i18n="entryLabel">也可以直接说话或打字</div>
+            <div class="row">
+                <button id="voiceBtn" class="btn btn-ghost" data-i18n="voiceBtnStart">🎙 说一句</button>
+                <input id="textInput" type="text" data-i18n-placeholder="textInputPlaceholder" placeholder="也可以直接打字，一句话就行" />
+                <button id="textBtn" class="btn btn-send" data-i18n="textBtn">发送</button>
+            </div>
+        </section>
+
+        <div id="status" style="display:none;" data-i18n="statusIdle">待机中。点上面的卡片，或说话/打字。</div>
+        <div id="redirectHint" class="jump-link"></div>
+        <div class="meta"><span class="zh">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</span><span class="en">Upstream: {UPSTREAM_BASE_URL} · build {UI_VERSION}</span></div>
     <section class="turns-wrap">
       <div class="turns-hdr">
-        <h2 data-i18n="turnsTitle">对话历史</h2>
+                <h2 data-i18n="turnsTitle">最近活动</h2>
         <button class="clear-btn" id="clearTurns" data-i18n="clearTurns">清空</button>
       </div>
       <div id="turns" class="turns"></div>
