@@ -2,6 +2,7 @@
 import argparse
 import gc
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -11,7 +12,7 @@ import time
 from pathlib import Path
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from local_voice_chat import (
     asr_transcribe,
@@ -516,6 +517,15 @@ def _html_response(handler, status: int, html: str) -> None:
     handler.wfile.write(body)
 
 
+def _bytes_response(handler, status: int, data: bytes, content_type: str) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 _REQUEST_CONTEXT = threading.local()
 
 
@@ -675,6 +685,29 @@ def _run_agent_cmd(cmd, timeout_sec):
         except Exception as e:  # noqa: BLE001
             last_err = str(e)
     return False, last_err or "OpenClaw agent failed"
+
+
+def _is_gateway_unreachable_error(output: str) -> bool:
+    low = (output or "").lower()
+    return "gateway not reachable" in low or "econnrefused" in low
+
+
+def _probe_openclaw_gateway(container_name: str, timeout_sec: int = 8) -> tuple[bool, str]:
+    # Keep probe lightweight and reuse docker/sudo fallback behavior in _run_agent_cmd.
+    probe_cmd = [
+        "docker",
+        "exec",
+        container_name,
+        "node",
+        "dist/index.js",
+        "gateway",
+        "status",
+    ]
+    ok, out = _run_agent_cmd(probe_cmd, timeout_sec=timeout_sec)
+    if not ok:
+        return False, out
+    low = (out or "").lower()
+    return ("connectivity probe: ok" in low or "listening:" in low), out
 
 
 def ensure_openclaw_exec_access(container_name: str) -> None:
@@ -2697,6 +2730,38 @@ def _fallback_local_photo_hits(semantic: str, limit: int = 3):
     return hits
 
 
+def _http_photo_search_results(query: str, limit: int = 8) -> dict:
+    semantic = _strip_immich_semantic(query).strip("，。！？,.!?；;：: ")
+    if len(semantic) < 1:
+        return {"semantic": "", "items": []}
+    hits = _fallback_local_photo_hits(semantic, limit=limit)
+    items = []
+    for rel in hits:
+        items.append({
+            "name": Path(rel).name,
+            "path": rel,
+            "preview_url": f"/api/photos/file?path={quote(rel)}",
+        })
+    return {"semantic": semantic, "items": items}
+
+
+def _resolve_http_photo_path(raw_rel: str) -> Path | None:
+    rel = (raw_rel or "").strip().lstrip("/")
+    if not rel:
+        return None
+    root = NAS_ROOT.resolve()
+    target = (NAS_ROOT / rel).resolve()
+    try:
+        target.relative_to(root)
+    except Exception:
+        return None
+    if not target.is_file():
+        return None
+    if target.suffix.lower() not in _IMMICH_FILENAME_EXTS:
+        return None
+    return target
+
+
 def _strip_immich_semantic(text: str) -> str:
     """从英文/中文用户句子里提取真正的相册语义词，保留内容词，不做字母级误删。"""
     s = (text or "").strip()
@@ -2919,6 +2984,14 @@ def ask_openclaw(args, user_text):
     ]
 
     ok, output = _run_agent_cmd(cmd, timeout_sec=args.openclaw_timeout)
+    if not ok and _is_gateway_unreachable_error(output):
+        print("[OPENCLAW] gateway unreachable; running health check")
+        probe_ok, _ = _probe_openclaw_gateway(args.openclaw_container, timeout_sec=8)
+        if probe_ok:
+            retry_timeout = min(20, max(5, args.openclaw_timeout))
+            print(f"[OPENCLAW] health check passed; retrying once (timeout={retry_timeout}s)")
+            ok, output = _run_agent_cmd(cmd, timeout_sec=retry_timeout)
+
     if not ok:
         low = output.lower()
         if "sudo: a password is required" in low:
@@ -3683,6 +3756,11 @@ def _run_single_http_turn(
             "text": text,
             "reply": spoken_reply,
             "redirect_url": redirect_url,
+            "photo_results": (
+                _http_photo_search_results(text, limit=8)
+                if (_IMMICH_INTENT_RE.search(text) and _IMMICH_OBJECT_RE.search(text))
+                else None
+            ),
         }
     finally:
         _set_request_context(False)
@@ -4012,6 +4090,12 @@ def _run_http_server(args) -> None:
                 state_copy["mic"] = _mic_runtime_snapshot(args)
                 _json_response(self, HTTPStatus.OK, {"ok": True, **state_copy})
                 return
+            if parsed.path == "/api/photos/search":
+                self._handle_photo_search(parsed)
+                return
+            if parsed.path == "/api/photos/file":
+                self._handle_photo_file(parsed)
+                return
             if parsed.path == "/trigger":
                 self._handle_trigger(parsed)
                 return
@@ -4090,6 +4174,24 @@ def _run_http_server(args) -> None:
                 })
             finally:
                 trigger_lock.release()
+
+        def _handle_photo_search(self, parsed):
+            q = parse_qs(parsed.query).get("q", [""])[0].strip()
+            payload = _http_photo_search_results(q, limit=8) if q else {"semantic": "", "items": []}
+            _json_response(self, HTTPStatus.OK, {"ok": True, "query": q, "results": payload})
+
+        def _handle_photo_file(self, parsed):
+            rel = parse_qs(parsed.query).get("path", [""])[0].strip()
+            target = _resolve_http_photo_path(rel)
+            if target is None:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid path"})
+                return
+            try:
+                data = target.read_bytes()
+                content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+                _bytes_response(self, HTTPStatus.OK, data, content_type)
+            except Exception as e:  # noqa: BLE001
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
 
     if args.http_wakeword:
         wake_thread = threading.Thread(

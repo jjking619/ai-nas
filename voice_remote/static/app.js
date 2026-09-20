@@ -8,6 +8,11 @@ const turnsEl = document.getElementById('turns');
 const clearTurnsBtn = document.getElementById('clearTurns');
 const redirectHintEl = document.getElementById('redirectHint');
 const langToggle = document.getElementById('langToggle');
+const photoModalEl = document.getElementById('photoModal');
+const photoModalTitleEl = document.getElementById('photoModalTitle');
+const photoModalCloseEl = document.getElementById('photoModalClose');
+const photoGridEl = document.getElementById('photoGrid');
+const photoEmptyEl = document.getElementById('photoEmpty');
 let _taskBusy = false;
 let _liveTurnEl = null;
 
@@ -92,6 +97,72 @@ function showRedirectHint(url) {
   redirectHintEl.style.display = 'block';
 }
 
+function nasFileBaseUrl() {
+  const override = (window.localStorage && window.localStorage.getItem('nas_file_base_url')) || '';
+  if (override) return override.replace(/\/$/, '');
+  const host = window.location.hostname || '127.0.0.1';
+  return `${window.location.protocol}//${host}:28085`;
+}
+
+function buildNasFileUrl(relPath) {
+  const path = String(relPath || '').replace(/^\/+/, '');
+  if (!path) return nasFileBaseUrl();
+  const encoded = path.split('/').map((seg) => encodeURIComponent(seg)).join('/');
+  return `${nasFileBaseUrl()}/#/files/${encoded}`;
+}
+
+function closePhotoModal() {
+  if (!photoModalEl) return;
+  photoModalEl.classList.remove('show');
+  photoModalEl.setAttribute('aria-hidden', 'true');
+}
+
+function showPhotoModal() {
+  if (!photoModalEl) return;
+  photoModalEl.classList.add('show');
+  photoModalEl.setAttribute('aria-hidden', 'false');
+}
+
+function renderPhotoResults(results) {
+  if (!photoGridEl || !photoEmptyEl || !photoModalTitleEl) return;
+  const items = (results && Array.isArray(results.items)) ? results.items : [];
+  const semantic = (results && results.semantic) ? String(results.semantic) : tr('photoResultTitle');
+  photoModalTitleEl.textContent = `${tr('photoResultTitle')} · ${semantic}`;
+  photoGridEl.innerHTML = '';
+
+  if (!items.length) {
+    photoEmptyEl.style.display = 'block';
+    showPhotoModal();
+    return;
+  }
+
+  photoEmptyEl.style.display = 'none';
+  const escapeHtml = (value) => String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  items.forEach((it) => {
+    const name = it.name || it.path || tr('photoUnknownName');
+    const path = it.path || '';
+    const preview = it.preview_url || '';
+    const openUrl = buildNasFileUrl(path);
+    const card = document.createElement('article');
+    card.className = 'photo-item';
+    card.innerHTML =
+      `<img loading="lazy" src="${escapeHtml(preview)}" alt="${escapeHtml(name)}" />` +
+      `<div class="photo-meta">` +
+      `<div class="photo-name">${escapeHtml(name)}</div>` +
+      `<a class="photo-open" href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer">${tr('openInNasFiles')}</a>` +
+      `</div>`;
+    photoGridEl.appendChild(card);
+  });
+
+  showPhotoModal();
+}
+
 async function pollTask(taskId) {
   for (;;) {
     const resp = await fetch(apiUrl('/api/task/' + encodeURIComponent(taskId)), { cache: 'no-store' });
@@ -164,6 +235,10 @@ async function submitTask(payload, modeKey, retryCount = 0) {
     const redirectUrl = doneTask.result && doneTask.result.redirect_url ? String(doneTask.result.redirect_url) : '';
     if (redirectUrl) {
       showRedirectHint(redirectUrl);
+    }
+    const photoResults = doneTask.result && doneTask.result.photo_results;
+    if (photoResults) {
+      renderPhotoResults(photoResults);
     }
     setBusy(false);
   } catch (err) {
@@ -458,5 +533,17 @@ function bindQuickActions() {
 
 bindQuickActions();
 refreshQaLabels();
+
+if (photoModalCloseEl) {
+  photoModalCloseEl.addEventListener('click', closePhotoModal);
+}
+if (photoModalEl) {
+  photoModalEl.addEventListener('click', (event) => {
+    if (event.target === photoModalEl) closePhotoModal();
+  });
+}
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closePhotoModal();
+});
 
 window.__voiceUiLoaded = true;

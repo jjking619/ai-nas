@@ -52,10 +52,10 @@ def _default_actions():
             {"zh": "住房合同里的关键日期", "en": "Key dates in the housing contract", "lzh": "合同关键日期", "len": "Key dates"},
         ],
         "photos": [
-            {"zh": "帮我把家庭相册的照片分类，先预览", "en": "Organize my family album, preview first", "lzh": "相册自动分类", "len": "Organize album"},
-            {"zh": "把家庭相册的照片加复古滤镜，先预览", "en": "Add a vintage filter to my album, preview first", "lzh": "加复古滤镜", "len": "Vintage filter"},
             {"zh": "找海边的照片", "en": "Show me photos from the seaside", "lzh": "找海边的照片", "len": "Seaside photos"},
             {"zh": "找猫/动物的照片", "en": "Show me photos of animals", "lzh": "找猫/动物的照片", "len": "Animal photos"},
+            {"zh": "帮我把家庭相册的照片分类，先预览", "en": "Organize my family album, preview first", "lzh": "相册自动分类", "len": "Organize album"},
+            {"zh": "把家庭相册的照片加复古滤镜，先预览", "en": "Add a vintage filter to my album, preview first", "lzh": "加复古滤镜", "len": "Vintage filter"},
         ],
         "videos": [
             {"zh": "下载测试视频", "en": "Download the sample video", "lzh": "下载测试视频", "len": "Download a video"},

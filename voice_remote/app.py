@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import json
 import html
+import mimetypes
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -35,6 +37,26 @@ _TASK_ORDER = []
 _TASK_LOCK = threading.Lock()
 _LOG_LOCK = threading.Lock()
 _FALLBACK_SCAN_CACHE = {"ts": 0.0, "counts": {"documents": 0, "photos": 0, "videos": 0}}
+
+_PHOTO_PRESET_PRIORITY = ["找海边的照片", "找猫/动物的照片"]
+_PHOTO_PRESET_MAP = {
+    "seaside": {
+        "patterns": [r"海边", r"沙滩", r"beach", r"seaside", r"coast", r"ocean", r"sea"],
+        "keywords": ["海边", "沙滩", "beach", "seaside", "coast", "ocean", "sea"],
+        "label": "海边",
+    },
+    "animals": {
+        "patterns": [r"猫", r"动物", r"cat", r"dog", r"animal", r"pet"],
+        "keywords": ["猫", "狗", "动物", "cat", "dog", "animal", "animals", "pet"],
+        "label": "猫/动物",
+    },
+    "vintage": {
+        "patterns": [r"复古", r"滤镜", r"vintage", r"filter"],
+        "keywords": [],
+        "label": "复古滤镜预览",
+    },
+}
+_PHOTO_SCAN_ROOTS = ["家庭相册", "手机相册", "旅行", "backup", "Family album", "Travel"]
 
 
 def _now_str() -> str:
@@ -99,6 +121,15 @@ def _text_response(handler, status, text, content_type):
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _bytes_response(handler, status, data, content_type):
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(data)
 
 
 def _load_static_text(path: Path) -> str:
@@ -224,6 +255,10 @@ def _run_task(task_id: str, text: str):
     try:
         code, raw = _call_upstream_trigger(text=text)
         payload = json.loads(raw) if raw else {"ok": code < 400}
+        if text:
+            photo_results = _build_photo_results_for_text(text)
+            if photo_results:
+                payload["photo_results"] = photo_results
         ok = bool(payload.get("ok", code < 400)) and code < 400
         _set_task(
             task_id,
@@ -351,6 +386,236 @@ def _fallback_count_from_nas_share():
     return counts
 
 
+def _photo_action_sort_key(item: dict) -> tuple[int, str]:
+    zh = _safe_text((item or {}).get("zh"))
+    try:
+        idx = _PHOTO_PRESET_PRIORITY.index(zh)
+    except ValueError:
+        idx = len(_PHOTO_PRESET_PRIORITY)
+    return (idx, zh)
+
+
+def _reorder_photo_actions(items: list[dict]) -> list[dict]:
+    if not items:
+        return items
+    return sorted(items, key=_photo_action_sort_key)
+
+
+def _detect_photo_preset(user_text: str) -> str:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return ""
+    if not re.search(r"照片|图片|相册|photo|photos|image|images|album", text, flags=re.IGNORECASE):
+        return ""
+    for key, cfg in _PHOTO_PRESET_MAP.items():
+        for pattern in cfg["patterns"]:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                return key
+    return ""
+
+
+def _iter_photo_roots() -> list[Path]:
+    roots = []
+    for name in _PHOTO_SCAN_ROOTS:
+        p = NAS_SHARE_ROOT / name
+        if p.exists() and p.is_dir():
+            roots.append(p)
+    if not roots and NAS_SHARE_ROOT.exists() and NAS_SHARE_ROOT.is_dir():
+        roots.append(NAS_SHARE_ROOT)
+    return roots
+
+
+def _safe_rel_path(path: Path, root: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except Exception:
+        return ""
+    return rel.as_posix()
+
+
+def _search_local_photos_by_preset(preset_key: str, limit: int = 8) -> list[dict]:
+    cfg = _PHOTO_PRESET_MAP.get(preset_key)
+    if not cfg:
+        return []
+    keywords = [k.lower() for k in cfg.get("keywords", []) if k]
+    if not keywords and preset_key == "vintage":
+        return _list_recent_photos_for_preview(limit=limit)
+    roots = _iter_photo_roots()
+    scored = []
+    seq = 0
+    for root in roots:
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    ext = Path(name).suffix.lower()
+                    if ext not in _PHOTO_EXTS:
+                        continue
+                    full = Path(dirpath) / name
+                    rel = _safe_rel_path(full, NAS_SHARE_ROOT)
+                    if not rel:
+                        continue
+                    rel_l = rel.lower()
+                    name_l = name.lower()
+                    score = 0
+                    for kw in keywords:
+                        if kw in name_l:
+                            score += 6
+                        elif kw in rel_l:
+                            score += 2
+                    if score <= 0:
+                        continue
+                    try:
+                        mtime = int(full.stat().st_mtime)
+                    except Exception:
+                        mtime = 0
+                    scored.append((score, mtime, -seq, rel, name))
+                    seq += 1
+        except Exception as e:  # noqa: BLE001
+            _log(f"[voice-remote] photo scan failed root={root}: {e}")
+            continue
+
+    scored.sort(reverse=True)
+    out = []
+    seen = set()
+    for _score, _mtime, _seq, rel, name in scored:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        out.append({
+            "name": name,
+            "path": rel,
+            "preview_url": f"/api/photos/file?path={urllib.parse.quote(rel)}",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _list_recent_photos_for_preview(limit: int = 8) -> list[dict]:
+    preferred = ["家庭相册", "Family album", "手机相册", "旅行", "Travel", "backup"]
+    roots = []
+    for name in preferred:
+        p = NAS_SHARE_ROOT / name
+        if p.exists() and p.is_dir():
+            roots.append(p)
+    if not roots:
+        roots = _iter_photo_roots()
+
+    candidates = []
+    for root in roots:
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    ext = Path(name).suffix.lower()
+                    if ext not in _PHOTO_EXTS:
+                        continue
+                    full = Path(dirpath) / name
+                    rel = _safe_rel_path(full, NAS_SHARE_ROOT)
+                    if not rel:
+                        continue
+                    try:
+                        mtime = int(full.stat().st_mtime)
+                    except Exception:
+                        mtime = 0
+                    candidates.append((mtime, rel, name))
+        except Exception as e:  # noqa: BLE001
+            _log(f"[voice-remote] vintage preview scan failed root={root}: {e}")
+
+    candidates.sort(reverse=True)
+    out = []
+    seen = set()
+    for _mtime, rel, name in candidates:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        out.append({
+            "name": name,
+            "path": rel,
+            "preview_url": f"/api/photos/file?path={urllib.parse.quote(rel)}",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _build_photo_results_for_text(user_text: str) -> dict | None:
+    preset_key = _detect_photo_preset(user_text)
+    if not preset_key:
+        return None
+    items = _search_local_photos_by_preset(preset_key, limit=8)
+    if not items:
+        upstream_items = _search_upstream_photos(user_text)
+        if upstream_items:
+            items = upstream_items
+    cfg = _PHOTO_PRESET_MAP.get(preset_key, {})
+    return {
+        "preset": preset_key,
+        "semantic": cfg.get("label") or preset_key,
+        "items": items,
+    }
+
+
+def _resolve_photo_path(raw_rel_path: str) -> Path | None:
+    rel = (raw_rel_path or "").strip().lstrip("/")
+    if not rel:
+        return None
+    root = NAS_SHARE_ROOT.resolve()
+    target = (NAS_SHARE_ROOT / rel).resolve()
+    try:
+        target.relative_to(root)
+    except Exception:
+        return None
+    if not target.is_file():
+        return None
+    if target.suffix.lower() not in _PHOTO_EXTS:
+        return None
+    return target
+
+
+def _search_upstream_photos(query: str) -> list[dict]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        url = _upstream_url("/api/photos/search", {"q": q})
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw) if raw else {}
+    except Exception as e:  # noqa: BLE001
+        _log(f"[voice-remote] upstream photo search failed: {e}")
+        return []
+
+    src_items = (((data or {}).get("results") or {}).get("items") or [])
+    out = []
+    for item in src_items:
+        rel = _safe_text((item or {}).get("path"))
+        if not rel:
+            continue
+        out.append({
+            "name": _safe_text((item or {}).get("name"), Path(rel).name),
+            "path": rel,
+            "preview_url": f"/api/photos/file?path={urllib.parse.quote(rel)}",
+        })
+    return out
+
+
+def _fetch_upstream_photo_file(raw_rel_path: str) -> tuple[bytes, str] | None:
+    rel = (raw_rel_path or "").strip().lstrip("/")
+    if not rel:
+        return None
+    try:
+        url = _upstream_url("/api/photos/file", {"path": rel})
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+            return data, ctype
+    except Exception as e:  # noqa: BLE001
+        _log(f"[voice-remote] upstream photo file fetch failed path={rel}: {e}")
+        return None
+
+
 def _safe_prompt_item(item):
     if not isinstance(item, dict):
         return None
@@ -400,16 +665,26 @@ def _load_nas_manifest():
                     break
         if not items:
             items = list(_FALLBACK_ACTIONS[key])
+        if key == "photos":
+            items = _reorder_photo_actions(items)
         actions[key] = items
 
-    fallback_counts = _fallback_count_from_nas_share() if not has_manifest else {"documents": 0, "photos": 0, "videos": 0}
+    # 计数优先使用 NAS 实时扫描结果（带 TTL 缓存），避免 manifest 过期导致删/增文件后不更新。
+    # 若 NAS 根目录不可用，再回退到 manifest 内计数。
+    live_counts = _fallback_count_from_nas_share()
+    has_live_root = NAS_SHARE_ROOT.exists() and NAS_SHARE_ROOT.is_dir()
+    fallback_counts = live_counts if has_live_root else {
+        "documents": _safe_int((counts or {}).get("documents", 0)),
+        "photos": _safe_int((counts or {}).get("photos", 0)),
+        "videos": _safe_int((counts or {}).get("videos", 0)),
+    }
 
     return {
         "generated_at": _safe_text((raw or {}).get("generated_at"), ""),
         "counts": {
-            "documents": _safe_int((counts or {}).get("documents", fallback_counts["documents"])),
-            "photos": _safe_int((counts or {}).get("photos", fallback_counts["photos"])),
-            "videos": _safe_int((counts or {}).get("videos", fallback_counts["videos"])),
+            "documents": fallback_counts["documents"],
+            "photos": fallback_counts["photos"],
+            "videos": fallback_counts["videos"],
         },
         "actions": actions,
     }
@@ -614,6 +889,58 @@ def _index_html():
         .btn-send {{ width: 120px; padding: 12px 16px; font-size: 16px; }}
         .jump-link {{ color: #93c5fd; font-size: 13px; margin-top: 4px; display: none; }}
         .jump-link a {{ color: #bfdbfe; }}
+        .photo-modal {{
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.55);
+            z-index: 999;
+            padding: 16px;
+        }}
+        .photo-modal.show {{ display: flex; }}
+        .photo-panel {{
+            width: min(1080px, 96vw);
+            max-height: 92vh;
+            overflow: auto;
+            background: rgba(9, 18, 26, 0.96);
+            border: 1px solid rgba(255,255,255,0.18);
+            border-radius: 16px;
+            padding: 16px;
+        }}
+        .photo-panel-head {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }}
+        .photo-title {{ margin: 0; font-size: 18px; }}
+        .photo-close {{
+            border: 1px solid rgba(255,255,255,0.2);
+            background: transparent;
+            color: var(--text);
+            border-radius: 10px;
+            cursor: pointer;
+            padding: 6px 10px;
+        }}
+        .photo-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+            gap: 12px;
+        }}
+        .photo-item {{
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 12px;
+            overflow: hidden;
+        }}
+        .photo-item img {{
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            object-fit: cover;
+            display: block;
+            background: rgba(255,255,255,0.08);
+        }}
+        .photo-meta {{ padding: 8px 10px 10px; }}
+        .photo-name {{ font-size: 12px; color: var(--text); line-height: 1.4; word-break: break-all; margin-bottom: 6px; }}
+        .photo-open {{ color: #93c5fd; font-size: 12px; text-decoration: none; }}
+        .photo-empty {{ color: var(--muted); font-size: 14px; }}
   </style>
 </head>
 <body>
@@ -637,7 +964,7 @@ def _index_html():
     </section>
 
         <section class="entry">
-            <div class="entry-label" data-i18n="entryLabel">也可以直接说话或打字</div>
+            <div class="entry-label" data-i18n="entryLabel">点击“说一句”按钮后说话，或呼叫“小远同学”唤醒；也可以打字直接输入。</div>
             <div class="row">
                 <button id="voiceBtn" class="btn btn-ghost" data-i18n="voiceBtnStart">🎙 说一句</button>
                 <input id="textInput" type="text" data-i18n-placeholder="textInputPlaceholder" placeholder="也可以直接打字，一句话就行" />
@@ -647,6 +974,16 @@ def _index_html():
 
         <div id="status" style="display:none;" data-i18n="statusIdle">待机中。点上面的卡片，或说话/打字。</div>
         <div id="redirectHint" class="jump-link"></div>
+        <div id="photoModal" class="photo-modal" aria-hidden="true">
+            <section class="photo-panel">
+                <div class="photo-panel-head">
+                    <h3 id="photoModalTitle" class="photo-title">找到的照片</h3>
+                    <button id="photoModalClose" type="button" class="photo-close">关闭</button>
+                </div>
+                <div id="photoGrid" class="photo-grid"></div>
+                <div id="photoEmpty" class="photo-empty" style="display:none;">没有找到可展示的图片。</div>
+            </section>
+        </div>
         <div class="meta"><span class="zh">上游服务：{UPSTREAM_BASE_URL} · 版本：{UI_VERSION}</span><span class="en">Upstream: {UPSTREAM_BASE_URL} · build {UI_VERSION}</span></div>
     <section class="turns-wrap">
       <div class="turns-hdr">
@@ -771,6 +1108,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 _json_response(self, HTTPStatus.OK, {"ok": True, "state": "idle", "busy": False})
             return
+        if parsed.path == "/api/photos/search":
+            self._handle_photo_search(parsed)
+            return
+        if parsed.path == "/api/photos/file":
+            self._handle_photo_file(parsed)
+            return
         if parsed.path.startswith("/api/task/"):
             task_id = parsed.path.rsplit("/", 1)[-1].strip()
             self._handle_task_get(task_id)
@@ -831,6 +1174,31 @@ class Handler(BaseHTTPRequestHandler):
             "status": task["status"],
             "poll": f"/api/task/{task['id']}",
         })
+
+    def _handle_photo_search(self, parsed):
+        q = urllib.parse.parse_qs(parsed.query).get("q", [""])[0].strip()
+        results = _build_photo_results_for_text(q) if q else None
+        _json_response(self, HTTPStatus.OK, {"ok": True, "query": q, "results": results or {"items": []}})
+
+    def _handle_photo_file(self, parsed):
+        rel = urllib.parse.parse_qs(parsed.query).get("path", [""])[0].strip()
+        target = _resolve_photo_path(rel)
+        if target is not None:
+            try:
+                data = target.read_bytes()
+                ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+                _bytes_response(self, HTTPStatus.OK, data, ctype)
+                return
+            except Exception as e:  # noqa: BLE001
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
+                return
+
+        upstream = _fetch_upstream_photo_file(rel)
+        if upstream is None:
+            _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid path"})
+            return
+        data, ctype = upstream
+        _bytes_response(self, HTTPStatus.OK, data, ctype)
 
     def _handle_task_get(self, task_id: str):
         if not task_id:

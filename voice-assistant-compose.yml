@@ -17,6 +17,7 @@ services:
       LOG_FILE: /logs/voice_remote.log
       LOG_MAX_BYTES: "5242880"
       LOG_BACKUPS: "3"
+      NAS_SHARE_ROOT: /nas_share
     # 宿主机 docker 桥网关路由损坏，容器无法访问 host.docker.internal，
     # 改用 host 网络直连 127.0.0.1:28082；对外端口保持 28083 不变。
     network_mode: host
@@ -32,6 +33,10 @@ services:
       - type: bind
         source: __APP_DIR__/logs
         target: /logs
+      - type: bind
+        source: __NAS_ROOT__
+        target: /nas_share
+        read_only: true
     logging:
       driver: json-file
       options:
