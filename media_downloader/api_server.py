@@ -243,7 +243,6 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def log_message(self, fmt, *args):
-        # Keep container logs concise.
         return
 
 

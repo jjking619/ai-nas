@@ -740,7 +740,6 @@ def ensure_openclaw_exec_access(container_name: str) -> None:
             f"Current error: {detail}"
         )
 
-    # Ensure target container exists/running before entering voice loop.
     p = subprocess.run(
         ["docker", "ps", "--format", "{{.Names}}"],
         text=True,
@@ -822,13 +821,11 @@ def _json_from_mixed_output(raw):
     if not raw:
         return None
 
-    # Fast path: full JSON
     try:
         return json.loads(raw)
     except Exception:  # noqa: BLE001
         pass
 
-    # Find first '{' and last '}' as fallback
     i = raw.find("{")
     j = raw.rfind("}")
     if i >= 0 and j > i:
@@ -844,7 +841,6 @@ def _extract_text_from_agent_json(obj):
     if not isinstance(obj, dict):
         return ""
 
-    # Preferred OpenClaw shape
     payloads = obj.get("result", {}).get("payloads", [])
     if isinstance(payloads, list):
         texts = []
@@ -856,7 +852,6 @@ def _extract_text_from_agent_json(obj):
         if texts:
             return "\n".join(texts)
 
-    # Generic fallback
     for key in ("text", "message", "reply", "output"):
         v = obj.get(key)
         if isinstance(v, str) and v.strip():
@@ -1440,7 +1435,6 @@ _COMMON_MEDIA_ALIASES = {
     "ocean": {"play_name": "Oceans", "download": {"url": "https://vjs.zencdn.net/v/oceans.mp4", "default_folder": "Movies"}},
 }
 PLAY_ALIASES = {k: v["play_name"] for k, v in _COMMON_MEDIA_ALIASES.items() if "play_name" in v}
-# Backward-compatible alias used by older references in this file.
 _PLAY_ALIASES = PLAY_ALIASES
 
 DOWNLOAD_MEDIA_LIBRARY = {
@@ -1448,7 +1442,6 @@ DOWNLOAD_MEDIA_LIBRARY = {
     for k, v in _COMMON_MEDIA_ALIASES.items()
     if "download" in v
 }
-# Backward-compatible alias used by older references in this file.
 _DOWNLOAD_MEDIA_LIBRARY = DOWNLOAD_MEDIA_LIBRARY
 
 
