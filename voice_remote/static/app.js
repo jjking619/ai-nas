@@ -15,6 +15,7 @@ const photoGridEl = document.getElementById('photoGrid');
 const photoEmptyEl = document.getElementById('photoEmpty');
 let _taskBusy = false;
 let _liveTurnEl = null;
+let _photoResults = null;
 
 const tr = (key, fallback = '') => {
   if (window.voiceI18n && typeof window.voiceI18n.t === 'function') {
@@ -123,10 +124,21 @@ function showPhotoModal() {
   photoModalEl.setAttribute('aria-hidden', 'false');
 }
 
+function photoSemanticLabel(results) {
+  const keys = {
+    seaside: 'photoSemanticSeaside',
+    animals: 'photoSemanticAnimals',
+    vintage: 'photoSemanticVintage',
+  };
+  const key = results && keys[results.preset];
+  return key ? tr(key) : ((results && results.semantic) ? String(results.semantic) : tr('photoResultTitle'));
+}
+
 function renderPhotoResults(results) {
   if (!photoGridEl || !photoEmptyEl || !photoModalTitleEl) return;
+  _photoResults = results || { items: [] };
   const items = (results && Array.isArray(results.items)) ? results.items : [];
-  const semantic = (results && results.semantic) ? String(results.semantic) : tr('photoResultTitle');
+  const semantic = photoSemanticLabel(results);
   photoModalTitleEl.textContent = `${tr('photoResultTitle')} · ${semantic}`;
   photoGridEl.innerHTML = '';
 
@@ -498,6 +510,9 @@ document.addEventListener('voice:lang-change', () => {
   }
   refreshDynamicI18n();
   refreshQaLabels();
+  if (_photoResults && photoModalEl && photoModalEl.classList.contains('show')) {
+    renderPhotoResults(_photoResults);
+  }
 });
 
 function currentLang() {

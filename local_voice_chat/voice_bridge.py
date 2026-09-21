@@ -3284,15 +3284,23 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
     需要先在 Jellyfin 管理后台 → 控制台 → API 密钥 创建密钥，
     并通过 --jellyfin-api-key <key> 传入。
     """
-    has_play_intent = any(k in user_text for k in ("播放", "放一下", "放出来", "看一下", "看看"))
-    has_dl_intent = any(k in user_text for k in ("下载", "找一下", "搜一个", "要看"))
+    lower_user_text = (user_text or "").lower()
+    has_play_intent = any(k in user_text for k in ("播放", "放一下", "放出来", "看一下", "看看")) or any(
+        k in lower_user_text for k in ("play", "watch")
+    )
+    has_dl_intent = any(k in user_text for k in ("下载", "找一下", "搜一个", "要看")) or any(
+        k in lower_user_text for k in ("download", "find", "search")
+    )
     if not has_play_intent and not has_dl_intent:
         return ""
     # 触发条件：回复含下载完成类关键词，或用户指令本身含下载意图
     has_completion = any(k in raw_reply for k in (
         "下载完成", "已保存到", "下载已完成", "已下载",
         "已存", "存入", "保存到", "已保存",
-    ))
+    )) or any(
+        k in (raw_reply or "").lower()
+        for k in ("download complete", "downloaded", "saved to", "file name")
+    )
     if not has_completion and not has_dl_intent:
         return ""
 
@@ -3350,6 +3358,8 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
     if not m:
         m = _re.search(r'文件名[:：]?\s*([^，。\n]+)', raw_reply)
     if not m:
+        m = _re.search(r'file name[:：]?\s*([^,.\n]+)', raw_reply, flags=_re.IGNORECASE)
+    if not m:
         m = _re.search(r'([A-Za-z0-9_\-\[\] .]+\.(?:mp4|mkv|avi|mov|webm))', raw_reply, flags=_re.IGNORECASE)
     raw_name_stem = ""
     if m:
@@ -3363,7 +3373,9 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
         for _w in ("帮我", "请帮", "请", "帮", "给我",
                    "下载", "搜索", "查找", "找",
                    "播放", "放一下", "放出来", "看一下", "看看",
-                 "视频", "电影", "影片", "一下", "一部", "进行", "下"):
+               "视频", "电影", "影片", "一下", "一部", "进行", "下",
+               "please", "download", "search", "find", "play", "watch",
+               "the", "a", "an", "sample", "video", "movie", "trailer"):
             term = term.replace(_w, "")
         term = re.sub(r"(并且播放|并播放|然后播放)$", "", term)
         term = term.replace("并且", "").replace("并", "")
@@ -3374,9 +3386,9 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
         term = _PLAY_ALIASES[term]
     print(f"[Jellyfin] search: {term!r} (from={'reply' if m else 'user_text'})")
 
-    # 3. 等扫描写入后搜索（最多 4 次，每次间隔 3 秒）
+    # 3. 等扫描写入后搜索（最多 10 次，每次间隔 3 秒）
     item_id, item_name = None, term
-    for i in range(4):
+    for i in range(10):
         _time.sleep(3)
         try:
             result = _req(
@@ -3418,7 +3430,11 @@ def _jellyfin_play_after_download(user_text: str, raw_reply: str, jellyfin_url: 
             print(f"[Jellyfin] path fallback failed: {e}")
 
     if not item_id:
-        return "Jellyfin 库已刷新，视频扫描中，稍后可在家庭影院查看。"
+        return _lang_reply(
+            user_text,
+            "Jellyfin 库已刷新，视频仍在扫描中，稍后可在家庭影院查看。",
+            "Jellyfin was refreshed, but the video is still being scanned. It will appear in the library shortly.",
+        )
 
     # 4. 查找能播放 Video 的活跃 session，发送播放指令
     try:

@@ -101,6 +101,13 @@ class WakeLoopNoiseGateTest(unittest.TestCase):
         self.assertIn("没有写入 Movies 文件夹", msg)
         self.assertIn("外部视频源无法解析", msg)
 
+    def test_english_download_triggers_jellyfin_workflow(self):
+        voice_bridge = importlib.import_module("local_voice_chat.voice_bridge")
+        source = inspect.getsource(voice_bridge._jellyfin_play_after_download)
+        self.assertIn('"download"', source)
+        self.assertIn('"download complete"', source)
+        self.assertIn("file name", source)
+
 
 class FilterEdgeCaseRegressionTest(unittest.TestCase):
     def test_filter_request_maps_my_album_to_family_album(self):
